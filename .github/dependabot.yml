@@ -1,7 +1,7 @@
 version: 2
 updates:
-  # Dependabot does not track the upstream Hindsight image. Upstream releases
-  # are adopted by deliberate PRs that bump the pinned FROM line.
+  # Dependabot does not track the upstream Hindsight image. The upstream-release
+  # workflow proposes upstream's latest release as a PR that bumps the pinned FROM line.
   - package-ecosystem: github-actions
     directory: /
     schedule:
