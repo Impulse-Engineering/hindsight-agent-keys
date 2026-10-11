@@ -14,6 +14,7 @@ Read them without cloning:
 ```sh
 gh api repos/Impulse-Engineering/aseva-foundation-hosting/contents/CONTEXT.md --jq .content | base64 -d
 gh api repos/Impulse-Engineering/aseva-foundation-hosting/contents/docs/adr --jq '.[].name'
+adr_file=0002-hindsight-self-issued-agent-keys.md  # any name from the listing above
 gh api repos/Impulse-Engineering/aseva-foundation-hosting/contents/docs/adr/"$adr_file" --jq .content | base64 -d
 ```
 

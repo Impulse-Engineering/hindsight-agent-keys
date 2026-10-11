@@ -8,7 +8,7 @@ Parent issue for this component: #697. Commit messages reference tickets as `Ref
 
 - **Create an issue**: `gh issue create -R Impulse-Engineering/aseva-foundation-hosting --title "..." --body "..."`. Use a heredoc for multi-line bodies.
 - **Read an issue**: `gh issue view <number> -R Impulse-Engineering/aseva-foundation-hosting --json number,title,body,state,labels,comments --jq '{number, title, body, state, labels: [.labels[].name], comments: [.comments[].body]}'`
-- **List issues**: `gh issue list -R Impulse-Engineering/aseva-foundation-hosting --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
+- **List issues**: `gh issue list -R Impulse-Engineering/aseva-foundation-hosting --state open --limit 500 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
 - **Comment on an issue**: `gh issue comment <number> -R Impulse-Engineering/aseva-foundation-hosting --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> -R Impulse-Engineering/aseva-foundation-hosting --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> -R Impulse-Engineering/aseva-foundation-hosting --comment "..."`
@@ -37,9 +37,9 @@ Run the read command above.
 
 Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
 
-- **Map**: a single issue labelled `wayfinder:map`, holding the Notes / Decisions-so-far / Fog body. `gh issue create -R Impulse-Engineering/aseva-foundation-hosting --label wayfinder:map ...`.
+- **Map**: a single issue labelled `wayfinder:map`, holding the Notes / Decisions-so-far / Fog body. `gh issue create -R Impulse-Engineering/aseva-foundation-hosting --label wayfinder:map --title "..." --body-file map.md`.
 - **Child ticket**: an issue linked to the map as a GitHub sub-issue: `gh issue edit <map> -R Impulse-Engineering/aseva-foundation-hosting --add-sub-issue <child>`. Labels: `wayfinder:<type>` (`research`/`prototype`/`grilling`/`task`). Once claimed, the ticket is assigned to the driving dev.
 - **Blocking**: GitHub's native issue dependencies: `gh issue edit <child> -R Impulse-Engineering/aseva-foundation-hosting --add-blocked-by <blocker>`. A ticket is unblocked when every blocker is closed.
-- **Frontier query**: `gh issue view <map> -R Impulse-Engineering/aseva-foundation-hosting --json subIssues --jq '.subIssues.nodes[] | select(.state == "OPEN") | .number'` lists the open children in map order. For each, `gh issue view <child> -R Impulse-Engineering/aseva-foundation-hosting --json assignees,blockedBy --jq '{assignees: [.assignees[].login], open_blockers: [.blockedBy.nodes[] | select(.state == "OPEN") | .number]}'`; drop any with an assignee or an open blocker. First remaining wins.
+- **Frontier query**: `gh issue view <map> -R Impulse-Engineering/aseva-foundation-hosting --json subIssues --jq 'if (.subIssues.nodes | length) < .subIssues.totalCount then error("subIssues truncated") else .subIssues.nodes[] | select(.state == "OPEN") | .number end'` lists the open children in map order (it errors rather than return a partial list past GitHub's 100-node cap). For each, `gh issue view <child> -R Impulse-Engineering/aseva-foundation-hosting --json assignees,blockedBy --jq 'if (.blockedBy.nodes | length) < .blockedBy.totalCount then error("blockedBy truncated") else . end | {assignees: [.assignees[].login], open_blockers: [.blockedBy.nodes[] | select(.state == "OPEN") | .number]}'`; drop any with an assignee or an open blocker. First remaining wins.
 - **Claim**: `gh issue edit <n> -R Impulse-Engineering/aseva-foundation-hosting --add-assignee @me`, the session's first write.
 - **Resolve**: `gh issue comment <n> -R Impulse-Engineering/aseva-foundation-hosting --body "<answer>"`, then `gh issue close <n> -R Impulse-Engineering/aseva-foundation-hosting`, then append a context pointer (gist + link) to the map's Decisions-so-far.
