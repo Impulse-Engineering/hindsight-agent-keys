@@ -68,7 +68,13 @@ uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null
 Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They need git, jq and pytest on the host:
 
 ```sh
-uv run --no-project --with pytest==8.4.2 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
+uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
+```
+
+Lint runs the same script as CI. It needs ruff on PATH, shellcheck and Docker:
+
+```sh
+uv run --no-project --with ruff==0.17.0 scripts/lint.sh
 ```
 
 Behind a TLS-inspecting proxy, the vulnerability scan needs that proxy's CA mounted into the Grype container (`SSL_CERT_FILE`).
