@@ -1,0 +1,36 @@
+name: upstream-release
+
+# Daily: propose the latest upstream Hindsight release as a PR that bumps the
+# pinned FROM line. A person approves its CI run and merges it; nothing here merges.
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-release
+
+jobs:
+  propose:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # The workflow's own token is the only credential: it pushes the branch and opens the PR.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # Credentials persist because the script pushes the branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Propose the latest upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: scripts/upstream-release.sh
