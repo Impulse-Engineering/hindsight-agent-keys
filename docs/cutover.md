@@ -30,36 +30,39 @@ pg() { t=$1; shift; podman run --rm -i --network "container:app-$app" -e PGPASSW
   "$(podman ps --filter "name=^app-$app\$" --format '{{.Image}}')" \
   -h 127.0.0.1 -p "$(sed -n 4p $pg0/instances/hindsight/data/postmaster.pid)" -U hindsight "$@"; }
 api() { curl -sS -o /dev/null -w '%{http_code}\n' "$@"; }
+banks() { pg psql -d hindsight -Atc "select b.bank_id, (select count(*) from memory_units m where m.bank_id = b.bank_id),
+  (select count(*) from documents d where d.bank_id = b.bank_id), (select count(*) from mental_models x where x.bank_id = b.bank_id)
+  from banks b order by 1"; }   # bank_id|memory units|documents|mental models
 key=$(sed -n 's/^HINDSIGHT_API_TENANT_LEGACY_KEY=//p' /etc/apps/$app/.env)   # empty until step 4; Conductor writes each secret there
 ```
 
 ## 1. Back up
 
 ```sh
-# CT
+# CT. Stop the cut-over unless this ends with "backup OK"
 out=/root/$app-pg0-$(date -u +%Y%m%dT%H%M%SZ).dump
-pg pg_dump -Fc hindsight > "$out"
-ls -l "$out"; sha256sum "$out"
-pg pg_restore --list < "$out" | grep -c ' TABLE '   # non-zero, or the dump is not usable
+pg pg_dump -Fc hindsight > "$out" && pg pg_restore --list < "$out" | grep ' TABLE ' > /dev/null &&
+  sha256sum "$out" && echo "backup OK" || echo "BACKUP FAILED: do not continue"
+banks > /root/$app-banks-before.txt && cat /root/$app-banks-before.txt   # the baseline for steps 2, 6 and 8
 ```
 
-- Copy the dump off the CT: on the node, `pct pull <vmid> /root/<file> /root/<file>`, then `scp` it somewhere safe.
+- Copy the dump off the CT: on the node, `pct pull <vmid> /root/<file> /root/<file>`, then `scp` it somewhere safe. Its `sha256sum` there must match the one above.
 - Take a fresh vzdump of the CT on the node: `vzdump <vmid> --mode snapshot --storage <PBS storage>`. Dev's rootfs cannot snapshot, so there it falls back to suspend mode. Check the archive with `pvesm list <storage> --vmid <vmid>`. A reused VMID can carry an older tenant's archives, so compare dates with the app's `created_at`.
-- Record the bank count, for step 2: `curl -sS -H "Authorization: Bearer <current key>" http://127.0.0.1:$port/v1/default/banks` (no header if the app has no key).
 
 ### Restore
 
-Restore into a fresh database in the running app, not over pg0's data directory. The app's image may be newer than the dump; it migrates the restored data at the next start. Close the bypass hostname first (step 3).
+Restore into a side database in the running app, then swap it in by name. The app's live sessions never see a half-restored database: writes before the swap land in the old one and are dropped with it. The app's image may be newer than the dump; it migrates the restored data at the next start. Close the bypass hostname first (step 3).
 
 ```sh
 # CT
-pg dropdb --force hindsight
-pg createdb hindsight
-pg pg_restore --exit-on-error -d hindsight < /root/<file>.dump
-systemctl restart app-$app
+pg dropdb --if-exists hindsight_restore && pg createdb hindsight_restore &&
+  pg pg_restore --exit-on-error -d hindsight_restore < /root/<file>.dump &&
+  pg dropdb --force hindsight &&
+  pg psql -d postgres -v ON_ERROR_STOP=1 -c 'ALTER DATABASE hindsight_restore RENAME TO hindsight' &&
+  systemctl restart app-$app
 ```
 
-Then check `/version` and the bank list as in step 2. If the app no longer starts, PBS file-restore can pull `/var/lib/apps/<app>/home/hindsight/.pg0` out of the vzdump archive. That copy only runs on the image digest it was taken with, because pg0 keeps its PostgreSQL binaries and pgvector in the same directory.
+Then check `/version`, and `banks` against the snapshot taken with the dump. If the app no longer starts, PBS file-restore can pull `/var/lib/apps/<app>/home/hindsight/.pg0` out of the vzdump archive. That copy only runs on the image digest it was taken with, because pg0 keeps its PostgreSQL binaries and pgvector in the same directory.
 
 ## 2. Upgrade to stock Hindsight
 
@@ -67,9 +70,10 @@ The target is the upstream digest this image is built on: `scripts/upstream-ref.
 
 1. `platform_resolve_image_version tag=<tag>` must return that digest.
 2. `platform_update_app container_image=ghcr.io/vectorize-io/hindsight@sha256:<digest>`.
-3. `platform_approve_image` (platform admin). On a live app this queues the deploy itself. Its health checks fail with HTTP 0 for about 30 seconds while pg0 starts and migrates. That is expected.
+3. `platform_approve_image` (platform admin). On a live app this queues the deploy itself and returns its `job_id`. Its health checks fail with HTTP 0 for about 30 seconds while pg0 starts and migrates. That is expected.
+4. `platform_get_deploy_status` shows the job `completed`, with `Applied image ref recorded:` naming the digest from 2.
 
-On the CT, `curl -sS http://127.0.0.1:$port/version` shows the new version, and the bank list matches the count from step 1.
+On the CT, `curl -sS http://127.0.0.1:$port/version` shows the new version, and `banks | diff /root/$app-banks-before.txt -` shows every bank still present, with no count lower. Counts can grow if tasks queued before the change finish.
 
 ## 3. Close the bypass hostname
 
@@ -100,7 +104,7 @@ Copy the current value of every secret this step or step 5 changes into the pass
 ## 5. Deploy the image
 
 1. `platform_update_app container_image=ghcr.io/impulse-engineering/hindsight-agent-keys@sha256:<digest>`, a digest whose `verify-published` job passed.
-2. `platform_approve_image` (platform admin) queues the deploy.
+2. `platform_approve_image` (platform admin) queues the deploy. Check it as in step 2.4.
 
 ## 6. Verify behind Access
 
@@ -109,7 +113,7 @@ Copy the current value of every secret this step or step 5 changes into the pass
 api http://127.0.0.1:$port/health                                       # 200
 api http://127.0.0.1:$port/v1/default/banks                             # 401
 api -H "Authorization: Bearer $key" http://127.0.0.1:$port/v1/default/banks   # 200
-curl -sS -H "Authorization: Bearer $key" http://127.0.0.1:$port/v1/default/banks   # the banks from step 1
+banks | diff /root/$app-banks-before.txt -   # every bank from step 1, no count lower
 journalctl -u app-$app --since -10min | grep -iE 'agent-keys|tenant|migrat'   # extension loaded, public migrated, no event-log warning
 pg psql -d hindsight -Atc 'select * from agent_keys.events order by 1 desc limit 5'   # the 401 above, as key_refused
 ```
@@ -134,7 +138,7 @@ Only once step 6 returned 401 for the keyless request: switch the bypass domain 
 b=https://<bypass>
 key=$(cat <key file>)   # the file step 4 set the key from
 curl -sS -o /dev/null -w '%{http_code}\n' $b/v1/default/banks                                     # 401
-curl -sS -H "Authorization: Bearer $key" $b/v1/default/banks                                      # the banks from step 1
+curl -sS -H "Authorization: Bearer $key" $b/v1/default/banks                                      # the bank_ids in step 1's snapshot
 curl -sS -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' $b/mcp/ \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_banks","arguments":{}}}'   # the same banks
@@ -145,7 +149,7 @@ Retain a memory into an existing bank with `"async": true`, then poll `GET /v1/d
 ## Rollback
 
 1. Close the bypass hostname (step 3).
-2. Restore the secrets from step 4: set `HINDSIGHT_API_TENANT_EXTENSION` to its old value, and re-create and set the deleted keys. The guard refuses the old extension, so this image stops and stays down instead of serving without our extension.
+2. Restore the secrets from step 4: set `HINDSIGHT_API_TENANT_EXTENSION` to its old value, and re-create and set the deleted keys. The guard refuses the old extension, so this image stops and stays down instead of serving without our extension. If the app had no `HINDSIGHT_API_TENANT_EXTENSION` before (Dev before #703), there is nothing to restore: stock Hindsight will run with no authentication.
 3. `platform_update_app` to the stock digest from step 2, then `platform_approve_image`. Conductor refuses a rollback across repositories, so this is a new approval, not `platform_rollback_deploy`. Stock Hindsight starts against a database this image used, because the extension's `agent_keys` schema sits outside upstream's migrations.
-4. Check that a keyless request on the CT gets 401 from the stock extension, then reopen the bypass hostname. Re-create the UI hostname only if the UI comes back: `platform_request_domain container_port_label=ui`.
+4. Reopen the bypass hostname only if a keyless request on the CT gets 401 from the stock extension. Otherwise leave it closed: the app is then reachable only through Access, as it was before the cut-over. Re-create the UI hostname only if the UI comes back: `platform_request_domain container_port_label=ui`.
 5. Digests older than the step 2 upgrade are not valid targets, because they predate its migrations. Restore the step 1 dump instead.
