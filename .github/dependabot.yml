@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Dependabot does not track the upstream Hindsight image. Upstream releases
+  # are adopted by deliberate PRs that bump the pinned FROM line.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # The hash-pinned integration-test runner (requirements-ci.txt).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
