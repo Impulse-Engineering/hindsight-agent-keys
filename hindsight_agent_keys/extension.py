@@ -131,7 +131,7 @@ class AgentKeysTenantExtension(TenantExtension):
     async def _refused(self, context: RequestContext, kind: str, key_id: str) -> None:
         client_ip = _client_ip(context)
         now = self._clock()
-        if not self._throttle.allow((kind, _client_bucket(client_ip)), now):
+        if not self._throttle.allow(_client_bucket(client_ip), now):
             return
         if not self._refusal_budget.allow(now):
             # Make the suppression itself visible, once a minute.

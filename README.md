@@ -2,14 +2,14 @@
 
 A container image of [Hindsight](https://github.com/vectorize-io/hindsight) (by Vectorize) with a tenant extension that gives each caller only the memory its key allows.
 
-This first version knows one key, the **legacy key**: the deployment's existing shared key. It reaches the **Public Team**, whose banks live in the Postgres `public` schema. Every other key, and a request with no key, gets 401 on the API and on MCP. Personal Agent Keys and Teams are built on top of this.
+This first version knows one key, the **legacy key**: the deployment's existing shared key. It reaches the **Public Team**, whose banks live in the Postgres `public` schema. Every other key, and a request with no key, gets 401 on the API and on MCP. There is one exception. Upstream answers an MCP `GET` with no session ID before authentication runs: it is the handshake probe some clients send, and it returns `200 {}` with no data. Personal Agent Keys and Teams are built on top of this.
 
 ## What the image adds to upstream
 
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
   - It always lists `public` as a tenant, so startup migrates `public` and the worker processes it (see upstream issue #5400).
   - Banks cannot switch on upstream audit logging.
-  - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. It writes at most one row a minute per client (an IPv4 address, or an IPv6 /64) and at most 60 rows a minute in total.
+  - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one row a minute, whatever the event. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process.
 - **A startup guard**, described in its own section below.
 - **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension.
 
@@ -19,6 +19,7 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 
 | Setting | Why it is refused |
 | --- | --- |
+| A `.env` file exists at `/app/api/.env`, `/app/.env` or `/.env` | Upstream loads the first one it finds over the process environment, after the guard has checked it. |
 | `HINDSIGHT_API_TENANT_EXTENSION` is not ours | Without our extension Hindsight admits every request into `public`. |
 | `HINDSIGHT_API_MCP_AUTH_TOKEN` is set, even empty | It bypasses the tenant extension for MCP. |
 | `HINDSIGHT_API_DATABASE_SCHEMA` is anything but `public` | The worker would skip the Public Team's background tasks. |

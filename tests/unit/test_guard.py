@@ -91,3 +91,30 @@ def test_every_refusal_points_to_the_readme():
     from hindsight_agent_keys.guard import README_POINTER
 
     assert "README" in README_POINTER
+
+
+def test_refuses_when_a_dotenv_file_would_override_the_environment():
+    found = problems(SAFE, dotenv_files=["/app/.env"])
+    assert len(found) == 1
+    assert "/app/.env" in found[0]
+
+
+def test_finds_every_dotenv_file_upstream_could_load(tmp_path):
+    from hindsight_agent_keys.guard import dotenv_files
+
+    workdir = tmp_path / "app" / "api"
+    workdir.mkdir(parents=True)
+    (tmp_path / "app" / ".env").write_text("HINDSIGHT_API_TENANT_EXTENSION=x\n")
+    (tmp_path / ".env").write_text("")
+    assert dotenv_files(str(workdir), stop=str(tmp_path)) == [
+        str(tmp_path / "app" / ".env"),
+        str(tmp_path / ".env"),
+    ]
+
+
+def test_finds_no_dotenv_files_in_a_clean_tree(tmp_path):
+    from hindsight_agent_keys.guard import dotenv_files
+
+    workdir = tmp_path / "app" / "api"
+    workdir.mkdir(parents=True)
+    assert dotenv_files(str(workdir), stop=str(tmp_path)) == []

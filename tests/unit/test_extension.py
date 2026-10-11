@@ -245,3 +245,10 @@ async def test_an_ipv4_mapped_address_is_recorded_and_throttled_as_ipv4():
     await refuse(ext, request("not-a-key", ip="::ffff:203.0.113.7"))
     await refuse(ext, request("not-a-key", ip="203.0.113.7"))
     assert [r["client_ip"] for r in events.rows] == ["203.0.113.7"]
+
+
+async def test_one_client_gets_one_row_a_minute_whatever_the_kind():
+    ext, events = watched(clock=Clock("2026-12-01T00:00:00+00:00"), legacy_key_expires="2026-11-10")
+    await refuse(ext, request(LEGACY))
+    await refuse(ext, request("not-a-key"))
+    assert [r["kind"] for r in events.rows] == ["legacy_key_expired"]
