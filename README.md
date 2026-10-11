@@ -65,7 +65,7 @@ docker build -t hindsight-agent-keys:test .
 uv run --no-project --with pytest==8.4.2 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
-Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They need git and pytest on the host:
+Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They need git, jq and pytest on the host:
 
 ```sh
 uv run --no-project --with pytest==8.4.2 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v

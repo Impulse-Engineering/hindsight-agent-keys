@@ -1,9 +1,11 @@
 """Runs scripts/upstream-release.sh in a scratch repository with fake gh and docker on PATH.
 
-The fakes stand in for GitHub and GHCR and record every call. git is real and
-pushes to a local bare remote, so the tests read what was actually pushed.
+The fakes stand in for GitHub and GHCR and record every call. The fake gh runs
+each call's --jq expression through jq, as gh does. git is real and pushes to a
+local bare remote, so the tests read what was actually pushed.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -28,11 +30,14 @@ GIT_ENV = {
 FAKE_GH = """#!/bin/sh
 echo "gh $*" >> "$CALLS"
 case "$1 $2" in
-  "api repos/vectorize-io/hindsight/releases/latest") echo "$RELEASE" ;;
-  "pr list") echo "$OPEN_PR"; exit "$PR_LIST_STATUS" ;;
-  "pr create") echo "https://example.invalid/pull/1" ;;
+  "api repos/vectorize-io/hindsight/releases/latest") json=$RELEASE_JSON ;;
+  "pr list") json=$PRS_JSON; [ "$PR_LIST_STATUS" = 0 ] || exit 1 ;;
+  "pr create") echo "https://example.invalid/pull/1"; exit 0 ;;
   *) echo "fake gh: unexpected call: $*" >&2; exit 2 ;;
 esac
+while [ "$#" -gt 2 ]; do shift; done
+[ "$1" = --jq ] || { echo "fake gh: the call does not end in --jq <expr>" >&2; exit 2; }
+printf '%s' "$json" | jq -r "$2"
 """
 FAKE_DOCKER = """#!/bin/sh
 echo "docker $*" >> "$CALLS"
@@ -69,15 +74,17 @@ def notes(tag):
     return f"https://github.com/vectorize-io/hindsight/releases/tag/{tag}"
 
 
-def run(repo, tag, open_pr="", pr_list_status="0"):
+def run(repo, tag, prs="[]", pr_list_status="0"):
     calls = repo.parent / "calls"
     env = {
         **os.environ,
         **GIT_ENV,
         "PATH": f"{repo.parent / 'bin'}:{os.environ['PATH']}",
         "CALLS": str(calls),
-        "RELEASE": f"{tag} {notes(tag)}",
-        "OPEN_PR": open_pr,
+        "RELEASE_JSON": json.dumps(
+            {"tag_name": tag, "name": f"Hindsight {tag}", "html_url": notes(tag), "draft": False, "prerelease": False}
+        ),
+        "PRS_JSON": prs,
         "PR_LIST_STATUS": pr_list_status,
         "DIGEST": DIGEST,
     }
@@ -99,7 +106,7 @@ def test_a_new_release_is_proposed_as_one_pr_pinning_its_exact_tag_and_digest(re
     result, calls = run(repo, f"v{version}")
 
     assert result.returncode == 0, result.stderr
-    assert f"docker buildx imagetools inspect {IMAGE}:{version} " in calls
+    assert f"docker buildx imagetools inspect {IMAGE}:{version} --format {{{{.Manifest.Digest}}}}\n" in calls
     new = f"{IMAGE}:{version}@{DIGEST}"
     assert pushed(repo) == {
         "main": DOCKERFILE,
@@ -122,7 +129,7 @@ def test_nothing_happens_when_the_pin_is_current_or_newer(repo, version):
 
 
 def test_nothing_happens_when_a_pr_for_the_release_exists(repo):
-    result, calls = run(repo, "v0.10.4", open_pr="42")
+    result, calls = run(repo, "v0.10.4", prs='[{"number": 42}]')
 
     assert result.returncode == 0, result.stderr
     assert "gh pr list --head upstream/hindsight-0.10.4 --state all" in calls
