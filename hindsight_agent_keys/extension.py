@@ -10,10 +10,15 @@ import ipaddress
 import logging
 import re
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from hindsight_api.config import HindsightConfig
-from hindsight_api.extensions.tenant import AuthenticationError, Tenant, TenantContext, TenantExtension
+from hindsight_api.extensions.tenant import (
+    AuthenticationError,
+    Tenant,
+    TenantContext,
+    TenantExtension,
+)
 from hindsight_api.models import RequestContext
 
 from hindsight_agent_keys.events import EventLog, PostgresEventLog, RateLimit, Throttle
@@ -42,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _parse_expiry(text: str) -> datetime:
@@ -51,7 +56,7 @@ def _parse_expiry(text: str) -> datetime:
         when = datetime.fromisoformat(text.strip())
     except ValueError as exc:
         raise ValueError(f"HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES is not an ISO date or datetime: {text!r}") from exc
-    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+    return when if when.tzinfo else when.replace(tzinfo=UTC)
 
 
 def _client_ip(context: RequestContext) -> str | None:
@@ -144,7 +149,7 @@ class AgentKeysTenantExtension(TenantExtension):
     async def _record(self, kind: str, key_id: str, client_ip: str | None) -> None:
         try:
             await self._events.record(kind, key_id, client_ip)
-        except Exception as exc:  # the refusal stands even if it cannot be logged
+        except Exception as exc:  # noqa: BLE001 - the refusal stands even if it cannot be logged
             logger.warning("agent-keys: could not record %s event: %s", kind, exc)
 
     async def list_tenants(self) -> list[Tenant]:
