@@ -62,7 +62,7 @@ Integration tests start the real container on Hindsight's mock LLM, so they need
 
 ```sh
 docker build -t hindsight-agent-keys:test .
-uv run --no-project --with pytest==8.4.2 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
+uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
 Behind a TLS-inspecting proxy, the vulnerability scan needs that proxy's CA mounted into the Grype container (`SSL_CERT_FILE`).
