@@ -18,7 +18,6 @@ env:
   REPOSITORY: ghcr.io/impulse-engineering/hindsight-agent-keys
   # Grype runs as a digest-pinned container: no third-party action code.
   GRYPE: anchore/grype@sha256:e4a44ef45d285b829ce6efe2642980329661bd2d18eab5fc539138d4adaebbbe # v0.120.1
-  ACTIONLINT: rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # v1.7.12
 
 jobs:
   test:
@@ -35,10 +34,7 @@ jobs:
           /tmp/it/bin/pip install --quiet --require-hashes --no-deps -r requirements-ci.txt
 
       - name: Lint (ruff, shellcheck, actionlint)
-        run: |
-          /tmp/it/bin/ruff check .
-          shellcheck -s sh scripts/*.sh docker/agent-keys-start.sh
-          docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT" -color=false
+        run: PATH="/tmp/it/bin:$PATH" scripts/lint.sh
 
       - name: Script tests (release watcher, fake GitHub)
         run: /tmp/it/bin/pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
