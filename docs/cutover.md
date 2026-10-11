@@ -130,7 +130,7 @@ Then delete the secrets the image no longer reads: `cloudflared access curl "$ca
 cloudflared access curl "$capi/domains/<id>" -sS -X DELETE
 ```
 
-Port 9999 stays in `image_ports`, which is append-only; nothing listens on it.
+Port 9999 stays in `image_ports`: Conductor keeps a deployed port there for good (`imagePortsAppendOnlyError`, aseva-foundation-hosting `conductor/docs/LXC-CONTAINER-PIPELINE.md`, "`image_ports` is append-only after provisioning"). Nothing listens on it.
 
 ## 8. Open the bypass hostname and verify
 
