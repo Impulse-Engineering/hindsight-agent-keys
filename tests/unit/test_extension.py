@@ -38,7 +38,7 @@ async def test_without_a_legacy_key_every_key_is_refused():
 async def test_legacy_key_is_identified_in_the_request_context():
     ctx = RequestContext(api_key=LEGACY)
     await extension().authenticate(ctx)
-    assert ctx.api_key_id == "legacy"
+    assert ctx.api_key_id == "(legacy)"
 
 
 async def test_tenant_list_is_the_public_schema():
@@ -120,13 +120,13 @@ async def refuse(ext, ctx):
 async def test_a_refused_key_is_recorded_with_the_client_ip():
     ext, events = watched()
     await refuse(ext, request("not-a-key"))
-    assert events.rows == [{"kind": "key_refused", "key_id": "unrecognized", "client_ip": "203.0.113.7"}]
+    assert events.rows == [{"kind": "key_refused", "key_id": "(unrecognized)", "client_ip": "203.0.113.7"}]
 
 
 async def test_a_missing_key_is_recorded_as_missing():
     ext, events = watched()
     await refuse(ext, request(None))
-    assert [r["key_id"] for r in events.rows] == ["missing"]
+    assert [r["key_id"] for r in events.rows] == ["(missing)"]
 
 
 async def test_an_agent_key_is_recorded_by_its_id_never_its_secret():
@@ -186,7 +186,7 @@ async def test_refusals_from_different_ips_are_recorded_separately():
 async def test_an_expired_legacy_key_is_recorded_as_expired():
     ext, events = watched(clock=Clock("2026-12-01T00:00:00+00:00"), legacy_key_expires="2026-11-10")
     await refuse(ext, request(LEGACY))
-    assert [(r["kind"], r["key_id"]) for r in events.rows] == [("legacy_key_expired", "legacy")]
+    assert [(r["kind"], r["key_id"]) for r in events.rows] == [("legacy_key_expired", "(legacy)")]
 
 
 async def test_an_accepted_key_records_nothing():
@@ -213,7 +213,35 @@ async def test_refusal_rows_are_capped_per_minute_across_all_clients():
     ext, events = watched(clock=clock)
     for n in range(200):
         await refuse(ext, request("not-a-key", ip=f"198.51.{n // 250}.{n % 250}"))
-    assert len(events.rows) == 60
+    refused = [r for r in events.rows if r["kind"] == "key_refused"]
+    assert len(refused) == 60
     clock.advance(60)
     await refuse(ext, request("not-a-key", ip="203.0.113.99"))
-    assert len(events.rows) == 61
+    assert len([r for r in events.rows if r["kind"] == "key_refused"]) == 61
+
+
+async def test_running_out_of_budget_is_itself_recorded_once_a_minute():
+    clock = Clock()
+    ext, events = watched(clock=clock)
+    for n in range(200):
+        await refuse(ext, request("not-a-key", ip=f"198.51.100.{n % 250}"))
+    assert [r["kind"] for r in events.rows].count("refusal_log_saturated") == 1
+    clock.advance(60)
+    for n in range(200):
+        await refuse(ext, request("not-a-key", ip=f"198.51.101.{n % 250}"))
+    assert [r["kind"] for r in events.rows].count("refusal_log_saturated") == 2
+
+
+@pytest.mark.parametrize("claimed", ["legacy", "missing", "unrecognized"])
+async def test_a_presented_key_cannot_pose_as_a_reserved_key_id(claimed):
+    ext, events = watched()
+    await refuse(ext, request(f"hsk_{claimed}_" + "q" * 43))
+    assert events.rows[0]["key_id"] == claimed
+    assert events.rows[0]["key_id"] not in {"(legacy)", "(missing)", "(unrecognized)"}
+
+
+async def test_an_ipv4_mapped_address_is_recorded_and_throttled_as_ipv4():
+    ext, events = watched()
+    await refuse(ext, request("not-a-key", ip="::ffff:203.0.113.7"))
+    await refuse(ext, request("not-a-key", ip="203.0.113.7"))
+    assert [r["client_ip"] for r in events.rows] == ["203.0.113.7"]
