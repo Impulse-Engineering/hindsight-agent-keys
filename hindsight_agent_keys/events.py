@@ -66,13 +66,25 @@ class RateLimit:
         self._window = timedelta(seconds=window_seconds)
         self._start: datetime | None = None
         self._count = 0
+        self._saturation_reported = False
+
+    def _roll(self, now: datetime) -> None:
+        if self._start is None or now - self._start >= self._window:
+            self._start, self._count, self._saturation_reported = now, 0, False
 
     def allow(self, now: datetime) -> bool:
-        if self._start is None or now - self._start >= self._window:
-            self._start, self._count = now, 0
+        self._roll(now)
         if self._count >= self._limit:
             return False
         self._count += 1
+        return True
+
+    def first_saturation(self, now: datetime) -> bool:
+        """True the first time it is asked in a window whose limit is used up."""
+        self._roll(now)
+        if self._count < self._limit or self._saturation_reported:
+            return False
+        self._saturation_reported = True
         return True
 
 

@@ -19,7 +19,13 @@ from hindsight_api.models import RequestContext
 from hindsight_agent_keys.events import EventLog, PostgresEventLog, RateLimit, Throttle
 
 PUBLIC_SCHEMA = "public"
-LEGACY_KEY_ID = "legacy"
+
+# Reserved key IDs are parenthesised: a presented key's ID is alphanumeric
+# (see _AGENT_KEY_ID), so no presented key can pose as one of these.
+LEGACY_KEY_ID = "(legacy)"
+MISSING_KEY_ID = "(missing)"
+UNRECOGNIZED_KEY_ID = "(unrecognized)"
+NO_KEY_ID = "(none)"
 
 # Per-bank settings no bank may change. Upstream audit logging stays off while the
 # Public Team lives in `public`: unauthenticated requests would write into its log.
@@ -52,9 +58,13 @@ def _client_ip(context: RequestContext) -> str | None:
     """The forwarded client address in canonical form, or None if absent or not an address."""
     raw = (context.extra_headers or {}).get(CLIENT_IP_HEADER) or ""
     try:
-        return str(ipaddress.ip_address(raw.strip()))
+        address = ipaddress.ip_address(raw.strip())
     except ValueError:
         return None
+    # One client, one form: ::ffff:a.b.c.d is the IPv4 address a.b.c.d.
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return str(address)
 
 
 def _client_bucket(client_ip: str | None) -> str | None:
@@ -70,9 +80,9 @@ def _client_bucket(client_ip: str | None) -> str | None:
 
 def _key_id(key: str) -> str:
     if not key:
-        return "missing"
+        return MISSING_KEY_ID
     match = _AGENT_KEY_ID.match(key)
-    return match.group(1) if match else "unrecognized"
+    return match.group(1) if match else UNRECOGNIZED_KEY_ID
 
 
 def _digest(value: str) -> bytes:
@@ -124,7 +134,14 @@ class AgentKeysTenantExtension(TenantExtension):
         if not self._throttle.allow((kind, _client_bucket(client_ip)), now):
             return
         if not self._refusal_budget.allow(now):
+            # Make the suppression itself visible, once a minute.
+            if self._refusal_budget.first_saturation(now):
+                logger.warning("agent-keys: refusal log budget used up; more refusals this minute are not recorded")
+                await self._record("refusal_log_saturated", NO_KEY_ID, None)
             return
+        await self._record(kind, key_id, client_ip)
+
+    async def _record(self, kind: str, key_id: str, client_ip: str | None) -> None:
         try:
             await self._events.record(kind, key_id, client_ip)
         except Exception as exc:  # the refusal stands even if it cannot be logged

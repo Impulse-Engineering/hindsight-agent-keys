@@ -43,8 +43,8 @@ Events go to `agent_keys.events` in Hindsight's own database. That schema sits o
 
 | Column | Meaning |
 | --- | --- |
-| `kind` | `key_refused` or `legacy_key_expired` |
-| `key_id` | `missing`, `unrecognized`, `legacy`, or the `<id>` part of an `hsk_<id>_<secret>` key |
+| `kind` | `key_refused`, `legacy_key_expired`, or `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded) |
+| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)`, or the `<id>` part of a presented `hsk_<id>_<secret>` key. Parenthesised values are reserved; a presented key's ID is never parenthesised. |
 | `client_ip` | The `X-Real-IP` address in canonical form, or empty if missing or not an IP address |
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
