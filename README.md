@@ -90,6 +90,10 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
+## Moving a Conductor app onto the image
+
+[docs/cutover.md](docs/cutover.md) is the runbook: back up pg0, upgrade to the stock release this image is built on, then swap the image while the bypass hostname is behind Access.
+
 ## Troubleshooting
 
 | Symptom | Cause |
