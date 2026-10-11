@@ -41,9 +41,11 @@ key=$(sed -n 's/^HINDSIGHT_API_TENANT_LEGACY_KEY=//p' /etc/apps/$app/.env)   # e
 ```sh
 # CT. Stop the cut-over unless this ends with "backup OK"
 out=/root/$app-pg0-$(date -u +%Y%m%dT%H%M%SZ).dump
-pg pg_dump -Fc hindsight > "$out" && pg pg_restore --list < "$out" | grep ' TABLE ' > /dev/null &&
+pg pg_dump -Fc hindsight > "$out" &&
+  pg pg_restore -f /dev/null < "$out" &&   # reads every block, so a truncated dump fails here
+  pg pg_restore --list < "$out" > "$out.toc" && grep ' TABLE ' "$out.toc" > /dev/null &&
+  banks > /root/$app-banks-before.txt && cat /root/$app-banks-before.txt &&   # the baseline for steps 2 and 6
   sha256sum "$out" && echo "backup OK" || echo "BACKUP FAILED: do not continue"
-banks > /root/$app-banks-before.txt && cat /root/$app-banks-before.txt   # the baseline for steps 2, 6 and 8
 ```
 
 - Copy the dump off the CT: on the node, `pct pull <vmid> /root/<file> /root/<file>`, then `scp` it somewhere safe. Its `sha256sum` there must match the one above.
@@ -94,10 +96,10 @@ Copy the current value of every secret this step or step 5 changes into the pass
    ```sh
    # Operator machine
    python3 -c 'import json,sys; print(json.dumps({"value": open(sys.argv[1]).read().strip()}), end="")' <key file> |
-     cloudflared access curl "$capi/secrets/HINDSIGHT_API_TENANT_LEGACY_KEY" -sS -X PUT -H 'Content-Type: application/json' --data-binary @-
+     cloudflared access curl "$capi/secrets/HINDSIGHT_API_TENANT_LEGACY_KEY" -sS -f -X PUT -H 'Content-Type: application/json' --data-binary @-   # prints "is_set":true
    ```
 
-2. Prod only: register `HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES` and set it to the cut-over date plus 30 days (#697).
+2. Prod only: register `HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES` and set it to the cut-over date plus 30 days (#697), for example `2026-11-30`. It is not secret, so `platform_set_secret` is fine. The extension treats it as optional, so step 6 checks it is there.
 3. If the app has a `HINDSIGHT_API_TENANT_EXTENSION` secret, set it to `hindsight_agent_keys.extension:AgentKeysTenantExtension`. Do not delete it: deleting it restarts stock Hindsight with no tenant extension, which admits every request into `public`. Stock Hindsight cannot import our class, so it stops (`ExtensionLoadError`) and stays down until step 5. A secret overrides the image's own value, and the guard accepts only ours.
 4. Delete any other secret the startup guard refuses (README, "Startup guard"), for example `HINDSIGHT_API_MCP_AUTH_TOKEN`. Otherwise the deploy exits 78 and its log names the variable.
 
@@ -114,6 +116,7 @@ api http://127.0.0.1:$port/health                                       # 200
 api http://127.0.0.1:$port/v1/default/banks                             # 401
 api -H "Authorization: Bearer $key" http://127.0.0.1:$port/v1/default/banks   # 200
 banks | diff /root/$app-banks-before.txt -   # every bank from step 1, no count lower
+sed -n 's/^HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES=//p' /etc/apps/$app/.env   # Prod: the date from step 4.2
 journalctl -u app-$app --since -10min | grep -iE 'agent-keys|tenant|migrat'   # extension loaded, public migrated, no event-log warning
 pg psql -d hindsight -Atc 'select * from agent_keys.events order by 1 desc limit 5'   # the 401 above, as key_refused
 ```
@@ -150,6 +153,6 @@ Retain a memory into an existing bank with `"async": true`, then poll `GET /v1/d
 
 1. Close the bypass hostname (step 3).
 2. Restore the secrets from step 4: set `HINDSIGHT_API_TENANT_EXTENSION` to its old value, and re-create and set the deleted keys. The guard refuses the old extension, so this image stops and stays down instead of serving without our extension. If the app had no `HINDSIGHT_API_TENANT_EXTENSION` before (Dev before #703), there is nothing to restore: stock Hindsight will run with no authentication.
-3. `platform_update_app` to the stock digest from step 2, then `platform_approve_image`. Conductor refuses a rollback across repositories, so this is a new approval, not `platform_rollback_deploy`. Stock Hindsight starts against a database this image used, because the extension's `agent_keys` schema sits outside upstream's migrations.
-4. Reopen the bypass hostname only if a keyless request on the CT gets 401 from the stock extension. Otherwise leave it closed: the app is then reachable only through Access, as it was before the cut-over. Re-create the UI hostname only if the UI comes back: `platform_request_domain container_port_label=ui`.
+3. `platform_update_app` to the stock digest from step 2, then `platform_approve_image`, then wait for the deploy as in step 2.4: the job `completed` and `Applied image ref recorded:` naming the stock digest. Until then the old container keeps answering, so a check in step 4 would test the wrong image. Conductor refuses a rollback across repositories, so this is a new approval, not `platform_rollback_deploy`. Stock Hindsight starts against a database this image used, because the extension's `agent_keys` schema sits outside upstream's migrations.
+4. On the CT, `podman ps --filter "name=^app-$app\$" --format '{{.Image}}'` shows `localhost/app-<app>:<first 40 hex of the stock digest>` and `/version` shows the stock version. Reopen the bypass hostname only if a keyless request then gets 401 from the stock extension. Otherwise leave it closed: the app is then reachable only through Access, as it was before the cut-over. Re-create the UI hostname only if the UI comes back: `platform_request_domain container_port_label=ui`.
 5. Digests older than the step 2 upgrade are not valid targets, because they predate its migrations. Restore the step 1 dump instead.
