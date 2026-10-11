@@ -153,6 +153,16 @@ def test_the_container_refuses_to_start_with_an_unsafe_setting(variable, value):
     assert "Hindsight is running" not in result.stdout
 
 
+@pytest.mark.parametrize("path", ["/app/api/.env", "/app/.env", "/.env"])
+def test_the_container_refuses_to_start_with_a_dotenv_file(tmp_path, path):
+    dotenv = tmp_path / "dotenv"
+    dotenv.write_text("HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:DefaultTenantExtension\n")
+    dotenv.chmod(0o644)
+    result = docker("run", "--rm", "-v", f"{dotenv}:{path}:ro", IMAGE, check=False, timeout=180)
+    assert result.returncode == 78
+    assert path in result.stderr
+
+
 def test_overriding_the_command_does_not_skip_the_guard():
     result = docker(
         "run", "--rm", "-e", "HINDSIGHT_API_MCP_AUTH_TOKEN=any-token", IMAGE, "/app/start-all.sh",
@@ -171,6 +181,19 @@ def test_a_missing_or_unknown_key_gets_401_on_the_api(hindsight, key):
 @pytest.mark.parametrize("key", [None, "not-a-key"])
 def test_a_missing_or_unknown_key_gets_401_on_mcp(hindsight, key):
     status, _ = mcp(hindsight["port"], key, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert status == 401
+
+
+def test_an_mcp_get_probe_without_a_session_returns_only_an_empty_object(hindsight):
+    # Upstream answers this client handshake probe before authentication; it is
+    # the one unauthenticated MCP response, and it carries no data.
+    status, text = http(hindsight["port"], "GET", "/mcp/")
+    assert (status, json.loads(text)) == (200, {})
+
+
+@pytest.mark.parametrize("key", [None, "not-a-key"])
+def test_an_mcp_get_with_a_session_id_still_needs_a_key(hindsight, key):
+    status, _ = http(hindsight["port"], "GET", "/mcp/", key=key, headers={"Mcp-Session-Id": "any-session"})
     assert status == 401
 
 
