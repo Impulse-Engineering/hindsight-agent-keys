@@ -199,3 +199,21 @@ async def test_a_failing_event_store_still_refuses_the_key():
     events = RecordedEvents(fail=True)
     ext = AgentKeysTenantExtension({"legacy_key": LEGACY}, clock=Clock(), events=events)
     await refuse(ext, request("not-a-key"))
+
+
+async def test_addresses_in_one_ipv6_64_are_throttled_as_one_client():
+    ext, events = watched()
+    for n in range(1, 30):
+        await refuse(ext, request("not-a-key", ip=f"2001:db8:0:0::{n:x}"))
+    assert len(events.rows) == 1
+
+
+async def test_refusal_rows_are_capped_per_minute_across_all_clients():
+    clock = Clock()
+    ext, events = watched(clock=clock)
+    for n in range(200):
+        await refuse(ext, request("not-a-key", ip=f"198.51.{n // 250}.{n % 250}"))
+    assert len(events.rows) == 60
+    clock.advance(60)
+    await refuse(ext, request("not-a-key", ip="203.0.113.99"))
+    assert len(events.rows) == 61

@@ -9,7 +9,7 @@ This first version knows one key, the **legacy key**: the deployment's existing 
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
   - It always lists `public` as a tenant, so startup migrates `public` and the worker processes it (see upstream issue #5400).
   - Banks cannot switch on upstream audit logging.
-  - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time, at most one row a minute per client IP.
+  - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. It writes at most one row a minute per client (an IPv4 address, or an IPv6 /64) and at most 60 rows a minute in total.
 - **A startup guard**, described in its own section below.
 - **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension.
 

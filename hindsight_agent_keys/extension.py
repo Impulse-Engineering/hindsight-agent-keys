@@ -16,7 +16,7 @@ from hindsight_api.config import HindsightConfig
 from hindsight_api.extensions.tenant import AuthenticationError, Tenant, TenantContext, TenantExtension
 from hindsight_api.models import RequestContext
 
-from hindsight_agent_keys.events import EventLog, PostgresEventLog, Throttle
+from hindsight_agent_keys.events import EventLog, PostgresEventLog, RateLimit, Throttle
 
 PUBLIC_SCHEMA = "public"
 LEGACY_KEY_ID = "legacy"
@@ -57,6 +57,17 @@ def _client_ip(context: RequestContext) -> str | None:
         return None
 
 
+def _client_bucket(client_ip: str | None) -> str | None:
+    """The unit one client is throttled by: an IPv4 address, or an IPv6 /64
+    (one subscriber typically holds a whole /64 and can rotate within it)."""
+    if client_ip is None:
+        return None
+    address = ipaddress.ip_address(client_ip)
+    if address.version == 6:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return client_ip
+
+
 def _key_id(key: str) -> str:
     if not key:
         return "missing"
@@ -85,7 +96,10 @@ class AgentKeysTenantExtension(TenantExtension):
         self._legacy_expires = _parse_expiry(expires) if expires else None
         self._clock = clock or _now
         self._events = events if events is not None else PostgresEventLog()
+        # Refusal rows are bounded twice: one a minute per client, and at most
+        # 60 a minute in total, so unauthenticated callers cannot grow the log.
         self._throttle = Throttle(window_seconds=60)
+        self._refusal_budget = RateLimit(limit=60, window_seconds=60)
 
     async def on_startup(self) -> None:
         await self._events.start(self.context.get_memory_engine().db_url)
@@ -106,9 +120,10 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def _refused(self, context: RequestContext, kind: str, key_id: str) -> None:
         client_ip = _client_ip(context)
-        # One row per kind per client IP per minute, whatever key it presents:
-        # unauthenticated callers must not be able to grow the log at will.
-        if not self._throttle.allow((kind, client_ip), self._clock()):
+        now = self._clock()
+        if not self._throttle.allow((kind, _client_bucket(client_ip)), now):
+            return
+        if not self._refusal_budget.allow(now):
             return
         try:
             await self._events.record(kind, key_id, client_ip)

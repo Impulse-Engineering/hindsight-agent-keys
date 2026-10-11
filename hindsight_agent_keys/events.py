@@ -35,7 +35,11 @@ class EventLog(Protocol):
 
 
 class Throttle:
-    """Allows one occurrence per key per window, with bounded memory."""
+    """Allows one occurrence per key per window, with bounded memory.
+
+    When the table is full of live entries, new keys are refused rather than
+    the table being cleared, so filling it never re-allows a throttled key.
+    """
 
     def __init__(self, window_seconds: int, max_entries: int = 10_000):
         self._window = timedelta(seconds=window_seconds)
@@ -49,8 +53,26 @@ class Throttle:
         if len(self._last) >= self._max:
             self._last = {k: t for k, t in self._last.items() if now - t < self._window}
             if len(self._last) >= self._max:
-                self._last.clear()
+                return False
         self._last[key] = now
+        return True
+
+
+class RateLimit:
+    """Allows at most `limit` occurrences per fixed window, across all callers."""
+
+    def __init__(self, limit: int, window_seconds: int):
+        self._limit = limit
+        self._window = timedelta(seconds=window_seconds)
+        self._start: datetime | None = None
+        self._count = 0
+
+    def allow(self, now: datetime) -> bool:
+        if self._start is None or now - self._start >= self._window:
+            self._start, self._count = now, 0
+        if self._count >= self._limit:
+            return False
+        self._count += 1
         return True
 
 
