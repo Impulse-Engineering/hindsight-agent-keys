@@ -40,6 +40,9 @@ jobs:
           shellcheck -s sh scripts/*.sh docker/agent-keys-start.sh
           docker run --rm -v "$PWD:/repo:ro" -w /repo "$ACTIONLINT" -color=false
 
+      - name: Script tests (release watcher, fake GitHub)
+        run: /tmp/it/bin/pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
+
       - name: Unit tests (inside the pinned upstream image)
         run: scripts/unit-tests.sh -v
 

@@ -65,14 +65,21 @@ docker build -t hindsight-agent-keys:test .
 uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
+Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They need git, jq and pytest on the host:
+
+```sh
+uv run --no-project --with pytest==8.4.2 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
+```
+
 Behind a TLS-inspecting proxy, the vulnerability scan needs that proxy's CA mounted into the Grype container (`SSL_CERT_FILE`).
 
 ## CI and publishing
 
-- **Every PR:** lint (ruff, shellcheck, actionlint), unit tests, integration tests, and a Grype scan. The scan runs as a digest-pinned container against an exported image tar and blocks on critical vulnerabilities that have a fix.
+- **Every PR:** lint (ruff, shellcheck, actionlint), script tests, unit tests, integration tests, and a Grype scan. The scan runs as a digest-pinned container against an exported image tar and blocks on critical vulnerabilities that have a fix.
 - **On `main`:** an amd64 image is published to `ghcr.io/impulse-engineering/hindsight-agent-keys:<upstream version>-ak.<run>` (a re-run adds `.<attempt>`), with an SBOM, a GitHub build provenance attestation and a keyless cosign signature. A follow-up job then runs the integration tests and the scan against that exact digest. Approve a digest only once that job has passed.
+- **Daily (upstream releases):** the `upstream-release` workflow reads upstream's latest GitHub Release, which is never a draft or a pre-release. If it is newer than the pin and has no PR yet, it opens one PR that pins `ghcr.io/vectorize-io/hindsight:<version>@<digest>` and links the release notes. A release overtaken by a newer one before the next run gets no PR. Closing a PR declines that release; reopen it to take the release up again. Only an exact `vX.Y.Z` release is followed, never a floating tag such as `latest` or `0.10`, or a `-slim` tag. A release tag that is not `vX.Y.Z` fails the run. GitHub holds CI on that PR until a maintainer selects **Approve workflows to run**. Nothing merges automatically; merging publishes the new image as above. It can also be started by hand from the Actions tab, on `main`.
 
-All actions are pinned by commit SHA. Only the publish job can write packages.
+All actions are pinned by commit SHA. Only the publish job can write packages. Only the `upstream-release` workflow can push branches and open PRs, and its own token is its only credential.
 
 Verify a published image:
 
