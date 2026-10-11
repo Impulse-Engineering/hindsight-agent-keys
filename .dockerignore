@@ -1,0 +1,5 @@
+# Send only what the image needs to the build.
+*
+!hindsight_agent_keys/
+!docker/
+**/__pycache__
