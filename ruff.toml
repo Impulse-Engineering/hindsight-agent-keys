@@ -1,0 +1,3 @@
+# A project file overrides any user-level ruff config, so local runs match CI.
+# Default rule set; the image runs Python 3.11.
+target-version = "py311"

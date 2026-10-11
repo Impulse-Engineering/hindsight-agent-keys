@@ -109,7 +109,7 @@ class PostgresEventLog:
             pool = await asyncpg.create_pool(_asyncpg_dsn(db_url), min_size=1, max_size=2)
             async with pool.acquire() as conn:
                 await conn.execute(DDL)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - any failure leaves the log inert, never blocks startup
             logger.warning("agent-keys: event log unavailable, events will not be recorded: %s", exc)
             if pool is not None:
                 await pool.close()
