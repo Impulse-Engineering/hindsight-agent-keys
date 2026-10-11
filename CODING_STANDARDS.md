@@ -10,3 +10,4 @@ Reviewers apply these to every PR. Each rule is a judgement call that no linter 
 3. **Make reserved values unforgeable.** A sentinel stored beside client-supplied values uses a form client input cannot produce.
 4. **Keep docs true to the code.** In the same PR, check every README row, code comment and config comment that states behaviour against the code it describes.
 5. **Pin what runs.** Base and tool images by digest, actions by commit SHA, Python tools by hash. A new pin carries its version as a trailing comment.
+6. **Make fakes honour the contract.** A fake for an external CLI applies the call's output-shaping flags (gh `--jq` through jq) or the test asserts the full argument list, so dropping or changing a flag turns a test red.
