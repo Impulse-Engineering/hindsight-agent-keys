@@ -69,7 +69,7 @@ Behind a TLS-inspecting proxy, the vulnerability scan needs that proxy's CA moun
 
 ## CI and publishing
 
-- **Every PR:** unit tests, integration tests, and a Grype scan. The scan runs as a digest-pinned container against an exported image tar and blocks on critical vulnerabilities that have a fix.
+- **Every PR:** lint (ruff, shellcheck, actionlint), unit tests, integration tests, and a Grype scan. The scan runs as a digest-pinned container against an exported image tar and blocks on critical vulnerabilities that have a fix.
 - **On `main`:** an amd64 image is published to `ghcr.io/impulse-engineering/hindsight-agent-keys:<upstream version>-ak.<run>` (a re-run adds `.<attempt>`), with an SBOM, a GitHub build provenance attestation and a keyless cosign signature. A follow-up job then runs the integration tests and the scan against that exact digest. Approve a digest only once that job has passed.
 
 All actions are pinned by commit SHA. Only the publish job can write packages.
