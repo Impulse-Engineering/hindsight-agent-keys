@@ -4,3 +4,17 @@
 - **Upstream source** is in the pinned image, not on PyPI. The package sits at `/app/api/hindsight_api` (not `site-packages`). Read it with `docker run --rm --entrypoint sh "$(scripts/upstream-ref.sh)" -c '<read-only command>'`.
 - **Tests and CI:** README "Tests" and "CI and publishing". CI on the PR is the full gate.
 - **Review rules:** `CODING_STANDARDS.md`.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub issues in `Impulse-Engineering/aseva-foundation-hosting` (always `gh ... -R`); PRs stay here. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five defaults (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`), already defined in the tracker repo. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context, held in the foundation repo (`CONTEXT.md` + `docs/adr/`); none in this repo. See `docs/agents/domain.md`.
