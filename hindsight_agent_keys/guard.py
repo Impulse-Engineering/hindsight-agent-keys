@@ -10,6 +10,10 @@ import sys
 from collections.abc import Iterable, Mapping
 
 EXTENSION_PATH = "hindsight_agent_keys.extension:AgentKeysTenantExtension"
+HTTP_EXTENSION_PATH = "hindsight_agent_keys.web:AgentKeysHttpExtension"
+MCP_EXTENSION_PATH = "hindsight_agent_keys.tools:AgentKeysMcpExtension"
+# Upstream's audit actions are snake_case names, so an allowlist of only this audits nothing.
+AUDIT_NO_ACTIONS = "(none)"
 
 # Exit status for a configuration error (sysexits EX_CONFIG).
 EX_CONFIG = 78
@@ -52,6 +56,16 @@ def problems(env: Mapping[str, str], dotenv_files: Iterable[str] = ()) -> list[s
             f"HINDSIGHT_API_TENANT_EXTENSION must be {EXTENSION_PATH}; "
             "without it Hindsight admits every request into the public schema."
         )
+    if env.get("HINDSIGHT_API_HTTP_EXTENSION", "") != HTTP_EXTENSION_PATH:
+        found.append(
+            f"HINDSIGHT_API_HTTP_EXTENSION must be {HTTP_EXTENSION_PATH}; "
+            "Hindsight serves whatever another one mounts at /ext unauthenticated, and without ours there are no key pages."
+        )
+    if env.get("HINDSIGHT_API_MCP_EXTENSION", "") != MCP_EXTENSION_PATH:
+        found.append(
+            f"HINDSIGHT_API_MCP_EXTENSION must be {MCP_EXTENSION_PATH}; "
+            "another one would add its own tools to every MCP endpoint, and without ours agents cannot manage Teams."
+        )
     if "HINDSIGHT_API_MCP_AUTH_TOKEN" in env:
         found.append(
             "HINDSIGHT_API_MCP_AUTH_TOKEN must be unset; it bypasses the tenant extension for MCP."
@@ -69,6 +83,14 @@ def problems(env: Mapping[str, str], dotenv_files: Iterable[str] = ()) -> list[s
         found.append(
             "HINDSIGHT_API_AUDIT_LOG_ENABLED must not be true; "
             "unauthenticated requests would write into the Public Team's audit log."
+        )
+    # Parsed as upstream parses it; an empty list audits every action, and a bank's
+    # stored audit_log_enabled then decides, before authentication.
+    actions = [a.strip() for a in env.get("HINDSIGHT_API_AUDIT_LOG_ACTIONS", "").split(",") if a.strip()]
+    if actions != [AUDIT_NO_ACTIONS]:
+        found.append(
+            f"HINDSIGHT_API_AUDIT_LOG_ACTIONS must be {AUDIT_NO_ACTIONS}; "
+            "any other list lets a bank's stored config write unauthenticated requests into the Public Team's audit log."
         )
     # Read exactly as upstream does (value.lower() == "true", no strip): a looser
     # parse here would accept a value upstream treats as stateful.

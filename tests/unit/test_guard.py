@@ -6,8 +6,11 @@ from hindsight_agent_keys.guard import EXTENSION_PATH, problems
 
 SAFE = {
     "HINDSIGHT_API_TENANT_EXTENSION": "hindsight_agent_keys.extension:AgentKeysTenantExtension",
+    "HINDSIGHT_API_HTTP_EXTENSION": "hindsight_agent_keys.web:AgentKeysHttpExtension",
+    "HINDSIGHT_API_MCP_EXTENSION": "hindsight_agent_keys.tools:AgentKeysMcpExtension",
     "HINDSIGHT_ENABLE_CP": "false",
     "HINDSIGHT_API_MCP_STATELESS": "true",
+    "HINDSIGHT_API_AUDIT_LOG_ACTIONS": "(none)",
 }
 
 
@@ -27,6 +30,26 @@ def test_image_defaults_are_accepted():
 
 def test_extension_path_names_our_extension():
     assert EXTENSION_PATH == "hindsight_agent_keys.extension:AgentKeysTenantExtension"
+
+
+# Upstream mounts whatever class HINDSIGHT_API_HTTP_EXTENSION names at /ext with no
+# authentication, or nothing when it is unset or empty (extensions/loader.py:106-111,
+# api/http.py:5301-5316): either way the key pages would not be ours.
+@pytest.mark.parametrize("value", [None, "", "some_package.pages:OpenPages"])
+def test_refuses_when_our_http_extension_is_not_configured(value):
+    found = problems(env(HINDSIGHT_API_HTTP_EXTENSION=value))
+    assert len(found) == 1
+    assert "HINDSIGHT_API_HTTP_EXTENSION" in found[0]
+
+
+# Upstream registers the tools of whatever class HINDSIGHT_API_MCP_EXTENSION names on
+# both MCP servers, or none when it is unset or empty (extensions/loader.py:106-111,
+# api/mcp.py:201-204): either way the Team tools would not be ours.
+@pytest.mark.parametrize("value", [None, "", "some_package.tools:OpenTools"])
+def test_refuses_when_our_mcp_extension_is_not_configured(value):
+    found = problems(env(HINDSIGHT_API_MCP_EXTENSION=value))
+    assert len(found) == 1
+    assert "HINDSIGHT_API_MCP_EXTENSION" in found[0]
 
 
 @pytest.mark.parametrize(
@@ -78,9 +101,24 @@ def test_refuses_stateful_mcp(value):
     assert "HINDSIGHT_API_MCP_STATELESS" in found[0]
 
 
+# Upstream reads the allowlist as [a.strip() for a in value.split(",") if a.strip()] and audits
+# every action when it is empty (config.py:5265-5267, engine/audit.py:144 and 159-161), and every
+# audit path checks it before a bank's stored audit_log_enabled (engine/audit.py:170 and 193,
+# api/http.py:4990, mcp_tools.py:916 and 967). Only "(none)" names no action.
+@pytest.mark.parametrize("value", [None, "", " , ", "retain", "(none),recall"])
+def test_refuses_an_audit_allowlist_that_could_name_an_action(value):
+    found = problems(env(HINDSIGHT_API_AUDIT_LOG_ACTIONS=value))
+    assert len(found) == 1
+    assert "HINDSIGHT_API_AUDIT_LOG_ACTIONS" in found[0]
+
+
+def test_accepts_the_audit_allowlist_as_upstream_parses_it():
+    assert problems(env(HINDSIGHT_API_AUDIT_LOG_ACTIONS=" (none) ,")) == []
+
+
 def test_reports_every_problem_at_once():
     found = problems({"HINDSIGHT_API_MCP_AUTH_TOKEN": "x"})
-    assert len(found) == 4
+    assert len(found) == 7
 
 
 def test_accepts_stateless_mcp_in_any_case():
