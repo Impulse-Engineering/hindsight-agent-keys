@@ -13,15 +13,17 @@ if [ -L "$ROOT/.upstream" ]; then
   echo "upstream-src: .upstream is a symlink; refusing to write or delete through it" >&2
   exit 1
 fi
-# .ref holds the full tag@digest and is written last, so only a complete copy has it.
-if [ "$(cat "$dest/.ref" 2>/dev/null)" != "$ref" ]; then
+# .ref holds the full tag@digest and a fingerprint of every package file, written
+# last; a copy whose files no longer match it (edited, deleted, partial) is rebuilt.
+fingerprint() { (cd "$1" && find hindsight_api -type f -exec cksum {} + | LC_ALL=C sort | cksum); }
+if [ "$(cat "$dest/.ref" 2>/dev/null)" != "$ref $(fingerprint "$dest" 2>/dev/null)" ]; then
   mkdir -p "$ROOT/.upstream"
   tmp=$(mktemp -d "$ROOT/.upstream/.tmp.XXXXXX")
   cid=
   trap 'if [ -n "$cid" ]; then docker rm "$cid" >/dev/null 2>&1 || true; fi; rm -rf "$tmp"' EXIT
   cid=$(docker create "$ref")
   docker cp "$cid:/app/api/hindsight_api" "$tmp/hindsight_api"
-  printf '%s\n' "$ref" > "$tmp/.ref"
+  printf '%s %s\n' "$ref" "$(fingerprint "$tmp")" > "$tmp/.ref"
   rm -rf "$dest"   # incomplete or stale
   mv "$tmp" "$dest"
 fi
