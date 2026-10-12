@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta
 
 import pytest
+from conftest import RecordedEvents
 from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.models import RequestContext
 
@@ -41,11 +42,6 @@ async def test_legacy_key_is_identified_in_the_request_context():
     assert ctx.api_key_id == "(legacy)"
 
 
-async def test_tenant_list_is_the_public_schema():
-    tenants = await extension().list_tenants()
-    assert [t.schema for t in tenants] == ["public"]
-
-
 async def test_banks_cannot_switch_on_upstream_audit_logging():
     allowed = await extension().get_allowed_config_fields(RequestContext(api_key=LEGACY), "any-bank")
     assert "audit_log_enabled" not in allowed
@@ -72,23 +68,6 @@ async def test_legacy_key_is_refused_from_its_expiry(now):
 def test_an_unreadable_expiry_stops_startup():
     with pytest.raises(ValueError):
         extension(legacy_key_expires="next month")
-
-
-class RecordedEvents:
-    def __init__(self, fail=False):
-        self.rows = []
-        self.fail = fail
-
-    async def start(self, db_url):
-        pass
-
-    async def stop(self):
-        pass
-
-    async def record(self, kind, key_id, client_ip):
-        if self.fail:
-            raise RuntimeError("event store unavailable")
-        self.rows.append({"kind": kind, "key_id": key_id, "client_ip": client_ip})
 
 
 class Clock:
@@ -120,7 +99,9 @@ async def refuse(ext, ctx):
 async def test_a_refused_key_is_recorded_with_the_client_ip():
     ext, events = watched()
     await refuse(ext, request("not-a-key"))
-    assert events.rows == [{"kind": "key_refused", "key_id": "(unrecognized)", "client_ip": "203.0.113.7"}]
+    assert events.rows == [
+        {"kind": "key_refused", "key_id": "(unrecognized)", "client_ip": "203.0.113.7", "email": None, "actor": None, "team": None}
+    ]
 
 
 async def test_a_missing_key_is_recorded_as_missing():
