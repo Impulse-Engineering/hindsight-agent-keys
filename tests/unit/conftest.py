@@ -26,10 +26,10 @@ class RecordedEvents:
     async def stop(self):
         pass
 
-    async def record(self, kind, key_id, client_ip, email=None):
+    async def record(self, kind, key_id, client_ip, email=None, actor=None):
         if self.fail:
             raise RuntimeError("event store unavailable")
-        self.rows.append({"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email})
+        self.rows.append({"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor})
 
 
 class MemoryStore:
@@ -38,6 +38,7 @@ class MemoryStore:
     def __init__(self):
         self.people = {}
         self.keys = {}
+        self.roles = {}
         self.fail = False
 
     async def tenant_schemas(self):
@@ -55,7 +56,27 @@ class MemoryStore:
         self.keys[key_id] = {"digest": digest, "name": name, "email": email, "schema": schema}
 
     async def find_key(self, key_id):
-        return self.keys.get(key_id)
+        key = self.keys.get(key_id)
+        return key and {**key, "role": self.roles.get(key["email"])}
+
+    async def role(self, email):
+        return self.roles.get(email)
+
+    async def add_request(self, email):
+        if email in self.roles:
+            return False
+        self.roles[email] = "requested"
+        return True
+
+    async def allowlist(self):
+        rows = sorted(({"email": e, "role": r} for e, r in self.roles.items()), key=lambda r: r["email"])
+        return sorted(rows, key=lambda r: r["role"], reverse=True)
+
+    async def set_role(self, email, role):
+        old = self.roles.pop(email, None)
+        if role is not None:
+            self.roles[email] = role
+        return old
 
     async def close(self):
         pass
