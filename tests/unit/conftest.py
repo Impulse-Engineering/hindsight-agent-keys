@@ -40,6 +40,7 @@ class MemoryStore:
         self.people = {}
         self.keys = {}
         self.sign_ins = {}
+        self.roles = {}
         self.fail = False
 
     async def tenant_schemas(self):
@@ -67,7 +68,26 @@ class MemoryStore:
 
     async def find_key(self, key_id):
         key = self.keys.get(key_id)
-        return key and {**key, "last_seen": self.sign_ins.get(key["email"])}
+        return key and {**key, "role": self.roles.get(key["email"]), "last_seen": self.sign_ins.get(key["email"])}
+
+    async def role(self, email):
+        return self.roles.get(email)
+
+    async def add_request(self, email):
+        if email in self.roles:
+            return False
+        self.roles[email] = "requested"
+        return True
+
+    async def allowlist(self):
+        rows = sorted(({"email": e, "role": r} for e, r in self.roles.items()), key=lambda r: r["email"])
+        return sorted(rows, key=lambda r: r["role"], reverse=True)
+
+    async def set_role(self, email, role):
+        old = self.roles.pop(email, None)
+        if role is not None:
+            self.roles[email] = role
+        return old
 
     async def signed_in(self, email, at):
         self.sign_ins[email] = max(at, self.sign_ins.get(email, at))

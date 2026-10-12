@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.sign_ins (
     email text PRIMARY KEY,
     last_seen timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS {SCHEMA}.allowlist (
+    email text PRIMARY KEY,
+    role text NOT NULL CHECK (role IN ('requested', 'member', 'admin'))
+);
 """
 
 
@@ -119,12 +123,50 @@ class PostgresKeyStore:
                 expires_at,
             )
 
+    async def role(self, email: str) -> str | None:
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT role FROM {SCHEMA}.allowlist WHERE email = $1", email)
+
+    async def allowlist(self) -> list[asyncpg.Record]:
+        """Everyone with a role, pending requests first."""
+        pool = await self._get_pool()
+        return await pool.fetch(f"SELECT email, role FROM {SCHEMA}.allowlist ORDER BY role DESC, email")
+
+    async def add_request(self, email: str) -> bool:
+        """Record a request to join unless the person already has a role; True if recorded."""
+        pool = await self._get_pool()
+        return bool(
+            await pool.fetchval(
+                f"INSERT INTO {SCHEMA}.allowlist (email, role) VALUES ($1, 'requested')"
+                " ON CONFLICT (email) DO NOTHING RETURNING true",
+                email,
+            )
+        )
+
+    async def set_role(self, email: str, role: str | None) -> str | None:
+        """Set the person's role, or remove them with None; returns the role they had."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            old = await conn.fetchval(f"SELECT role FROM {SCHEMA}.allowlist WHERE email = $1 FOR UPDATE", email)
+            if role is None:
+                await conn.execute(f"DELETE FROM {SCHEMA}.allowlist WHERE email = $1", email)
+            else:
+                await conn.execute(
+                    f"INSERT INTO {SCHEMA}.allowlist (email, role) VALUES ($1, $2)"
+                    " ON CONFLICT (email) DO UPDATE SET role = excluded.role",
+                    email,
+                    role,
+                )
+        return old
+
     async def find_key(self, key_id: str) -> asyncpg.Record | None:
-        """The key's digest, email, schema, expiry and revocation, and its owner's last sign-in."""
+        """The key's digest, email, schema, expiry and revocation, its owner's role on the
+        Key Allowlist and its owner's last sign-in, in one indexed lookup."""
         pool = await self._get_pool()
         return await pool.fetchrow(
-            f"SELECT k.digest, k.email, k.schema, k.expires_at, k.revoked_at, s.last_seen"
-            f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.sign_ins s USING (email) WHERE k.id = $1",
+            f"SELECT k.digest, k.email, k.schema, k.expires_at, k.revoked_at, a.role, s.last_seen FROM {SCHEMA}.keys k"
+            f" LEFT JOIN {SCHEMA}.allowlist a ON a.email = k.email"
+            f" LEFT JOIN {SCHEMA}.sign_ins s ON s.email = k.email WHERE k.id = $1",
             key_id,
         )
 

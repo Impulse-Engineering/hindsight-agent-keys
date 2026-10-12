@@ -191,5 +191,5 @@ def test_only_an_admin_can_revoke_an_identity_or_sees_how(team):
     mallory = as_person(team, "mallory@example.com")
     assert client.post("/ext/admin/revoke-identity", json={"email": "alice@example.com"}, headers=mallory).status_code == 403
     assert events.rows == []
-    assert "Revoke an identity" in client.get("/ext/", headers=signed_in(team)).text
-    assert "Revoke an identity" not in client.get("/ext/", headers=signed_in(team, email="mallory@example.com")).text
+    assert "Revoke an identity" in client.get("/ext/admin", headers=signed_in(team)).text
+    assert client.get("/ext/admin", headers=signed_in(team, email="mallory@example.com")).status_code == 403

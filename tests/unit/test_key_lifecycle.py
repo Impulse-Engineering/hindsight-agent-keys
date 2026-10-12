@@ -185,3 +185,9 @@ async def test_only_an_admin_can_revoke_an_identity(keys):
         await keys.ext.revoke_identity("mallory@example.com", BOB, None)
     assert refusal.value.status == 403
     assert await works(keys, key)
+
+
+async def test_an_admin_granted_on_the_admin_page_can_revoke_an_identity(keys):
+    await keys.ext.set_role(ALICE, "carol@example.com", "admin", None)
+    await keys.ext.create_personal_key(BOB, "laptop", None)
+    assert await keys.ext.revoke_identity("carol@example.com", BOB, None) == 1

@@ -8,9 +8,9 @@ and a same-origin Origin. The state lives on the tenant extension.
 
 import html
 from collections.abc import Awaitable
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from hindsight_api.extensions.http import HttpExtension
 from pydantic import BaseModel, StringConstraints
@@ -26,8 +26,41 @@ class NewKey(BaseModel):
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
 
+class RoleChange(BaseModel):
+    email: Annotated[
+        str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")
+    ]
+    role: Literal["member", "admin"] | None  # None removes the person, or declines their request
+
+
+# What the page says about a person's place on the Key Allowlist, by role.
+ALLOWLIST_NOTE = {
+    None: '<p>You are not on the Key Allowlist. <button id="request-access" type="button">Ask an admin to add you</button></p>',
+    "requested": "<p>Your request to join the Key Allowlist is waiting for an admin.</p>",
+    "member": "",
+    "admin": '<p><a href="/ext/admin">Manage the Key Allowlist</a></p>',
+}
+ROLE_LABELS = {"requested": "Asked to join", "member": "Member", "admin": "Admin"}
+# The admin page's buttons for each role: (new role, label); an empty role removes.
+ROLE_ACTIONS = {
+    "requested": (("member", "Approve"), ("", "Decline")),
+    "member": (("admin", "Grant admin rights"), ("", "Remove")),
+    "admin": (("member", "Remove admin rights"), ("", "Remove")),
+}
+
+
+def _allowlist_row(email: str, role: str, bootstrap: bool) -> str:
+    shown = html.escape(email)
+    actions = "Set in AGENT_KEYS_ADMIN_EMAILS" if bootstrap else " ".join(
+        f'<button type="button" data-email="{shown}" data-role="{new}">{label}</button>' for new, label in ROLE_ACTIONS[role]
+    )
+    return f"<tr><td>{shown}</td><td>{ROLE_LABELS[role]}</td><td>{actions}</td></tr>"
+
+
 class Identity(BaseModel):
-    email: Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, min_length=1, max_length=320)]
+    email: Annotated[
+        str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")
+    ]
 
 
 async def _or_refused(change: Awaitable):
@@ -57,12 +90,38 @@ class AgentKeysHttpExtension(HttpExtension):
                 raise HTTPException(403, "Sign in through Cloudflare Access.")
             return email
 
+        async def admin(email: str = Depends(person)) -> str:
+            """The signed-in admin's email; refuses everyone else."""
+            if await memory.tenant_extension.role(email) != "admin":
+                raise HTTPException(403, "Only admins can manage the Key Allowlist.")
+            return email
+
         router = APIRouter(include_in_schema=False, dependencies=[Depends(person)])
+        # Every route under /ext/admin is for admins only.
+        admin_router = APIRouter(prefix="/admin", dependencies=[Depends(admin)])
 
         @router.get("/", response_class=HTMLResponse)
         async def page(email: str = Depends(person)):
-            admin = ADMIN_FORM if email in memory.tenant_extension.bootstrap_admins else ""
-            return PAGE.replace("$admin", admin).replace("$email", html.escape(email))
+            note = ALLOWLIST_NOTE[await memory.tenant_extension.role(email)]
+            return PAGE.replace("$allowlist", note).replace("$email", html.escape(email))
+
+        @router.post("/access-requests", status_code=204)
+        async def request_access(request: Request, email: str = Depends(person)):
+            await memory.tenant_extension.request_access(email, client_ip(request.headers))
+
+        @admin_router.get("", response_class=HTMLResponse)
+        async def admin_page():
+            keys = memory.tenant_extension
+            rows = "\n".join(_allowlist_row(e, r, e in keys.bootstrap_admins) for e, r in await keys.allowlist())
+            return ADMIN_PAGE.replace("$rows", rows)
+
+        @admin_router.post("/people")
+        async def set_role(body: RoleChange, request: Request, email: str = Depends(admin)):
+            try:
+                await memory.tenant_extension.set_role(email, body.email, body.role, client_ip(request.headers))
+            except Refused as refusal:
+                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            return Response(status_code=204)
 
         @router.get("/keys")
         async def my_keys(email: str = Depends(person)):
@@ -78,8 +137,8 @@ class AgentKeysHttpExtension(HttpExtension):
             await _or_refused(memory.tenant_extension.revoke_key(email, key_id, client_ip(request.headers)))
             return {"id": key_id, "state": "revoked"}
 
-        @router.post("/admin/revoke-identity")
-        async def revoke_identity(body: Identity, request: Request, email: str = Depends(person)):
+        @admin_router.post("/revoke-identity")
+        async def revoke_identity(body: Identity, request: Request, email: str = Depends(admin)):
             revocation = memory.tenant_extension.revoke_identity(email, body.email, client_ip(request.headers))
             return {"revoked": await _or_refused(revocation)}
 
@@ -93,6 +152,7 @@ class AgentKeysHttpExtension(HttpExtension):
                 return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
             return JSONResponse({"id": key_id, "name": body.name, "key": key}, headers={"Cache-Control": "no-store"})
 
+        router.include_router(admin_router)
         return router
 
 
@@ -102,6 +162,7 @@ PAGE = """<!doctype html>
 <body>
 <h1>Agent Keys</h1>
 <p>Signed in as $email. Your keys work for 90 days, and only while you sign in here at least every 30 days.</p>
+$allowlist
 <form id="create">
   <label for="key-name">Key name</label>
   <input id="key-name" required maxlength="100">
@@ -113,7 +174,6 @@ PAGE = """<!doctype html>
   <thead><tr><th>Name</th><th>ID</th><th>Created</th><th>Expires</th><th>State</th><th></th></tr></thead>
   <tbody id="keys"></tbody>
 </table>
-$admin
 <script>
 const result = document.getElementById("result");
 async function post(path, body) {
@@ -156,22 +216,78 @@ document.getElementById("create").addEventListener("submit", async (event) => {
     showKeys();
   }
 });
-document.getElementById("revoke-identity")?.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const email = document.getElementById("identity").value;
-  if (!confirm("Revoke every key " + email + " holds?")) return;
-  const body = await post("/ext/admin/revoke-identity", {email});
-  if (body) result.textContent = "Revoked " + body.revoked + " keys held by " + email + ".";
-});
 showKeys();
+document.getElementById("request-access")?.addEventListener("click", async () => {
+  const resp = await fetch("/ext/access-requests", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
+    body: "{}",
+  });
+  if (resp.ok) location.reload();
+});
 </script>
 </body>
 </html>
 """
 
-ADMIN_FORM = """<h2>Revoke an identity</h2>
+ADMIN_PAGE = """<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Key Allowlist</title></head>
+<body>
+<h1>Key Allowlist</h1>
+<p>Only people on the Key Allowlist can create Agent Keys. Removing someone disables the keys they hold.
+<a href="/ext/">Your keys</a></p>
+<form id="add">
+  <label for="email">Email</label>
+  <input id="email" type="email" required maxlength="254">
+  <button>Add</button>
+</form>
+<p id="result" role="status"></p>
+<h2>Revoke an identity</h2>
 <form id="revoke-identity">
   <label for="identity">Email</label>
-  <input id="identity" type="email" required maxlength="320">
+  <input id="identity" type="email" required maxlength="254">
   <button>Revoke every key this person holds</button>
-</form>"""
+</form>
+<h2>People</h2>
+<table>
+<thead><tr><th scope="col">Email</th><th scope="col">Role</th><th scope="col">Change</th></tr></thead>
+<tbody>
+$rows
+</tbody>
+</table>
+<script>
+async function setRole(email, role) {
+  const resp = await fetch("/ext/admin/people", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
+    body: JSON.stringify({email, role}),
+  });
+  if (resp.ok) return location.reload();
+  document.getElementById("result").textContent = "Refused: " + JSON.stringify((await resp.json()).detail);
+}
+document.getElementById("add").addEventListener("submit", (event) => {
+  event.preventDefault();
+  setRole(document.getElementById("email").value, "member");
+});
+document.querySelectorAll("button[data-email]").forEach((button) => {
+  button.addEventListener("click", () => setRole(button.dataset.email, button.dataset.role || null));
+});
+document.getElementById("revoke-identity").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const email = document.getElementById("identity").value;
+  if (!confirm("Revoke every key " + email + " holds?")) return;
+  const resp = await fetch("/ext/admin/revoke-identity", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
+    body: JSON.stringify({email}),
+  });
+  const answer = await resp.json();
+  document.getElementById("result").textContent = resp.ok
+    ? "Revoked " + answer.revoked + " keys held by " + email + "."
+    : "Refused: " + JSON.stringify(answer.detail);
+});
+</script>
+</body>
+</html>
+"""
