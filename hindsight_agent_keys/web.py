@@ -215,6 +215,24 @@ class AgentKeysHttpExtension(HttpExtension):
                 return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
             return {"team": team, "email": body.email}
 
+        @router.post("/teams/{team}/confirmations")
+        async def confirm_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
+            """Confirm a pending request to add someone, filed by an agent over MCP."""
+            try:
+                await memory.tenant_extension.confirm_member(email, team, body.email, client_ip(request.headers))
+            except Refused as refusal:
+                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            return {"team": team, "email": body.email}
+
+        @router.delete("/teams/{team}/requests")
+        async def decline_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
+            """Decline a pending request to add someone, filed by an agent over MCP."""
+            try:
+                await memory.tenant_extension.decline_member(email, team, body.email, client_ip(request.headers))
+            except Refused as refusal:
+                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            return {"team": team, "email": body.email}
+
         router.include_router(admin_router)
         return router
 
@@ -378,6 +396,13 @@ def teams_html(email: str, teams: list[dict]) -> str:
             f"<p>Schema {e(t['team'])}. Your role: {e(t['role'] or 'none (admin)')}.</p>",
             f"<ul>{members}</ul>",
         ]
+        if t["requests"]:
+            asked = "".join(
+                f"<li>{e(q['email'])} as {e(q['role'])}, asked by {e(q['by'])} "
+                f"{REQUEST_FORMS.format(url=url, email=e(q['email']))}</li>"
+                for q in t["requests"]
+            )
+            parts.append(f"<h3>Waiting for an owner to confirm</h3><ul>{asked}</ul>")
         if t["role"]:
             parts.append(KEY_FORM.format(url=url, label="Create a Team key"))
         parts.append(MEMBER_FORMS.format(url=url))
@@ -400,6 +425,12 @@ MEMBER_FORMS = """<form data-url="{url}/members" data-method="POST">
 <button>Add, or change role</button></form>
 <form data-url="{url}/members" data-method="DELETE">
 <label>Email <input name="email" type="email" required></label> <button>Remove</button></form>"""
+
+# A request an agent filed over MCP lets nobody in until an owner or admin presses Confirm.
+REQUEST_FORMS = """<form data-url="{url}/confirmations" data-method="POST">
+<input type="hidden" name="email" value="{email}"><button>Confirm</button></form>
+<form data-url="{url}/requests" data-method="DELETE">
+<input type="hidden" name="email" value="{email}"><button>Decline</button></form>"""
 
 TEAMS_PAGE = Template("""<!doctype html>
 <html lang="en">

@@ -7,6 +7,7 @@ from hindsight_agent_keys.guard import EXTENSION_PATH, problems
 SAFE = {
     "HINDSIGHT_API_TENANT_EXTENSION": "hindsight_agent_keys.extension:AgentKeysTenantExtension",
     "HINDSIGHT_API_HTTP_EXTENSION": "hindsight_agent_keys.web:AgentKeysHttpExtension",
+    "HINDSIGHT_API_MCP_EXTENSION": "hindsight_agent_keys.tools:AgentKeysMcpExtension",
     "HINDSIGHT_ENABLE_CP": "false",
     "HINDSIGHT_API_MCP_STATELESS": "true",
 }
@@ -38,6 +39,16 @@ def test_refuses_when_our_http_extension_is_not_configured(value):
     found = problems(env(HINDSIGHT_API_HTTP_EXTENSION=value))
     assert len(found) == 1
     assert "HINDSIGHT_API_HTTP_EXTENSION" in found[0]
+
+
+# Upstream registers the tools of whatever class HINDSIGHT_API_MCP_EXTENSION names on
+# both MCP servers, or none when it is unset or empty (extensions/loader.py:106-111,
+# api/mcp.py:201-204): either way the Team tools would not be ours.
+@pytest.mark.parametrize("value", [None, "", "some_package.tools:OpenTools"])
+def test_refuses_when_our_mcp_extension_is_not_configured(value):
+    found = problems(env(HINDSIGHT_API_MCP_EXTENSION=value))
+    assert len(found) == 1
+    assert "HINDSIGHT_API_MCP_EXTENSION" in found[0]
 
 
 @pytest.mark.parametrize(
@@ -91,7 +102,7 @@ def test_refuses_stateful_mcp(value):
 
 def test_reports_every_problem_at_once():
     found = problems({"HINDSIGHT_API_MCP_AUTH_TOKEN": "x"})
-    assert len(found) == 5
+    assert len(found) == 6
 
 
 def test_accepts_stateless_mcp_in_any_case():

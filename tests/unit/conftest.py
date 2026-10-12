@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from hindsight_api.extensions.context import ExtensionContext
 from jwt.algorithms import RSAAlgorithm
 
-from hindsight_agent_keys.store import Refused
+from hindsight_agent_keys.store import TEAMS_PER_PERSON, Refused
 
 AUD = "aud-tag-0123456789"
 
@@ -47,6 +47,8 @@ class MemoryStore:
         self.roles = {}
         self.teams_by_schema = {}
         self.team_roles = {}  # (team, email) -> "owner" | "member"
+        self.creators = {}  # team -> email
+        self.requests = {}  # (team, email) -> (role, requested_by)
         # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
         self.stale = []
         self.fail = False
@@ -59,10 +61,16 @@ class MemoryStore:
             raise OSError("database unavailable")
         return [s for s in self.people.values() if s] + list(self.teams_by_schema)
 
+    async def check_team_limit(self, email):
+        if list(self.creators.values()).count(email) >= TEAMS_PER_PERSON:
+            raise Refused(429, f"You can create at most {TEAMS_PER_PERSON} Teams.")
+
     async def create_team(self, schema, name, owner):
+        await self.check_team_limit(owner)
         if name.lower() in (n.lower() for n in self.teams_by_schema.values()):
             raise Refused(409, "A Team with that name exists.")
         self.teams_by_schema[schema] = name
+        self.creators[schema] = owner
         self.team_roles[schema, owner] = "owner"
 
     async def team_schema(self, name):
@@ -82,6 +90,25 @@ class MemoryStore:
 
     async def remove_member(self, team, email):
         self._change_members(team, lambda roles: roles.pop((team, email), None))
+
+    async def request_member(self, team, email, role, by):
+        self._change_members(team, lambda roles: None)
+        self.requests[team, email] = (role, by)
+
+    async def confirm_member(self, team, email):
+        role, _ = self.requests.get((team, email), (None, None))
+        if role is not None:
+            await self.set_member(team, email, role)
+            del self.requests[team, email]
+        return role
+
+    async def decline_member(self, team, email):
+        self._change_members(team, lambda roles: None)
+        role, _ = self.requests.pop((team, email), (None, None))
+        return role
+
+    async def member_requests(self, team):
+        return [{"email": e, "role": r, "requested_by": b} for (t, e), (r, b) in sorted(self.requests.items()) if t == team]
 
     def _change_members(self, team, change):
         if team not in self.teams_by_schema:
