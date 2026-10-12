@@ -70,13 +70,21 @@ def http(port, method, path, key=None, body=None, headers=None):
         return err.code, err.read().decode()
 
 
-def mcp(port, key, payload):
+def mcp(port, key, payload, path="/mcp/"):
     headers = {"Accept": "application/json, text/event-stream"}
-    status, text = http(port, "POST", "/mcp/", key=key, body=payload, headers=headers)
+    status, text = http(port, "POST", path, key=key, body=payload, headers=headers)
     messages = [json.loads(line[5:]) for line in text.splitlines() if line.startswith("data:")]
     if not messages and text.strip().startswith("{"):
         messages = [json.loads(text)]
     return status, messages
+
+
+def call_tool(port, key, path, tool, **arguments):
+    """Call an MCP tool on the endpoint at `path` and return its JSON answer."""
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
+    status, messages = mcp(port, key, call, path)
+    assert status == 200, messages
+    return json.loads(messages[-1]["result"]["content"][0]["text"])
 
 
 def wait_healthy(port, container):
@@ -242,6 +250,7 @@ def hindsight(volume):
     [
         ("HINDSIGHT_API_TENANT_EXTENSION", "hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension"),
         ("HINDSIGHT_API_HTTP_EXTENSION", ""),
+        ("HINDSIGHT_API_MCP_EXTENSION", ""),
         ("HINDSIGHT_API_MCP_AUTH_TOKEN", "any-token"),
         ("HINDSIGHT_ENABLE_CP", "true"),
         ("HINDSIGHT_API_DATABASE_SCHEMA", "sentinel"),
@@ -520,6 +529,62 @@ def test_a_team_keeps_an_owner_and_a_unique_name_and_public_is_reserved(hindsigh
         assert status == 409, text
     status, page = key_page(hindsight, "GET", "/ext/teams", BOB)
     assert status == 200 and "CI Team" in page and f"{ALICE} (owner)" in page and f"{BOB} (member)" in page
+
+
+MCP_ENDPOINTS = ["/mcp/", f"/mcp/{BANK}/"]
+
+
+def test_agents_manage_teams_over_both_mcp_endpoints_but_only_an_owner_lets_anyone_in(hindsight, two_people):
+    port, key = hindsight["port"], two_people[ALICE]
+    multi, single = MCP_ENDPOINTS
+    team = call_tool(port, key, multi, "create_team", name="MCP Team")["team"]
+    answer = call_tool(port, key, single, "add_team_member", team=team, email=ERIN.upper())
+    assert answer == {"team": team, "email": ERIN, "role": "member", "status": "pending"}
+    call_tool(port, key, multi, "add_team_member", team=team, email=CAROL, role="owner")
+    (listed,) = [t for t in call_tool(port, key, single, "list_teams")["teams"] if t["team"] == team]
+    assert listed["members"] == [{"email": ALICE, "role": "owner"}]
+    assert listed["requests"] == [
+        {"email": CAROL, "role": "owner", "by": ALICE},
+        {"email": ERIN, "role": "member", "by": ALICE},
+    ]
+    team_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", ALICE, {"email": CAROL})
+
+    # Nobody is in the Team until an owner confirms on the Teams page.
+    status, text = key_page(hindsight, "POST", f"/ext/teams/{team}/keys", ERIN, body={"name": "ci"})
+    assert status == 403, text
+    team_page(hindsight, "POST", f"/ext/teams/{team}/confirmations", ALICE, {"email": ERIN})
+    erin = team_page(hindsight, "POST", f"/ext/teams/{team}/keys", ERIN, {"name": "ci"})["key"]
+    assert http(port, "GET", "/v1/default/banks", key=erin)[0] == 200
+
+    assert call_tool(port, key, multi, "remove_team_member", team=team, email=ERIN) == {"team": team, "email": ERIN}
+    assert http(port, "GET", "/v1/default/banks", key=erin)[0] == 401
+    rows = query(hindsight["name"], f"SELECT kind, email, actor FROM agent_keys.events WHERE team = '{team}' ORDER BY id")
+    assert [(r["kind"], r["email"], r["actor"]) for r in rows] == [
+        ("team_created", ALICE, ALICE),
+        ("member_requested", ERIN, ALICE),
+        ("owner_requested", CAROL, ALICE),
+        ("owner_declined", CAROL, ALICE),
+        ("member_confirmed", ERIN, ALICE),
+        ("key_created", ERIN, None),
+        ("member_removed", ERIN, ALICE),
+    ]
+
+
+@pytest.mark.parametrize("path", MCP_ENDPOINTS)
+def test_team_keys_and_the_legacy_key_cannot_create_teams_or_change_membership_over_mcp(hindsight, ci_team, path):
+    port, team = hindsight["port"], ci_team["team"]
+    for key in (ci_team["key"], LEGACY):
+        for tool, arguments in [
+            ("create_team", {"name": "Not allowed"}),
+            ("add_team_member", {"team": team, "email": CAROL, "role": "owner"}),
+            ("remove_team_member", {"team": team, "email": BOB}),
+        ]:
+            assert "personal Agent Key" in call_tool(port, key, path, tool, **arguments)["error"]
+    assert query(hindsight["name"], "SELECT schema FROM agent_keys.teams WHERE name = 'Not allowed'") == []
+    assert query(hindsight["name"], f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == []
+    assert {"email": BOB, "role": "member"} in query(
+        hindsight["name"], f"SELECT email, role FROM agent_keys.members WHERE team = '{team}'"
+    )
 
 
 def test_a_new_key_is_stored_as_an_hmac_and_its_creation_logged(hindsight):

@@ -9,6 +9,7 @@ from test_web import BYPASS, HOST, json_post, pages, signed_in
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
 CAROL = "carol@example.com"
+DAVE = "dave@example.com"
 
 
 @pytest.fixture(autouse=True)
@@ -86,11 +87,44 @@ async def test_people_on_the_key_allowlist_create_public_team_keys(team):
     assert client.post("/ext/teams/public/keys", json={"name": "ci"}, headers=as_person(team, CAROL)).status_code == 403
 
 
+async def test_owners_and_admins_confirm_pending_requests_on_the_teams_page(team):
+    client, ext, events = pages(team)
+    created = create_team(client, team)
+    await ext.set_member(ALICE, created, DAVE, "member", None)
+    await ext.request_member(ALICE, created, "<b>c</b>@example.com", "owner", None)
+    page = client.get("/ext/teams", headers=signed_in(team, email=DAVE)).text
+    assert "&lt;b&gt;c&lt;/b&gt;@example.com as owner, asked by alice@example.com" in page and "<b>c</b>" not in page
+    url = f"/ext/teams/{created}/confirmations"
+    body = {"email": "<b>c</b>@example.com"}
+    resp = client.post(url, json=body, headers=as_person(team, DAVE))
+    assert resp.status_code == 403 and "owners" in resp.json()["detail"]
+    assert client.post(url, json=body, headers=as_person(team, BOB)).status_code == 200
+    assert (await ext.teams(ALICE))[0]["members"][0] == {"email": "<b>c</b>@example.com", "role": "owner"}
+    assert events.rows[-1]["kind"] == "owner_confirmed"
+    resp = client.post(url, json=body, headers=as_person(team, BOB))
+    assert resp.status_code == 404, resp.text
+
+
+async def test_declining_a_pending_request_on_the_teams_page_keeps_the_person_in_the_team(team):
+    client, ext, _ = pages(team)
+    created = create_team(client, team)
+    await ext.set_member(ALICE, created, CAROL, "member", None)
+    await ext.request_member(ALICE, created, CAROL, "owner", None)
+    url = f"/ext/teams/{created}/requests"
+    resp = client.request("DELETE", url, json={"email": CAROL}, headers=as_person(team, ALICE))
+    assert resp.status_code == 200, resp.text
+    (shown,) = await ext.teams(ALICE)
+    assert (shown["members"][1], shown["requests"]) == ({"email": CAROL, "role": "member"}, [])
+    assert client.request("DELETE", url, json={"email": CAROL}, headers=as_person(team, ALICE)).status_code == 404
+
+
 STATE_CHANGES = [
     ("POST", "/ext/teams", {"name": "Platform"}),
     ("POST", "/ext/teams/public/keys", {"name": "ci"}),
     ("POST", "/ext/teams/t_0000000000000000/members", {"email": CAROL, "role": "member"}),
     ("DELETE", "/ext/teams/t_0000000000000000/members", {"email": CAROL}),
+    ("POST", "/ext/teams/t_0000000000000000/confirmations", {"email": CAROL}),
+    ("DELETE", "/ext/teams/t_0000000000000000/requests", {"email": CAROL}),
 ]
 
 
