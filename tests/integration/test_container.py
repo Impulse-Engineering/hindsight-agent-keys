@@ -465,6 +465,76 @@ def test_key_creation_is_rate_limited_and_active_keys_are_capped(hindsight):
         assert create()[0] == 200
     status, text = create()
     assert status == 429 and "active keys" in text
+    # A revoked key no longer counts against the cap (an hour on again, so only the cap applies).
+    rows = query(hindsight["name"], f"UPDATE agent_keys.keys SET created_at = now() - interval '2 hours' WHERE email = '{DAVE}' RETURNING id")
+    assert key_page(hindsight, "POST", f"/ext/keys/{rows[0]['id']}/revoke", DAVE, body={})[0] == 200
+    assert create()[0] == 200
+
+
+def test_revoking_a_key_stops_it_within_an_open_mcp_session(hindsight):
+    port = hindsight["port"]
+    created = personal_key(hindsight, CAROL, name="agent")
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "ci", "version": "0"}},
+    }
+    call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_banks", "arguments": {}}}
+    assert mcp(port, created["key"], init)[0] == 200
+    assert mcp(port, created["key"], call)[0] == 200
+    ip = "203.0.113.80"
+    status, text = key_page(hindsight, "POST", f"/ext/keys/{created['id']}/revoke", CAROL, body={}, headers={"X-Real-IP": ip})
+    assert status == 200, text
+    # No auth cache: the very next call in the same session is refused.
+    assert mcp(port, created["key"], call)[0] == 401
+    rows = query(hindsight["name"], f"SELECT kind, key_id, email FROM agent_keys.events WHERE client_ip = '{ip}'")
+    assert rows == [{"kind": "key_revoked", "key_id": created["id"], "email": CAROL}]
+
+
+def test_a_key_needs_its_owner_to_sign_in_every_30_days_and_expires_unless_renewed(hindsight):
+    port, name = hindsight["port"], hindsight["name"]
+    created = personal_key(hindsight, CAROL, name="lifecycle")
+    key_id, key = created["id"], created["key"]
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
+    query(name, f"UPDATE agent_keys.sign_ins SET last_seen = now() - interval '30 days' WHERE email = '{CAROL}' RETURNING email")
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
+    # Any key page request with a fresh Access token is a sign-in, and revives the key.
+    assert key_page(hindsight, "GET", "/ext/", CAROL)[0] == 200
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
+
+    query(name, f"UPDATE agent_keys.keys SET expires_at = now() + interval '1 day' WHERE id = '{key_id}' RETURNING id")
+    ip = "203.0.113.81"
+    status, text = key_page(hindsight, "POST", f"/ext/keys/{key_id}/renew", CAROL, body={}, headers={"X-Real-IP": ip})
+    assert status == 200, text
+    assert query(name, f"SELECT expires_at > now() + interval '89 days' AS renewed FROM agent_keys.keys WHERE id = '{key_id}'") == [
+        {"renewed": True}
+    ]
+    assert query(name, f"SELECT kind, key_id, email FROM agent_keys.events WHERE client_ip = '{ip}'") == [
+        {"kind": "key_renewed", "key_id": key_id, "email": CAROL}
+    ]
+
+    query(name, f"UPDATE agent_keys.keys SET expires_at = now() WHERE id = '{key_id}' RETURNING id")
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
+    status, text = key_page(hindsight, "GET", "/ext/keys", CAROL)
+    assert {k["id"]: k["state"] for k in json.loads(text)}[key_id] == "expired"
+    assert key_page(hindsight, "POST", f"/ext/keys/{key_id}/renew", CAROL, body={})[0] == 404
+
+
+def test_revoke_identity_disables_every_key_the_person_holds(hindsight):
+    port = hindsight["port"]
+    keys = [personal_key(hindsight, ERIN, name=n)["key"] for n in ("one", "two")]
+    assert [http(port, "GET", "/v1/default/banks", key=k)[0] for k in keys] == [200, 200]
+    ip = "203.0.113.82"
+    body = {"email": ERIN.upper()}
+    status, text = key_page(hindsight, "POST", "/ext/admin/revoke-identity", ALICE, body=body, headers={"X-Real-IP": ip})
+    assert status == 200, text
+    assert [http(port, "GET", "/v1/default/banks", key=k)[0] for k in keys] == [401, 401]
+    unrevoked = f"SELECT count(*) AS n FROM agent_keys.keys WHERE email = '{ERIN}' AND revoked_at IS NULL"
+    assert query(hindsight["name"], unrevoked) == [{"n": 0}]
+    assert query(hindsight["name"], f"SELECT kind, email, actor FROM agent_keys.events WHERE client_ip = '{ip}'") == [
+        {"kind": "identity_revoked", "email": ERIN, "actor": ALICE}
+    ]
 
 
 def test_the_bundled_ui_is_not_listening(hindsight):

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.events (
 );
 CREATE INDEX IF NOT EXISTS events_at_idx ON {SCHEMA}.events (at);
 ALTER TABLE {SCHEMA}.events ADD COLUMN IF NOT EXISTS email text;
+ALTER TABLE {SCHEMA}.events ADD COLUMN IF NOT EXISTS actor text;
 """
 
 
@@ -32,7 +33,9 @@ class EventLog(Protocol):
 
     async def stop(self) -> None: ...
 
-    async def record(self, kind: str, key_id: str, client_ip: str | None, email: str | None = None) -> None: ...
+    async def record(
+        self, kind: str, key_id: str, client_ip: str | None, email: str | None = None, actor: str | None = None
+    ) -> None: ...
 
 
 class Throttle:
@@ -122,13 +125,16 @@ class PostgresEventLog:
         if pool is not None:
             await pool.close()
 
-    async def record(self, kind: str, key_id: str, client_ip: str | None, email: str | None = None) -> None:
+    async def record(
+        self, kind: str, key_id: str, client_ip: str | None, email: str | None = None, actor: str | None = None
+    ) -> None:
         if self._pool is None:
             return
         await self._pool.execute(
-            f"INSERT INTO {SCHEMA}.events (kind, key_id, client_ip, email) VALUES ($1, $2, $3, $4)",
+            f"INSERT INTO {SCHEMA}.events (kind, key_id, client_ip, email, actor) VALUES ($1, $2, $3, $4, $5)",
             kind,
             key_id,
             client_ip,
             email,
+            actor,
         )

@@ -4,6 +4,7 @@ the event log, and a Cloudflare Access team that serves signing keys and signs J
 import json
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import jwt
@@ -26,10 +27,10 @@ class RecordedEvents:
     async def stop(self):
         pass
 
-    async def record(self, kind, key_id, client_ip, email=None):
+    async def record(self, kind, key_id, client_ip, email=None, actor=None):
         if self.fail:
             raise RuntimeError("event store unavailable")
-        self.rows.append({"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email})
+        self.rows.append({"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor})
 
 
 class MemoryStore:
@@ -38,6 +39,7 @@ class MemoryStore:
     def __init__(self):
         self.people = {}
         self.keys = {}
+        self.sign_ins = {}
         self.fail = False
 
     async def tenant_schemas(self):
@@ -51,11 +53,41 @@ class MemoryStore:
     async def add_person(self, email, schema):
         return self.people.setdefault(email, schema)
 
-    async def add_key(self, key_id, digest, name, email, schema):
-        self.keys[key_id] = {"digest": digest, "name": name, "email": email, "schema": schema}
+    async def add_key(self, key_id, digest, name, email, schema, expires_at):
+        self.keys[key_id] = {
+            "id": key_id,
+            "digest": digest,
+            "name": name,
+            "email": email,
+            "schema": schema,
+            "created_at": datetime.now(UTC),
+            "expires_at": expires_at,
+            "revoked_at": None,
+        }
 
     async def find_key(self, key_id):
-        return self.keys.get(key_id)
+        key = self.keys.get(key_id)
+        return key and {**key, "last_seen": self.sign_ins.get(key["email"])}
+
+    async def signed_in(self, email, at):
+        self.sign_ins[email] = max(at, self.sign_ins.get(email, at))
+
+    async def list_keys(self, email):
+        fields = ("id", "name", "created_at", "expires_at", "revoked_at")
+        return [{f: k[f] for f in fields} for k in self.keys.values() if k["email"] == email]
+
+    async def renew_key(self, email, key_id, now, expires_at):
+        key = self.keys.get(key_id)
+        if key is None or key["email"] != email or key["revoked_at"] is not None or key["expires_at"] <= now:
+            return False
+        key["expires_at"] = expires_at
+        return True
+
+    async def revoke_keys(self, email, now, key_id=None):
+        hits = [k for k in self.keys.values() if k["email"] == email and k["revoked_at"] is None and key_id in (None, k["id"])]
+        for key in hits:
+            key["revoked_at"] = now
+        return len(hits)
 
     async def close(self):
         pass
