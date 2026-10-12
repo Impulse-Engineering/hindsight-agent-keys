@@ -6,6 +6,7 @@ import pytest
 from conftest import MemoryStore, Migrations, RecordedEvents
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.models import RequestContext
 
 from hindsight_agent_keys.extension import AgentKeysTenantExtension
@@ -139,3 +140,56 @@ def test_a_key_needs_a_short_name(team, name):
 def test_the_key_pages_are_not_in_the_public_api_schema(team):
     client, _, _ = pages(team)
     assert not [path for path in client.app.openapi()["paths"] if path.startswith("/ext")]
+
+
+def as_person(team, email):
+    return {**json_post(team), "Cf-Access-Jwt-Assertion": team.token(email=email)}
+
+
+async def test_the_owner_lists_renews_and_revokes_their_keys(team):
+    client, ext, events = pages(team)
+    created = client.post("/ext/keys", json={"name": "laptop"}, headers=json_post(team)).json()
+    listed = client.get("/ext/keys", headers=signed_in(team)).json()
+    assert [(k["id"], k["name"], k["state"]) for k in listed] == [(created["id"], "laptop", "active")]
+    renewed = client.post(f"/ext/keys/{created['id']}/renew", headers=json_post(team))
+    assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["expires_at"] >= listed[0]["expires_at"]
+    assert client.post(f"/ext/keys/{created['id']}/revoke", headers=json_post(team)).status_code == 200
+    assert client.get("/ext/keys", headers=signed_in(team)).json()[0]["state"] == "revoked"
+    with pytest.raises(AuthenticationError):
+        await ext.authenticate(RequestContext(api_key=created["key"]))
+    assert client.post(f"/ext/keys/{created['id']}/revoke", headers=json_post(team)).status_code == 404
+    assert [r["kind"] for r in events.rows] == ["key_created", "key_renewed", "key_revoked", "key_refused"]
+
+
+def test_nobody_else_sees_renews_or_revokes_a_key(team, monkeypatch):
+    monkeypatch.setenv("AGENT_KEYS_ADMIN_EMAILS", "alice@example.com,bob@example.com")
+    client, _, _ = pages(team)
+    key_id = client.post("/ext/keys", json={"name": "laptop"}, headers=json_post(team)).json()["id"]
+    assert client.get("/ext/keys", headers=signed_in(team, email="bob@example.com")).json() == []
+    for action in ("renew", "revoke"):
+        assert client.post(f"/ext/keys/{key_id}/{action}", headers=as_person(team, "bob@example.com")).status_code == 404
+    assert client.get("/ext/keys", headers=signed_in(team)).json()[0]["state"] == "active"
+
+
+async def test_an_admin_revokes_every_key_a_person_holds(team, monkeypatch):
+    monkeypatch.setenv("AGENT_KEYS_ADMIN_EMAILS", "alice@example.com,bob@example.com")
+    client, ext, events = pages(team)
+    bobs = [client.post("/ext/keys", json={"name": n}, headers=as_person(team, "bob@example.com")).json()["key"] for n in "ab"]
+    resp = client.post("/ext/admin/revoke-identity", json={"email": " Bob@Example.com "}, headers=json_post(team))
+    assert (resp.status_code, resp.json()) == (200, {"revoked": 2})
+    for key in bobs:
+        with pytest.raises(AuthenticationError):
+            await ext.authenticate(RequestContext(api_key=key))
+    assert ("identity_revoked", "bob@example.com", "alice@example.com") in [
+        (r["kind"], r["email"], r["actor"]) for r in events.rows
+    ]
+
+
+def test_only_an_admin_can_revoke_an_identity_or_sees_how(team):
+    client, _, events = pages(team)
+    mallory = as_person(team, "mallory@example.com")
+    assert client.post("/ext/admin/revoke-identity", json={"email": "alice@example.com"}, headers=mallory).status_code == 403
+    assert events.rows == []
+    assert "Revoke an identity" in client.get("/ext/", headers=signed_in(team)).text
+    assert "Revoke an identity" not in client.get("/ext/", headers=signed_in(team, email="mallory@example.com")).text
