@@ -7,6 +7,7 @@ and a same-origin Origin. The state lives on the tenant extension.
 """
 
 import html
+from collections.abc import Awaitable
 from string import Template
 from typing import Annotated, Literal
 
@@ -72,6 +73,20 @@ def _allowlist_row(email: str, role: str, bootstrap: bool) -> str:
     return f"<tr><td>{shown}</td><td>{ROLE_LABELS[role]}</td><td>{actions}</td></tr>"
 
 
+class Identity(BaseModel):
+    email: Annotated[
+        str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")
+    ]
+
+
+async def _or_refused(change: Awaitable):
+    """The change's result; a refusal becomes its HTTP status with the reason as detail."""
+    try:
+        return await change
+    except Refused as refusal:
+        raise HTTPException(refusal.status, str(refusal)) from None
+
+
 class AgentKeysHttpExtension(HttpExtension):
     def get_router(self, memory) -> APIRouter:
         async def person(request: Request) -> str:
@@ -123,6 +138,25 @@ class AgentKeysHttpExtension(HttpExtension):
             except Refused as refusal:
                 return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
             return Response(status_code=204)
+
+        @router.get("/keys")
+        async def my_keys(email: str = Depends(person)):
+            return await memory.tenant_extension.list_keys(email)
+
+        @router.post("/keys/{key_id}/renew")
+        async def renew_key(key_id: str, request: Request, email: str = Depends(person)):
+            renewal = memory.tenant_extension.renew_key(email, key_id, client_ip(request.headers))
+            return {"id": key_id, "expires_at": await _or_refused(renewal)}
+
+        @router.post("/keys/{key_id}/revoke")
+        async def revoke_key(key_id: str, request: Request, email: str = Depends(person)):
+            await _or_refused(memory.tenant_extension.revoke_key(email, key_id, client_ip(request.headers)))
+            return {"id": key_id, "state": "revoked"}
+
+        @admin_router.post("/revoke-identity")
+        async def revoke_identity(body: Identity, request: Request, email: str = Depends(admin)):
+            revocation = memory.tenant_extension.revoke_identity(email, body.email, client_ip(request.headers))
+            return {"revoked": await _or_refused(revocation)}
 
         @router.post("/keys")
         async def create_key(body: NewKey, request: Request, email: str = Depends(person)):
@@ -201,6 +235,7 @@ PAGE = """<!doctype html>
 <body>
 <h1>Agent Keys</h1>
 <p>Signed in as $email. <a href="/ext/teams">Teams</a></p>
+<p>Your keys work for 90 days, and only while you sign in here at least every 30 days.</p>
 $allowlist
 <form id="create">
   <label for="key-name">Key name</label>
@@ -208,20 +243,54 @@ $allowlist
   <button>Create a personal key</button>
 </form>
 <p id="result" role="status"></p>
+<h2>Your keys</h2>
+<table>
+  <thead><tr><th>Name</th><th>ID</th><th>Created</th><th>Expires</th><th>State</th><th></th></tr></thead>
+  <tbody id="keys"></tbody>
+</table>
 <script>
-document.getElementById("create").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const result = document.getElementById("result");
-  const resp = await fetch("/ext/keys", {
+const result = document.getElementById("result");
+async function post(path, body) {
+  const resp = await fetch(path, {
     method: "POST",
     headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
-    body: JSON.stringify({name: document.getElementById("key-name").value}),
+    body: JSON.stringify(body),
   });
-  const body = await resp.json();
-  result.textContent = resp.ok
-    ? "Your new key, shown only now. Copy it: " + body.key
-    : "Refused: " + JSON.stringify(body.detail);
+  const answer = await resp.json();
+  if (!resp.ok) result.textContent = "Refused: " + JSON.stringify(answer.detail);
+  return resp.ok ? answer : null;
+}
+async function showKeys() {
+  const keys = await (await fetch("/ext/keys")).json();
+  document.getElementById("keys").replaceChildren(...keys.map((key) => {
+    const row = document.createElement("tr");
+    for (const text of [key.name, key.id, key.created_at, key.expires_at, key.state]) {
+      row.insertCell().textContent = text;
+    }
+    const actions = row.insertCell();
+    for (const action of key.state === "active" ? ["renew", "revoke"] : []) {
+      const button = actions.appendChild(document.createElement("button"));
+      button.textContent = action;
+      button.onclick = async () => {
+        if (action === "revoke" && !confirm("Revoke " + key.name + "? Agents using it stop at once.")) return;
+        if (await post("/ext/keys/" + key.id + "/" + action, {})) {
+          result.textContent = key.name + ": " + action + "ed.";
+          showKeys();
+        }
+      };
+    }
+    return row;
+  }));
+}
+document.getElementById("create").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const body = await post("/ext/keys", {name: document.getElementById("key-name").value});
+  if (body) {
+    result.textContent = "Your new key, shown only now. Copy it: " + body.key;
+    showKeys();
+  }
 });
+showKeys();
 document.getElementById("request-access")?.addEventListener("click", async () => {
   const resp = await fetch("/ext/access-requests", {
     method: "POST",
@@ -248,6 +317,13 @@ ADMIN_PAGE = """<!doctype html>
   <button>Add</button>
 </form>
 <p id="result" role="status"></p>
+<h2>Revoke an identity</h2>
+<form id="revoke-identity">
+  <label for="identity">Email</label>
+  <input id="identity" type="email" required maxlength="254">
+  <button>Revoke every key this person holds</button>
+</form>
+<h2>People</h2>
 <table>
 <thead><tr><th scope="col">Email</th><th scope="col">Role</th><th scope="col">Change</th></tr></thead>
 <tbody>
@@ -270,6 +346,20 @@ document.getElementById("add").addEventListener("submit", (event) => {
 });
 document.querySelectorAll("button[data-email]").forEach((button) => {
   button.addEventListener("click", () => setRole(button.dataset.email, button.dataset.role || null));
+});
+document.getElementById("revoke-identity").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const email = document.getElementById("identity").value;
+  if (!confirm("Revoke every key " + email + " holds?")) return;
+  const resp = await fetch("/ext/admin/revoke-identity", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
+    body: JSON.stringify({email}),
+  });
+  const answer = await resp.json();
+  document.getElementById("result").textContent = resp.ok
+    ? "Revoked " + answer.revoked + " keys held by " + email + "."
+    : "Refused: " + JSON.stringify(answer.detail);
 });
 </script>
 </body>

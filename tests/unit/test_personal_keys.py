@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import re
+from datetime import UTC, datetime
 
 import pytest
 from conftest import MemoryStore, Migrations, RecordedEvents
@@ -26,6 +27,8 @@ def admins(monkeypatch):
 
 def extension(store=None, **config):
     store, migrations, events = store or MemoryStore(), Migrations(), RecordedEvents()
+    # Both people have just signed in through Access; test_key_lifecycle covers sign-ins.
+    store.sign_ins.update(dict.fromkeys((ALICE, BOB), datetime.now(UTC)))
     ext = AgentKeysTenantExtension({"key_pepper": PEPPER, "legacy_key": LEGACY, **config}, store=store, events=events)
     ext.set_context(migrations)
     return ext, store, migrations, events

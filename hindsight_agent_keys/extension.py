@@ -15,7 +15,7 @@ import re
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from hindsight_api.config import HindsightConfig, get_config
 from hindsight_api.extensions.tenant import (
@@ -32,6 +32,11 @@ from hindsight_agent_keys.events import EventLog, PostgresEventLog, RateLimit, T
 from hindsight_agent_keys.store import PostgresKeyStore, Refused
 
 PUBLIC_SCHEMA = "public"
+
+# A key works for this long after it is created or renewed,
+KEY_LIFETIME = timedelta(days=90)
+# and only while its owner has signed in through Access within this window.
+SIGN_IN_WINDOW = timedelta(days=30)
 
 # Roles on the Key Allowlist that may create keys; 'requested' may not.
 LISTED = ("member", "admin")
@@ -179,10 +184,19 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._store.close()
 
     async def access_email(self, token: str | None) -> str | None:
-        """The signed-in person's lowercase email from an Access JWT, or None."""
+        """The signed-in person's lowercase email from an Access JWT, or None.
+
+        Records the sign-in: agents never pass through Access, so this is the only
+        evidence that a key's owner is still with us.
+        """
         if self._access is None or not token:
             return None
-        return await self._access.email(token)
+        person = await self._access.email(token)
+        if person is None:
+            return None
+        email, signed_in_at = person
+        await self._store.signed_in(email, signed_in_at)
+        return email
 
     async def role(self, email: str) -> str | None:
         """The person's place on the Key Allowlist: 'admin', 'member', 'requested' (asked to join) or None."""
@@ -231,9 +245,40 @@ class AgentKeysTenantExtension(TenantExtension):
     async def _add_key(self, email: str, schema: str, kind: str, name: str, client_ip: str | None) -> tuple[str, str]:
         key_id = secrets.token_hex(8)
         key = f"hsk_{key_id}_{secrets.token_urlsafe(32)}"
-        await self._store.add_key(key_id, self._hmac(key), name, email, schema, kind)
+        await self._store.add_key(key_id, self._hmac(key), name, email, schema, kind, self._clock() + KEY_LIFETIME)
         await self._record("key_created", key_id, client_ip, email, **({"team": schema} if kind == "team" else {}))
         return key_id, key
+
+    async def list_keys(self, email: str) -> list[dict]:
+        """The person's own keys, oldest first, each with its state."""
+        now = self._clock()
+        return [
+            {**row, "state": "revoked" if row["revoked_at"] else "expired" if now >= row["expires_at"] else "active"}
+            for row in await self._store.list_keys(email)
+        ]
+
+    async def renew_key(self, email: str, key_id: str, client_ip: str | None) -> datetime:
+        """Give the person's unexpired key another full lifetime; returns its new expiry."""
+        now = self._clock()
+        expires_at = now + KEY_LIFETIME
+        if not await self._store.renew_key(email, key_id, now, expires_at):
+            raise Refused(404, "You hold no active key with that ID.")
+        await self._record("key_renewed", key_id, client_ip, email)
+        return expires_at
+
+    async def revoke_key(self, email: str, key_id: str, client_ip: str | None) -> None:
+        """Revoke one of the person's own keys; it is refused from its next request."""
+        if not await self._store.revoke_keys(email, self._clock(), key_id):
+            raise Refused(404, "You hold no unrevoked key with that ID.")
+        await self._record("key_revoked", key_id, client_ip, email)
+
+    async def revoke_identity(self, admin: str, email: str, client_ip: str | None) -> int:
+        """Revoke every key the person holds; returns how many. Admins only."""
+        if await self.role(admin) != "admin":
+            raise Refused(403, "Only an admin can revoke an identity.")
+        revoked = await self._store.revoke_keys(email, self._clock())
+        await self._record("identity_revoked", NO_KEY_ID, client_ip, email, actor=admin)
+        return revoked
 
     async def create_team_key(self, email: str, team: str, name: str, client_ip: str | None) -> tuple[str, str]:
         """Create a key for a Team the person is in, or for the Public Team (`public`).
@@ -334,6 +379,11 @@ class AgentKeysTenantExtension(TenantExtension):
             return None
         row = await self._store.find_key(match.group(1))
         if not hmac.compare_digest(self._hmac(key), row["digest"] if row else _NO_DIGEST) or row is None:
+            return None
+        now = self._clock()
+        if row["revoked_at"] is not None or now >= row["expires_at"]:
+            return None
+        if row["last_seen"] is None or now - row["last_seen"] >= SIGN_IN_WINDOW:
             return None
         # Removing someone from the Key Allowlist disables the keys they hold.
         if row["role"] not in LISTED and row["email"] not in self.bootstrap_admins:
