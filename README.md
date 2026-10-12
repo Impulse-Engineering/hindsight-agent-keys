@@ -18,7 +18,7 @@ Upstream serves these routes without a key, and they carry no memory data: `/hea
   - It lists `public` first, then every personal and Team schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
   - Banks cannot switch on upstream audit logging.
   - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one row a minute, whatever the event. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process.
-- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys" and "Teams").
+- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist" and "Teams").
 - **A startup guard**, described in its own section below.
 - **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension.
 
@@ -47,7 +47,7 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 | `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` | The Cloudflare Access team URL, such as `https://<team>.cloudflareaccess.com` (Conductor's `CF_ACCESS_TEAM_DOMAIN`). It is the JWT issuer and serves the signing keys. |
 | `HINDSIGHT_API_TENANT_ACCESS_AUD` | The Access application's AUD tag (Conductor's `CF_ACCESS_AUD`). It changes if the Access application is recreated. |
 | `HINDSIGHT_API_TENANT_ACCESS_HOST` | The app's Access-protected hostname, such as `<primary>`. The key pages answer only on it. |
-| `AGENT_KEYS_ADMIN_EMAILS` | Comma-separated emails of the first admins; case and spaces are ignored. Admins manage every Team. For now they are also the whole Key Allowlist: only they can create keys and Teams. |
+| `AGENT_KEYS_ADMIN_EMAILS` | Comma-separated emails of the bootstrap admins; case and spaces are ignored. They are always admins, so always on the Key Allowlist, and the admin page cannot change them. |
 
 Without all three `ACCESS` settings the key pages refuse every request. Everything else is upstream Hindsight configuration, such as the LLM provider and its key.
 
@@ -64,6 +64,17 @@ A person on the Key Allowlist opens `https://<access host>/ext/`, names a key an
 - **Limits:** each person can create 5 keys an hour and hold 10. Both are counted in the database.
 - **Schema:** a person's first key creates their schema, `p_` plus 16 random hex digits, never derived from their email, and migrates it before the key is shown. Every later key of theirs reaches the same schema.
 
+Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, creation time), `allowlist` (email, role), `teams` (schema, name) and `members` (Team schema, email, role `owner` or `member`).
+
+## The Key Allowlist
+
+Only people on the Key Allowlist can create Agent Keys. The bootstrap admins in `AGENT_KEYS_ADMIN_EMAILS` are always on it; everyone else has a row in `agent_keys.allowlist` with the role `member`, `admin`, or `requested` (asked to join, not yet on the list).
+
+- **Asking to join:** a signed-in person who is not on the list sees a button on `/ext/` that files a request. Asking again changes nothing.
+- **Admins** (bootstrap admins and anyone granted admin rights) manage the list at `https://<access host>/ext/admin`: add people by email, approve or decline requests, grant and remove admin rights, and remove people. Everyone else gets 403 on every `/ext/admin` route. The bootstrap admins cannot be changed there (409); edit the secret instead.
+- **Removing someone** stops them creating keys and disables the keys they hold: every request with a key checks its owner is still on the list. Their keys are not deleted, so adding them back makes the keys work again.
+- **Logging:** every change is an event (see "The event log").
+
 ## Teams
 
 A Team is a named set of people who share one schema. A person on the Key Allowlist opens `https://<access host>/ext/teams`, the Teams page, which follows the same hostname, sign-in and state-change rules as the key page.
@@ -73,20 +84,18 @@ A Team is a named set of people who share one schema. A person on the Key Allowl
 - **Team keys:** a member on the Key Allowlist creates a Team key the same way as a personal key, with the same limits, which count personal and Team keys together. Membership is checked on every request, so removing a member stops their Team keys on their next request.
 - **Public Team:** everyone on the Key Allowlist can create a Public Team key, which reaches the banks in `public`. The Public Team has no owners or members.
 
-Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, creation time), `teams` (schema, name) and `members` (Team schema, email, role `owner` or `member`).
-
 ## The event log
 
 Events go to `agent_keys.events` in Hindsight's own database. That schema sits outside upstream's migration history, so stock Hindsight still starts against the same database.
 
 | Column | Meaning |
 | --- | --- |
-| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), or `member_removed` |
-| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (no key involved), or the `<id>` part of a presented or created `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
+| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed`, or a Team change: `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), `member_removed` |
+| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (also every Key Allowlist and Team change), or the `<id>` part of a presented or created `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
 | `client_ip` | The `X-Real-IP` address in canonical form (an IPv4-mapped IPv6 address is stored as IPv4), or `NULL` if the header is missing or not an IP address |
-| `email` | For `key_created` and the Team events, the signed-in person who acted; otherwise `NULL` |
-| `team` | For the Team events and for a Team key's `key_created`, the Team's schema (`public` for the Public Team); otherwise `NULL` |
-| `member` | For `owner_added`, `member_added` and `member_removed`, the person whose membership changed; otherwise `NULL` |
+| `email` | For `key_created`, the person who created the key; for a Key Allowlist or Team change, the person it concerns (for `team_created`, the creator); otherwise `NULL` |
+| `actor` | For a Key Allowlist or Team change, who made it: the admin or owner, or for `access_requested` the person asking; otherwise `NULL` |
+| `team` | For a Team change and for a Team key's `key_created`, the Team's schema (`public` for the Public Team); otherwise `NULL` |
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
 
@@ -150,6 +159,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | The key page answers 404 | The request's hostname is not `HINDSIGHT_API_TENANT_ACCESS_HOST`, or one of the three `ACCESS` settings is unset. |
 | The key page answers 403 "Sign in through Cloudflare Access" | The Access JWT failed validation. Look for `agent-keys: refused an Access token` in the logs; a wrong or changed AUD tag is the usual cause. |
 | Key creation answers 503 | `HINDSIGHT_API_TENANT_KEY_PEPPER` is unset. |
+| A person's Agent Keys all get 401 at once | They were removed from the Key Allowlist (`allowlist_removed` in the event log). Adding them back restores the keys. |
 | Every Agent Key gets 401 | The pepper was changed or removed. Agent Keys must be created again. |
 | A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
 | The event log stays empty | The extension's database connection failed at startup. Look for `agent-keys` warnings in the logs, then restart the container. Refusals are still enforced. |

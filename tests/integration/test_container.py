@@ -383,6 +383,36 @@ def test_people_not_on_the_key_allowlist_cannot_create_keys(hindsight):
     assert status == 403, text
 
 
+def test_an_admin_manages_the_key_allowlist(hindsight):
+    frank = "frank@example.test"
+
+    def change(email, role, admin=ALICE):
+        return key_page(hindsight, "POST", "/ext/admin/people", admin, body={"email": email, "role": role})
+
+    assert key_page(hindsight, "POST", "/ext/access-requests", frank, body={})[0] == 204
+    status, text = key_page(hindsight, "GET", "/ext/admin", ALICE)
+    assert status == 200 and frank in text and "Asked to join" in text
+    assert key_page(hindsight, "GET", "/ext/admin", frank)[0] == 403
+    assert change(BOB, "member", admin=frank)[0] == 403
+
+    assert change(frank, "member")[0] == 204
+    key = personal_key(hindsight, frank)["key"]
+    assert http(hindsight["port"], "GET", "/v1/default/banks", key=key)[0] == 200
+    assert change(frank, None)[0] == 204
+    assert http(hindsight["port"], "GET", "/v1/default/banks", key=key)[0] == 401
+    assert change(BOB, None)[0] == 409
+
+    rows = query(
+        hindsight["name"],
+        f"SELECT kind, actor FROM agent_keys.events WHERE email = '{frank}' AND key_id = '(none)' ORDER BY id",
+    )
+    assert [(r["kind"], r["actor"]) for r in rows] == [
+        ("access_requested", frank),
+        ("access_approved", ALICE),
+        ("allowlist_removed", ALICE),
+    ]
+
+
 @pytest.fixture(scope="module")
 def two_people(hindsight):
     return {email: personal_key(hindsight, email)["key"] for email in (ALICE, BOB)}
@@ -476,9 +506,9 @@ def test_removing_a_member_stops_their_team_key_on_the_next_request(hindsight, c
     assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
     team_page(hindsight, "DELETE", f"/ext/teams/{team}/members", ALICE, {"email": CAROL})
     assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
-    rows = query(hindsight["name"], f"SELECT kind, email, member FROM agent_keys.events WHERE team = '{team}' ORDER BY id")
-    assert rows[0] == {"kind": "team_created", "email": ALICE, "member": None}
-    assert rows[-1] == {"kind": "member_removed", "email": ALICE, "member": CAROL}
+    rows = query(hindsight["name"], f"SELECT kind, email, actor FROM agent_keys.events WHERE team = '{team}' ORDER BY id")
+    assert rows[0] == {"kind": "team_created", "email": ALICE, "actor": ALICE}
+    assert rows[-1] == {"kind": "member_removed", "email": CAROL, "actor": ALICE}
 
 
 def test_a_team_keeps_an_owner_and_a_unique_name_and_public_is_reserved(hindsight, ci_team):
