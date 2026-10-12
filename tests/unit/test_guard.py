@@ -6,6 +6,7 @@ from hindsight_agent_keys.guard import EXTENSION_PATH, problems
 
 SAFE = {
     "HINDSIGHT_API_TENANT_EXTENSION": "hindsight_agent_keys.extension:AgentKeysTenantExtension",
+    "HINDSIGHT_API_HTTP_EXTENSION": "hindsight_agent_keys.web:AgentKeysHttpExtension",
     "HINDSIGHT_ENABLE_CP": "false",
     "HINDSIGHT_API_MCP_STATELESS": "true",
 }
@@ -27,6 +28,16 @@ def test_image_defaults_are_accepted():
 
 def test_extension_path_names_our_extension():
     assert EXTENSION_PATH == "hindsight_agent_keys.extension:AgentKeysTenantExtension"
+
+
+# Upstream mounts whatever class HINDSIGHT_API_HTTP_EXTENSION names at /ext with no
+# authentication, or nothing when it is unset or empty (extensions/loader.py:106-111,
+# api/http.py:5301-5316): either way the key pages would not be ours.
+@pytest.mark.parametrize("value", [None, "", "some_package.pages:OpenPages"])
+def test_refuses_when_our_http_extension_is_not_configured(value):
+    found = problems(env(HINDSIGHT_API_HTTP_EXTENSION=value))
+    assert len(found) == 1
+    assert "HINDSIGHT_API_HTTP_EXTENSION" in found[0]
 
 
 @pytest.mark.parametrize(
@@ -80,7 +91,7 @@ def test_refuses_stateful_mcp(value):
 
 def test_reports_every_problem_at_once():
     found = problems({"HINDSIGHT_API_MCP_AUTH_TOKEN": "x"})
-    assert len(found) == 4
+    assert len(found) == 5
 
 
 def test_accepts_stateless_mcp_in_any_case():

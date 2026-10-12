@@ -4,6 +4,8 @@ IMAGE names the image under test (default hindsight-agent-keys:test). The tests
 start the real container on Hindsight's mock LLM, so they need no credentials.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -22,9 +24,20 @@ UPSTREAM = subprocess.run(
     [os.path.join(ROOT, "scripts", "upstream-ref.sh")], capture_output=True, text=True, check=True
 ).stdout.strip()
 LEGACY = secrets.token_urlsafe(32)
+PEPPER = secrets.token_urlsafe(32)
 BANK = "ci-bank"
 STARTUP_SECONDS = 420
 RUN = secrets.token_hex(4)
+PYTHON = "/app/api/.venv/bin/python"
+
+# A stand-in Cloudflare Access team: the container serves its signing keys to itself.
+ACCESS_PORT = 8999
+TEAM = f"http://127.0.0.1:{ACCESS_PORT}"
+AUD = "ci-access-aud"
+ACCESS_HOST = "keys.example.test"
+BYPASS_HOST = "hindsight-api.example.test"
+ADMINS = ["alice@example.test", "bob@example.test", "carol@example.test", "dave@example.test", "erin@example.test"]
+ALICE, BOB, CAROL, DAVE, ERIN = ADMINS
 
 # Routines that only a migration of `public` installs; upstream #5400 leaves them missing.
 PUBLIC_ROUTINES = {"banks_needing_consolidation", "mental_models_with_cron", "schemas_with_expired_rows"}
@@ -94,7 +107,7 @@ def start(image, name, volume, env):
 
 def in_container(container, script):
     """Run Python inside the container against its pg0 database; returns parsed JSON output."""
-    out = docker("exec", container, "/app/api/.venv/bin/python", "-c", script)
+    out = docker("exec", container, PYTHON, "-c", script)
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
@@ -117,6 +130,85 @@ def query(container, sql):
     return in_container(container, f"QUERY = {sql!r}\n{DB_QUERY}")
 
 
+ACCESS_TOKEN = """
+import json, os, time, urllib.request
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from jwt.algorithms import RSAAlgorithm
+pem, certs = "/tmp/access-key.pem", "/tmp/access/cdn-cgi/access/certs"
+if not os.path.exists(pem):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    os.makedirs(os.path.dirname(certs), exist_ok=True)
+    with open(certs, "w") as f:
+        json.dump({"keys": [{**RSAAlgorithm.to_jwk(key.public_key(), as_dict=True), "kid": "ci", "use": "sig"}]}, f)
+    with open(pem, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()))
+try:
+    urllib.request.urlopen(TEAM + "/cdn-cgi/access/certs", timeout=2).close()
+    serving = True
+except OSError:
+    serving = False
+with open(pem, "rb") as f:
+    key = serialization.load_pem_private_key(f.read(), None)
+now = int(time.time())
+claims = {"iss": TEAM, "aud": [AUD], "iat": now, "exp": now + 600, **CLAIMS}
+claims = {k: v for k, v in claims.items() if v is not None}
+print(json.dumps({"serving": serving, "token": jwt.encode(claims, key, algorithm="RS256", headers={"kid": "ci"})}))
+"""
+
+
+def access_token(container, **claims):
+    """A JWT as Access would issue it; a claim set to None is left out."""
+    script = f"TEAM = {TEAM!r}\nAUD = {AUD!r}\nCLAIMS = {claims!r}\n{ACCESS_TOKEN}"
+    out = in_container(container, script)
+    if not out["serving"]:
+        # Started on first use and again after a restart.
+        docker("exec", "-d", container, PYTHON, "-m", "http.server", str(ACCESS_PORT),
+               "--bind", "127.0.0.1", "--directory", "/tmp/access")
+        deadline = time.time() + 30
+        while not out["serving"]:
+            assert time.time() < deadline, "the stand-in Access team did not start"
+            time.sleep(0.5)
+            out = in_container(container, script)
+    return out["token"]
+
+
+def key_page(hindsight, method, path, email, host=ACCESS_HOST, body=None, headers=None):
+    """A request from a person signed in through Access, as the key page's script sends it."""
+    sent = {"Host": host, "Cf-Access-Jwt-Assertion": access_token(hindsight["name"], email=email)}
+    if method != "GET":
+        sent |= {"X-Agent-Keys": "1", "Origin": f"https://{ACCESS_HOST}"}
+    return http(hindsight["port"], method, path, body=body, headers={**sent, **(headers or {})})
+
+
+def personal_key(hindsight, email, name="ci"):
+    status, text = key_page(hindsight, "POST", "/ext/keys", email, body={"name": name})
+    assert status == 200, text
+    return json.loads(text)
+
+
+def retain_and_wait(port, key, bank, content):
+    """Retain asynchronously and wait until the worker has processed it."""
+    assert http(port, "PUT", f"/v1/default/banks/{bank}", key=key, body={"mission": "ci"})[0] in (200, 201)
+    status, text = http(
+        port, "POST", f"/v1/default/banks/{bank}/memories", key=key, body={"items": [{"content": content}], "async": True}
+    )
+    assert status in (200, 202), text
+    operation = json.loads(text)["operation_id"]
+    deadline = time.time() + 180
+    state = None
+    while time.time() < deadline:
+        status, text = http(port, "GET", f"/v1/default/banks/{bank}/operations/{operation}", key=key)
+        assert status == 200, text
+        state = json.loads(text)["status"]
+        if state in ("completed", "failed"):
+            break
+        time.sleep(2)
+    return state
+
+
 @pytest.fixture(scope="module")
 def volume():
     name = f"hak-it-{RUN}"
@@ -128,7 +220,16 @@ def volume():
 @pytest.fixture(scope="module")
 def hindsight(volume):
     name = f"hak-it-{RUN}"
-    env = {"HINDSIGHT_API_LLM_PROVIDER": "mock", "HINDSIGHT_API_TENANT_LEGACY_KEY": LEGACY}
+    env = {
+        "HINDSIGHT_API_LLM_PROVIDER": "mock",
+        "HINDSIGHT_API_TENANT_LEGACY_KEY": LEGACY,
+        "HINDSIGHT_API_TENANT_KEY_PEPPER": PEPPER,
+        "HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN": TEAM,
+        "HINDSIGHT_API_TENANT_ACCESS_AUD": AUD,
+        "HINDSIGHT_API_TENANT_ACCESS_HOST": ACCESS_HOST,
+        # Mixed case and spaces, as an operator might type them.
+        "AGENT_KEYS_ADMIN_EMAILS": " , ".join(e.capitalize() for e in ADMINS),
+    }
     try:
         port = start(IMAGE, name, volume, env)
         yield {"name": name, "port": port}
@@ -140,6 +241,7 @@ def hindsight(volume):
     ("variable", "value"),
     [
         ("HINDSIGHT_API_TENANT_EXTENSION", "hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension"),
+        ("HINDSIGHT_API_HTTP_EXTENSION", ""),
         ("HINDSIGHT_API_MCP_AUTH_TOKEN", "any-token"),
         ("HINDSIGHT_ENABLE_CP", "true"),
         ("HINDSIGHT_API_DATABASE_SCHEMA", "sentinel"),
@@ -200,27 +302,7 @@ def test_an_mcp_get_with_a_session_id_still_needs_a_key(hindsight, key):
 def test_the_legacy_key_keeps_memory_in_public(hindsight):
     port = hindsight["port"]
     assert http(port, "GET", "/v1/default/banks", key=LEGACY)[0] == 200
-    assert http(port, "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
-
-    status, text = http(
-        port,
-        "POST",
-        f"/v1/default/banks/{BANK}/memories",
-        key=LEGACY,
-        body={"items": [{"content": "Alice works at Google."}], "async": True},
-    )
-    assert status in (200, 202), text
-    operation = json.loads(text)["operation_id"]
-
-    deadline = time.time() + 180
-    state = None
-    while time.time() < deadline:
-        status, text = http(port, "GET", f"/v1/default/banks/{BANK}/operations/{operation}", key=LEGACY)
-        assert status == 200, text
-        state = json.loads(text)["status"]
-        if state in ("completed", "failed"):
-            break
-        time.sleep(2)
+    state = retain_and_wait(port, LEGACY, BANK, "Alice works at Google.")
     assert state == "completed", "the worker did not process the retain task in public"
 
     status, text = http(
@@ -270,6 +352,121 @@ def test_a_refused_key_is_recorded_with_the_client_ip(hindsight):
     assert rows == [{"kind": "key_refused", "key_id": "refusedid", "client_ip": ip}]
 
 
+def test_the_key_page_refuses_the_bypass_hostname(hindsight):
+    status, text = key_page(hindsight, "GET", "/ext/", ALICE)
+    assert status == 200 and ALICE in text
+    assert key_page(hindsight, "GET", "/ext/", ALICE, host=BYPASS_HOST)[0] == 404
+    assert key_page(hindsight, "POST", "/ext/keys", ALICE, host=BYPASS_HOST, body={"name": "x"})[0] == 404
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"aud": ["another-application"]},
+        {"iss": "https://another-team.cloudflareaccess.com"},
+        {"email": None, "common_name": "a-service-token"},
+        {"exp": int(time.time()) - 60},
+    ],
+)
+def test_the_key_page_refuses_an_access_token_that_fails_validation(hindsight, claims):
+    token = access_token(hindsight["name"], **{"email": ALICE, **claims})
+    headers = {"Host": ACCESS_HOST, "Cf-Access-Jwt-Assertion": token}
+    assert http(hindsight["port"], "GET", "/ext/", headers=headers)[0] == 403
+
+
+def test_the_key_page_refuses_a_request_without_an_access_token(hindsight):
+    assert http(hindsight["port"], "GET", "/ext/", headers={"Host": ACCESS_HOST})[0] == 403
+
+
+def test_people_not_on_the_key_allowlist_cannot_create_keys(hindsight):
+    status, text = key_page(hindsight, "POST", "/ext/keys", "mallory@example.test", body={"name": "x"})
+    assert status == 403, text
+
+
+@pytest.fixture(scope="module")
+def two_people(hindsight):
+    return {email: personal_key(hindsight, email)["key"] for email in (ALICE, BOB)}
+
+
+def test_two_peoples_keys_each_see_only_their_own_banks(hindsight, two_people):
+    port = hindsight["port"]
+    assert http(port, "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
+    own = {ALICE: "alice-private", BOB: "bob-private"}
+    for email, key in two_people.items():
+        assert http(port, "PUT", f"/v1/default/banks/{own[email]}", key=key, body={"mission": "ci"})[0] in (200, 201)
+
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "ci", "version": "0"}},
+    }
+    call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_banks", "arguments": {}}}
+    for email, key in two_people.items():
+        status, text = http(port, "GET", "/v1/default/banks", key=key)
+        assert status == 200, text
+        assert {b["bank_id"] for b in json.loads(text)["banks"]} == {own[email]}
+        assert mcp(port, key, init)[0] == 200
+        status, messages = mcp(port, key, call)
+        assert status == 200, messages
+        listed = json.dumps(messages)
+        other = own[BOB] if email == ALICE else own[ALICE]
+        assert own[email] in listed
+        assert other not in listed and BANK not in listed
+
+    # Each bank sits in its owner's generated schema, and nothing new reached public.
+    people = {r["email"]: r["schema"] for r in query(hindsight["name"], "SELECT email, schema FROM agent_keys.people")}
+    for email, bank in own.items():
+        assert query(hindsight["name"], f'SELECT bank_id FROM "{people[email]}".banks') == [{"bank_id": bank}]
+    public = {r["bank_id"] for r in query(hindsight["name"], "SELECT bank_id FROM public.banks")}
+    assert not public & set(own.values())
+
+
+def test_the_worker_processes_background_tasks_in_a_personal_schema(hindsight, two_people):
+    port, key = hindsight["port"], two_people[ALICE]
+    state = retain_and_wait(port, key, "alice-memory", "Alice keeps her notes in a red notebook.")
+    assert state == "completed", "the worker did not process the retain task in a personal schema"
+    status, text = http(
+        port, "POST", "/v1/default/banks/alice-memory/memories/recall", key=key, body={"query": "Where are Alice's notes?"}
+    )
+    assert status == 200, text
+    assert "notebook" in text
+
+
+def test_a_new_key_is_stored_as_an_hmac_and_its_creation_logged(hindsight):
+    created = personal_key(hindsight, CAROL, name="laptop")
+    key = created["key"]
+    assert key.startswith(f"hsk_{created['id']}_")
+    rows = query(hindsight["name"], f"SELECT *, encode(digest, 'hex') AS hex FROM agent_keys.keys WHERE id = '{created['id']}'")
+    assert rows[0]["hex"] == hmac.new(PEPPER.encode(), key.encode(), hashlib.sha256).hexdigest()
+    assert key.split("_", 2)[2] not in json.dumps(rows)
+    assert (rows[0]["email"], rows[0]["name"]) == (CAROL, "laptop")
+
+
+def test_key_creation_is_logged_with_the_key_id_person_and_client_ip(hindsight):
+    ip = "203.0.113.70"
+    status, text = key_page(hindsight, "POST", "/ext/keys", ERIN, body={"name": "ci"}, headers={"X-Real-IP": ip})
+    assert status == 200, text
+    rows = query(hindsight["name"], f"SELECT kind, key_id, email, client_ip FROM agent_keys.events WHERE client_ip = '{ip}'")
+    assert rows == [{"kind": "key_created", "key_id": json.loads(text)["id"], "email": ERIN, "client_ip": ip}]
+
+
+def test_key_creation_is_rate_limited_and_active_keys_are_capped(hindsight):
+    def create():
+        return key_page(hindsight, "POST", "/ext/keys", DAVE, body={"name": "ci"})
+
+    for _ in range(5):
+        assert create()[0] == 200
+    status, text = create()
+    assert status == 429 and "an hour" in text
+    # An hour later the rate allows more, until the cap on active keys.
+    query(hindsight["name"], f"UPDATE agent_keys.keys SET created_at = now() - interval '2 hours' WHERE email = '{DAVE}' RETURNING id")
+    for _ in range(5):
+        assert create()[0] == 200
+    status, text = create()
+    assert status == 429 and "active keys" in text
+
+
 def test_the_bundled_ui_is_not_listening(hindsight):
     probe = (
         "import json, socket\n"
@@ -300,6 +497,10 @@ def test_a_restart_reuses_the_event_log(hindsight):
 
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
+    # The database also holds a personal schema, which stock Hindsight neither lists nor migrates.
+    personal_key(hindsight, ERIN)
+    personal = query(hindsight["name"], "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'p\\_%'")
+    assert personal, "no personal schema to start stock Hindsight against"
     docker("rm", "-f", hindsight["name"])
     name = f"hak-it-stock-{RUN}"
     env = {

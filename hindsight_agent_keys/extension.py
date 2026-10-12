@@ -1,18 +1,22 @@
 """Tenant extension that maps each Agent Key to the schema it may use.
 
-In this first form it knows one key: the legacy shared key, which reaches the
-Public Team in the `public` schema. Every other key, and a missing key, is refused.
+It knows two kinds of key: the legacy shared key, which reaches the Public Team in
+the `public` schema, and personal Agent Keys, each reaching its owner's own schema.
+Every other key, and a missing key, is refused.
 """
 
 import hashlib
 import hmac
 import ipaddress
 import logging
+import os
 import re
-from collections.abc import Callable
+import secrets
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from hindsight_api.config import HindsightConfig
+from hindsight_api.config import HindsightConfig, get_config
 from hindsight_api.extensions.tenant import (
     AuthenticationError,
     Tenant,
@@ -20,8 +24,11 @@ from hindsight_api.extensions.tenant import (
     TenantExtension,
 )
 from hindsight_api.models import RequestContext
+from hindsight_api.pg0 import resolve_database_url
 
+from hindsight_agent_keys.access import AccessVerifier
 from hindsight_agent_keys.events import EventLog, PostgresEventLog, RateLimit, Throttle
+from hindsight_agent_keys.store import PostgresKeyStore, Refused
 
 PUBLIC_SCHEMA = "public"
 
@@ -39,11 +46,24 @@ DENIED_BANK_FIELDS = frozenset({"audit_log_enabled"})
 # Agent Keys look like hsk_<id>_<secret>; only the id may ever be logged.
 _AGENT_KEY_ID = re.compile(r"^hsk_([A-Za-z0-9]{1,32})_")
 
+# Compared against when a key ID is unknown, so that costs the same as a wrong secret.
+_NO_DIGEST = bytes(32)
+
 # The fronting proxy must set X-Real-IP to the real client address and overwrite
 # any client-supplied value; the image passes the header through.
 CLIENT_IP_HEADER = "x-real-ip"
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Principal:
+    """Who an accepted key acts as."""
+
+    kind: str  # "legacy" or "personal"
+    schema: str
+    key_id: str
+    email: str | None = None
 
 
 def _now() -> datetime:
@@ -59,9 +79,9 @@ def _parse_expiry(text: str) -> datetime:
     return when if when.tzinfo else when.replace(tzinfo=UTC)
 
 
-def _client_ip(context: RequestContext) -> str | None:
+def client_ip(headers: Mapping[str, str] | None) -> str | None:
     """The forwarded client address in canonical form, or None if absent or not an address."""
-    raw = (context.extra_headers or {}).get(CLIENT_IP_HEADER) or ""
+    raw = (headers or {}).get(CLIENT_IP_HEADER) or ""
     try:
         address = ipaddress.ip_address(raw.strip())
     except ValueError:
@@ -103,40 +123,111 @@ class AgentKeysTenantExtension(TenantExtension):
         *,
         clock: Callable[[], datetime] | None = None,
         events: EventLog | None = None,
+        store: PostgresKeyStore | None = None,
     ):
         super().__init__(config)
         legacy = config.get("legacy_key") or ""
         self._legacy_digest = _digest(legacy) if legacy else None
         expires = config.get("legacy_key_expires") or ""
         self._legacy_expires = _parse_expiry(expires) if expires else None
+        pepper = (config.get("key_pepper") or "").encode()
+        if pepper and len(pepper) < 32:
+            raise ValueError("HINDSIGHT_API_TENANT_KEY_PEPPER must be at least 32 bytes")
+        # Without a pepper no key can be created and every Agent Key is refused.
+        self._pepper = pepper or None
+        # Until the Key Allowlist is managed on the page, it is these admins.
+        self.bootstrap_admins = frozenset(
+            e.strip().lower() for e in os.environ.get("AGENT_KEYS_ADMIN_EMAILS", "").split(",") if e.strip()
+        )
+        team, audience, host = (config.get(k) or "" for k in ("access_team_domain", "access_aud", "access_host"))
+        # The key pages answer only when all three are set.
+        self.access_host = host.strip().lower() if team and audience and host else None
+        self._access = AccessVerifier(team, audience) if self.access_host else None
         self._clock = clock or _now
         self._events = events if events is not None else PostgresEventLog()
+        self._store = store if store is not None else PostgresKeyStore(self._db_url)
+        self._tenants: list[Tenant] | None = None
         # Refusal rows are bounded twice: one a minute per client, and at most
         # 60 a minute in total, so unauthenticated callers cannot grow the log.
         self._throttle = Throttle(window_seconds=60)
         self._refusal_budget = RateLimit(limit=60, window_seconds=60)
+
+    async def _db_url(self) -> str:
+        if self._context is None:
+            # hindsight-admin lists tenants with no context (admin/cli.py:572); resolve as it does.
+            return await resolve_database_url(get_config().database_url)
+        return self.context.get_memory_engine().db_url
 
     async def on_startup(self) -> None:
         await self._events.start(self.context.get_memory_engine().db_url)
 
     async def on_shutdown(self) -> None:
         await self._events.stop()
+        await self._store.close()
+
+    async def access_email(self, token: str | None) -> str | None:
+        """The signed-in person's lowercase email from an Access JWT, or None."""
+        if self._access is None or not token:
+            return None
+        return await self._access.email(token)
+
+    def _hmac(self, key: str) -> bytes:
+        return hmac.new(self._pepper, key.encode(), hashlib.sha256).digest()
+
+    async def create_personal_key(self, email: str, name: str, client_ip: str | None) -> tuple[str, str]:
+        """Create a key for the person's own schema. Returns (key ID, key); the key is never stored."""
+        if self._pepper is None:
+            raise Refused(503, "Key creation is not configured.")
+        if email not in self.bootstrap_admins:
+            raise Refused(403, "You are not on the Key Allowlist.")
+        schema = await self._store.person_schema(email)
+        if schema is None:
+            # Generated, never derived from the email, and migrated before any key reaches it.
+            schema = "p_" + secrets.token_hex(8)
+            await self.context.run_migration(schema)
+            # shortcut: a concurrent first key for the same person wins and this schema stays
+            # empty and unlisted; serialise first keys per person if that ever shows up.
+            schema = await self._store.add_person(email, schema)
+        key_id = secrets.token_hex(8)
+        key = f"hsk_{key_id}_{secrets.token_urlsafe(32)}"
+        await self._store.add_key(key_id, self._hmac(key), name, email, schema)
+        await self._record("key_created", key_id, client_ip, email)
+        return key_id, key
+
+    def _is_legacy(self, key: str) -> bool:
+        return bool(key) and self._legacy_digest is not None and hmac.compare_digest(_digest(key), self._legacy_digest)
+
+    async def principal(self, api_key: str | None) -> Principal | None:
+        """Who a key acts as, or None if it is refused."""
+        key = api_key or ""
+        if self._is_legacy(key):
+            if self._legacy_expires is not None and self._clock() >= self._legacy_expires:
+                return None
+            return Principal("legacy", PUBLIC_SCHEMA, LEGACY_KEY_ID)
+        match = _AGENT_KEY_ID.match(key)
+        if match is None or self._pepper is None:
+            return None
+        row = await self._store.find_key(match.group(1))
+        if not hmac.compare_digest(self._hmac(key), row["digest"] if row else _NO_DIGEST) or row is None:
+            return None
+        return Principal("personal", row["schema"], match.group(1), row["email"])
 
     async def authenticate(self, context: RequestContext) -> TenantContext:
         key = context.api_key or ""
-        if key and self._legacy_digest is not None and hmac.compare_digest(_digest(key), self._legacy_digest):
-            if self._legacy_expires is None or self._clock() < self._legacy_expires:
-                context.api_key_id = LEGACY_KEY_ID
-                return TenantContext(schema_name=PUBLIC_SCHEMA)
+        principal = await self.principal(key)
+        if principal is not None:
+            context.api_key_id = principal.key_id
+            return TenantContext(schema_name=principal.schema)
+        if self._is_legacy(key):
             await self._refused(context, "legacy_key_expired", LEGACY_KEY_ID)
             raise AuthenticationError("API key expired")
         await self._refused(context, "key_refused", _key_id(key))
         raise AuthenticationError("Invalid or missing API key")
 
     async def _refused(self, context: RequestContext, kind: str, key_id: str) -> None:
-        client_ip = _client_ip(context)
+        ip = client_ip(context.extra_headers)
         now = self._clock()
-        if not self._throttle.allow(_client_bucket(client_ip), now):
+        if not self._throttle.allow(_client_bucket(ip), now):
             return
         if not self._refusal_budget.allow(now):
             # Make the suppression itself visible, once a minute.
@@ -144,18 +235,28 @@ class AgentKeysTenantExtension(TenantExtension):
                 logger.warning("agent-keys: refusal log budget used up; more refusals this minute are not recorded")
                 await self._record("refusal_log_saturated", NO_KEY_ID, None)
             return
-        await self._record(kind, key_id, client_ip)
+        await self._record(kind, key_id, ip)
 
-    async def _record(self, kind: str, key_id: str, client_ip: str | None) -> None:
+    async def _record(self, kind: str, key_id: str, client_ip: str | None, email: str | None = None) -> None:
         try:
-            await self._events.record(kind, key_id, client_ip)
-        except Exception as exc:  # noqa: BLE001 - the refusal stands even if it cannot be logged
+            await self._events.record(kind, key_id, client_ip, email)
+        except Exception as exc:  # noqa: BLE001 - the decision stands even if it cannot be logged
             logger.warning("agent-keys: could not record %s event: %s", kind, exc)
 
     async def list_tenants(self) -> list[Tenant]:
-        # Always include `public`: startup migrates and the worker polls only the
-        # schemas listed here (upstream #5400).
-        return [Tenant(schema=PUBLIC_SCHEMA)]
+        # `public` once and first, then every personal schema: startup migrates and
+        # the worker polls only the schemas listed here (upstream #5400).
+        try:
+            schemas = await self._store.tenant_schemas()
+        except Exception:
+            # With no list yet (startup) fail, so no schema silently skips its migrations;
+            # later, keep the worker claiming from the last list it had.
+            if self._tenants is None:
+                raise
+            logger.warning("agent-keys: could not list tenants; using the last list", exc_info=True)
+            return self._tenants
+        self._tenants = [Tenant(schema=PUBLIC_SCHEMA), *(Tenant(schema=s) for s in schemas)]
+        return self._tenants
 
     async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
         return HindsightConfig.get_configurable_fields() - DENIED_BANK_FIELDS
