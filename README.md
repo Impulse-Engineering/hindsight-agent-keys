@@ -117,7 +117,7 @@ A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer
 **Purging.** Take a backup first (docs/cutover.md, step 1); the purge cannot be undone otherwise. Copy `scripts/purge-schema.sql` to the CT (`scp` it to the node, then `pct push <vmid> purge-schema.sql /root/purge-schema.sql`). Then, with the `pg` helper from docs/cutover.md, type the schema ID from `/ext/admin` and your email:
 
 ```sh
-# CT
+# CT (not verified on Dev; the script itself runs in the stale-schema integration test)
 read -r -p 'Schema ID to purge: ' schema && read -r -p 'Your email: ' operator &&
   pg psql -X -d hindsight -v schema="$schema" -v operator="$operator" < /root/purge-schema.sql &&
   echo "purge OK" || { echo "PURGE FAILED: read the output above"; false; }
