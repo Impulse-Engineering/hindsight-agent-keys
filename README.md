@@ -119,14 +119,23 @@ A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer
 # CT
 read -r -p 'Schema ID to purge: ' schema && read -r -p 'Your email: ' operator &&
   pg psql -X -d hindsight -v schema="$schema" -v operator="$operator" < /root/purge-schema.sql &&
-  echo "purge OK" || echo "PURGE FAILED: read the output above"
+  echo "purge OK" || { echo "PURGE FAILED: read the output above"; false; }
 ```
 
 1. **Unlist** (one transaction). It stops, changing nothing, unless the schema is listed as stale at that moment and the email is set. It locks the owner's row as key creation does, so a key created meanwhile counts. Before and during it, no valid key reaches the schema; after it, every key that names the schema is revoked, the schema is off the tenant list so the worker stops processing it, and the owner's next personal key creates a new schema.
 2. **Wait** 60 seconds, so tasks the worker had already claimed there finish.
 3. **Drop** (one transaction). It stops, changing nothing, if a row in `agent_keys.people` names the schema again. Otherwise it revokes again any key that names the schema (one created in the instant before step 1), drops the schema, and records a `schema_purged` event naming the owner, the operator and the schema.
 
-psql stops at the first error with a non-zero status. If the output ends at `Unlisted` followed by `no rows returned for \gset`, step 3 found the schema in use again and dropped nothing: it is back on the tenant list with its owner, so the worker processes it and their keys created since step 1 work, while the keys step 1 revoked stay revoked. Purge it only if `/ext/admin` lists it as stale again. If the output ends at `Unlisted` with any other error, step 3 failed: no key reaches the schema and its data is intact. Put it back on the list with `pg psql -X -d hindsight -c "UPDATE agent_keys.people SET schema = '<ID>' WHERE email = '<owner>' AND schema IS NULL RETURNING email"` and run the script again; its keys stay revoked, so this reopens nothing. If that returns no row, the owner already has a new schema, and the old one stays unlisted and unreachable until it is dropped by hand.
+psql stops at the first error with a non-zero status. If the output ends at `Unlisted` followed by `no rows returned for \gset`, step 3 found the schema in use again and dropped nothing: it is back on the tenant list with its owner, so the worker processes it and their keys created since step 1 work, while the keys step 1 revoked stay revoked. Purge it only if `/ext/admin` lists it as stale again. If the output ends at `Unlisted` with any other error, step 3 failed: no key reaches the schema and its data is intact. Put it back on the list, passing both values as psql variables (psql substitutes them only in input it reads, never in `-c`), and run the script again:
+
+```sh
+# CT (not verified)
+read -r -p 'Owner email: ' owner &&
+  echo "UPDATE agent_keys.people SET schema = :'schema' WHERE email = :'owner' AND schema IS NULL RETURNING email" |
+  pg psql -X -d hindsight -At -v ON_ERROR_STOP=1 -v schema="$schema" -v owner="$owner"
+```
+
+Its keys stay revoked, so this reopens nothing. If that returns no row, the owner already has a new schema, and the old one stays unlisted and unreachable until it is dropped by hand.
 
 ## The event log
 
