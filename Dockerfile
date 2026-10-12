@@ -16,6 +16,7 @@ ENV PYTHONPATH=/app/extensions \
     HINDSIGHT_ENABLE_CP=false \
     HINDSIGHT_API_MCP_STATELESS=true \
     HINDSIGHT_API_AUDIT_LOG_ENABLED=false \
+    HINDSIGHT_API_AUDIT_LOG_ACTIONS="(none)" \
     HINDSIGHT_API_EXTENSION_PASSTHROUGH_HEADERS=x-real-ip
 
 # Fail the build, not the deploy, if the extension cannot be imported.
