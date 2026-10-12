@@ -9,11 +9,13 @@ Each step that restarts or redeploys the app names its **auth state**: what a ca
 | | Dev | Prod |
 | --- | --- | --- |
 | App | `hindsight` on Conductor Dev | `hindsight` on Conductor Prod |
-| Container | the Dev CT on `<node>`, nginx on port <port> | the Prod CT, nginx on port <port> |
-| Conductor API | `https://<conductor>/api` | `https://<conductor>/api` |
+| Container | `<vmid>` on `<node>`, nginx on `<port>` | `<vmid>` on `<node>`, nginx on `<port>` |
+| Conductor API | `https://<conductor dev>/api` | `https://<conductor prod>/api` |
 | Primary hostname (behind Access) | `<primary>` | `<primary>` |
 | Bypass hostname (`access_exempt`) | `<bypass>` | `<bypass>` |
 | UI hostname (removed in step 7) | `<ui>` | `<ui>` |
+
+This repo is public, so it names no real hostnames or hosts. Read each value from the app's record in Conductor (`platform_get_app`).
 
 The order:
 
@@ -33,7 +35,7 @@ Conductor has no MCP tool for switching a domain's `access_exempt`, removing a d
 
 ```sh
 # Operator machine
-capi=https://<conductor>/api/apps/hindsight   # Prod: https://<conductor>/api/apps/hindsight
+capi=https://<conductor>/api/apps/hindsight
 cloudflared access curl "$capi/domains" -sS   # the app's extra hostnames and their ids; the primary is not listed
 closed() { [ "$(curl -sS -o /dev/null -w '%{http_code}' "https://$1/health")" = 302 ] && echo "bypass closed OK" ||
   { echo "STOP: the bypass hostname still answers without Access"; return 1; }; }   # closed <bypass> (not verified)
@@ -43,7 +45,7 @@ Commands marked **CT** run as root on the app's container: `ssh root@<node>`, th
 
 ```sh
 # CT: set up once per shell
-app=hindsight port=<port>   # Prod: port=<port>
+app=hindsight port=<port>
 pg0=/var/lib/apps/$app/home/hindsight/.pg0
 pg() { t=$1; shift; podman run --rm -i --network "container:app-$app" -e PGPASSWORD=hindsight \
   -e LD_LIBRARY_PATH=/pgbin/lib -v "$(ls -d $pg0/installation/*/ | tail -1):/pgbin:ro" --entrypoint "/pgbin/bin/$t" \
@@ -72,7 +74,7 @@ pg pg_dump -Fc hindsight > "$out" &&
 - Copy the dump off the CT: on the node, `pct pull <vmid> /root/<file> /root/<file>`, then `scp` it somewhere safe. Its `sha256sum` there must match the one above.
 - Take a fresh vzdump of the CT on the node: `vzdump <vmid> --mode snapshot --storage <PBS storage>`. Dev's rootfs cannot snapshot, so there it falls back to suspend mode. Check the archive with `pvesm list <storage> --vmid <vmid>`. A reused VMID can carry an older tenant's archives, so compare dates with the app's `created_at`.
 
-**Prod:** the Prod CT is on <storage>, so vzdump can take a snapshot (#697 comment, item 7). The two existing banks in the snapshot are the Public Team; #712 compares their counts after the cut-over.
+**Prod:** the Prod CT's rootfs can snapshot, so vzdump can take a snapshot (#697 comment, item 7). The two existing banks in the snapshot are the Public Team; #712 compares their counts after the cut-over.
 
 ### Restore
 
@@ -116,7 +118,7 @@ cloudflared access curl "$capi/domains/<id>" -sS -f -X PATCH -H 'Content-Type: a
 
 The change takes a few seconds to reach Cloudflare. If `closed` prints STOP right after a PATCH that succeeded, wait and run `closed <bypass>` again; go on only once it prints `bypass closed OK` *(not verified)*.
 
-If the app has no bypass hostname yet, create it closed: `platform_request_domain domain_type=managed domain=hindsight-api.internal managed_domain_id=<zone> access_exempt=false`. Its certificate takes a few minutes. Until then, TLS handshakes fail.
+If the app has no bypass hostname yet, create it closed: `platform_request_domain domain_type=managed domain=<bypass label> managed_domain_id=<zone> access_exempt=false`. Its certificate takes a few minutes. Until then, TLS handshakes fail.
 
 **Auth state:** from `bypass closed OK` on, both hostnames are behind Access. Agents on the bypass hostname get 302 until step 8.
 
