@@ -42,10 +42,11 @@ class AgentKeysMcpExtension(MCPExtension):
 
         @mcp.tool()
         async def list_teams() -> dict:
-            """Your Teams (every Team for an admin): each with its ID, your role, its members
-            and the requests to add people that wait for an owner."""
+            """Your Teams: each with its ID, your role, its members and the requests to add
+            people that wait for an owner."""
             try:
-                return {"teams": await memory.tenant_extension.teams(await person())}
+                # Only Teams the caller is in, admins included; admins manage any Team on the page.
+                return {"teams": [t for t in await memory.tenant_extension.teams(await person()) if t["role"]]}
             except Refused as refusal:
                 return {"error": str(refusal)}
 

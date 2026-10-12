@@ -24,7 +24,7 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 
 Only people on it can create Agent Keys.
 
-- **First admins** come from the `AGENT_KEYS_ADMIN_EMAILS` secret, comma-separated. The image reads it at startup, so changing it with `platform_set_secret` restarts the app *(not verified)*. **Auth state:** down during the restart, then the same image and extension, so nothing opens. The page cannot change first admins (409). Someone dropped from the secret is off the Key Allowlist altogether unless they also have a row on `/ext/admin`, and their keys stop; add them on the page first if they should stay.
+- **First admins** come from the `AGENT_KEYS_ADMIN_EMAILS` secret, comma-separated. The image reads it at startup, so changing it with `platform_set_secret` restarts the app *(not verified)*. **Auth state:** down during the restart, then the same image and extension, so nothing opens. The page cannot change first admins (409), so to drop someone from the secret but keep them on the Key Allowlist: remove them from the secret (the app restarts), then add them on `/ext/admin` as a member or an admin. Between the two steps they are off the Key Allowlist and their keys get 401; adding them back makes those keys work again.
 - **Everyone else** is managed on `/ext/admin`: add people by email, approve or decline requests, grant or remove admin rights, and remove people. A signed-in person who is not on the list sees a button on `/ext/` that files a request.
 - **Removing someone** disables the keys they hold from their next request, without deleting them, so adding the person back makes those keys work again. To end someone's access, revoke their identity as well (below).
 - **Listing it** from the CT *(not verified)*: `pg psql -d hindsight -Atc 'select role, email from agent_keys.allowlist order by 1, 2'`. The first admins come from the secret, so this can miss them.
@@ -37,6 +37,7 @@ Every change is an event in `agent_keys.events` (README, "The event log").
 - **Limits.** Each person can create 5 keys an hour and hold 10 active keys, personal and Team keys together; past either, creation answers 429. Each person can create 10 Teams.
 - **90 days.** A key works for 90 days from its creation or its last renewal. Its owner renews an unexpired key, or revokes one, on `/ext/`. An expired or revoked key cannot be renewed; create a new one.
 - **30-day sign-in.** A key works only while its owner has signed in through Access to a key page within the last 30 days. Tell people to open `/ext/` at least once a month. Opening it after a lapse means signing in again, which revives the held-back keys at once. This is also what stops a leaver's keys: once the identity provider disables them, their keys stop within 30 days without anyone touching Hindsight. To stop them at once, revoke the identity.
+- **Access session length.** A sign-in is dated by the `iat` of the Access token, and Access keeps one token for a whole session. Keep the Access application's session duration under 30 days, including any policy session duration; Cloudflare's default is 24 hours. With 30 days or more, someone who opens `/ext/` every day can still have their keys stop.
 - **Leaked key.** Its owner revokes it on `/ext/`; it fails on its next request, including inside an open MCP session. If the owner cannot, an admin revokes their identity.
 - **The legacy key** reaches the Public Team until `HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES`; on Prod that is 30 days after the cut-over ([cutover.md](cutover.md), step 9). Its users get on the Key Allowlist and create Public Team keys before then.
 - **The pepper** (`HINDSIGHT_API_TENANT_KEY_PEPPER`) never changes: a new one invalidates every Agent Key at once. Without it, key creation answers 503 and every Agent Key gets 401, while the legacy key still works.
@@ -116,7 +117,7 @@ The README's "Troubleshooting" table maps each symptom to its cause. These are t
   | No row | The key was not created here: another environment, or a mistyped ID. |
   | `revoked_at` set | Revoked by its owner, by revoke identity, or by a schema purge. |
   | `expires_at` past | Expired. The owner creates a new key. |
-  | `last_seen` empty or older than 30 days | The owner must open `/ext/`. |
+  | `last_seen` empty or older than 30 days | The owner must open `/ext/`. If they did and `last_seen` did not move, the Access application's session duration is 30 days or more ("Access session length", above): shorten it, then have them sign out of Access and open `/ext/` again, so Access issues a new token. |
   | `role` empty or `requested` | The owner is off the Key Allowlist, unless they are a first admin. |
   | `left_team` true | The owner is no longer in the Team. |
   | None of these | The secret part is wrong (a mistyped or cut-off key), or the pepper changed since the key was created. |

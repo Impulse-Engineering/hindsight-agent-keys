@@ -61,6 +61,14 @@ async def test_with_a_personal_key_an_agent_creates_lists_and_removes_members_of
     assert await ext.teams(CAROL) == []
 
 
+async def test_list_teams_shows_only_the_callers_teams_even_to_an_admin():
+    mcp, ext, _ = server()
+    _, key = await ext.create_personal_key(ALICE, "agent", None)
+    await ext.create_team(BOB, "Another", None)
+    mine = await ext.create_team(ALICE, "Platform", None)
+    assert [t["team"] for t in (await call(mcp, key, "list_teams"))["teams"]] == [mine]
+
+
 @pytest.mark.parametrize("role", ["member", "owner"])
 async def test_adding_someone_over_mcp_only_asks_an_owner_to_confirm_it(role):
     mcp, ext, events = server()
@@ -72,7 +80,7 @@ async def test_adding_someone_over_mcp_only_asks_an_owner_to_confirm_it(role):
     assert shown["members"] == [{"email": ALICE, "role": "owner"}]
     assert shown["requests"] == [{"email": CAROL, "role": role, "by": ALICE}]
     assert events.rows[-1]["kind"] == f"{role}_requested"
-    await ext.confirm_member(ALICE, team, CAROL, None)
+    await ext.confirm_member(ALICE, team, CAROL, role, None)
     assert {m["email"]: m["role"] for m in (await ext.teams(ALICE))[0]["members"]} == {ALICE: "owner", CAROL: role}
 
 

@@ -29,11 +29,11 @@ class RecordedEvents:
     async def stop(self):
         pass
 
-    async def record(self, kind, key_id, client_ip, email=None, actor=None, **details):
+    async def record(self, kind, key_id, client_ip, email=None, actor=None, team=None):
         if self.fail:
             raise RuntimeError("event store unavailable")
         self.rows.append(
-            {"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor, **details}
+            {"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor, "team": team}
         )
 
 
@@ -95,12 +95,12 @@ class MemoryStore:
         self._change_members(team, lambda roles: None)
         self.requests[team, email] = (role, by)
 
-    async def confirm_member(self, team, email):
-        role, _ = self.requests.get((team, email), (None, None))
-        if role is not None:
+    async def confirm_member(self, team, email, role):
+        asked, _ = self.requests.get((team, email), (None, None))
+        if asked == role:
             await self.set_member(team, email, role)
             del self.requests[team, email]
-        return role
+        return asked
 
     async def decline_member(self, team, email):
         self._change_members(team, lambda roles: None)
