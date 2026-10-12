@@ -22,6 +22,8 @@ SELECT pg_sleep(:wait);
 
 -- Step 2: drop the schema and log the purge. Revoking again catches a key created in the instant before step 1.
 BEGIN;
+-- Stops here, changing nothing, if a person's row names the schema again: it is in use.
+SELECT 1 AS unclaimed WHERE NOT EXISTS (SELECT FROM agent_keys.people WHERE schema = :'schema') \gset
 UPDATE agent_keys.keys SET revoked_at = now() WHERE schema = :'schema' AND revoked_at IS NULL;
 DROP SCHEMA :"schema" CASCADE;
 INSERT INTO agent_keys.events (kind, key_id, email, actor, team)

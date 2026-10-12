@@ -48,6 +48,7 @@ pg() { t=$1; shift; podman run --rm -i --network "container:app-$app" -e PGPASSW
   "$(podman ps --filter "name=^app-$app\$" --format '{{.Image}}')" \
   -h 127.0.0.1 -p "$(sed -n 4p $pg0/instances/hindsight/data/postmaster.pid)" -U hindsight "$@"; }
 api() { curl -sS -o /dev/null -w '%{http_code}\n' "$@"; }
+keyless() { [ "$(api "$@")" = 401 ] && echo "keyless 401 OK" || echo "STOP: no 401 without a key; do not reopen the bypass hostname"; }   # (not verified)
 banks() { pg psql -d hindsight -Atc "select b.bank_id, (select count(*) from memory_units m where m.bank_id = b.bank_id),
   (select count(*) from documents d where d.bank_id = b.bank_id), (select count(*) from mental_models x where x.bank_id = b.bank_id)
   from banks b order by 1"; }   # bank_id|memory units|documents|mental models
@@ -156,6 +157,20 @@ Each change restarts the app, so keep this order. Until 4.5, stock Hindsight res
    - `HINDSIGHT_API_TENANT_ACCESS_HOST`: the app's primary hostname, from the table above. `platform_set_secret` *(not verified)*.
    - `AGENT_KEYS_ADMIN_EMAILS`: the first admins, comma-separated. `platform_set_secret` *(not verified)*.
 4. Delete any other secret the startup guard refuses (README, "Startup guard"), for example `HINDSIGHT_API_MCP_AUTH_TOKEN`, with `cloudflared access curl "$capi/secrets/<KEY>" -sS -X DELETE` (platform admin) *(not verified)*. Otherwise the deploy exits 78 and its log names the variable. **Prod:** `platform_get_secret_keys` *(not verified)* lists the app's secrets; #697 found only the tenant ones.
+
+   Then remove what the guard cannot see: a bank's stored config can set `audit_log_enabled`, and upstream obeys it whatever the environment says (`resolve_full_config` in `engine/memory_engine.py`). Stock Hindsight let any bank set it; the image stops that only from the deploy on. Run this while stock still runs, since `pg` needs the app's container *(not verified)*:
+
+   ```sh
+   # CT. Stop the cut-over unless this ends with "audit overrides OK" (not verified)
+   is_audit="lower(regexp_replace(k, '^HINDSIGHT_API_', '')) = 'audit_log_enabled'"   # a stored key as upstream's normalize_config_key reads it
+   pg psql -d hindsight -Atc "select bank_id, k, config->k from public.banks, jsonb_object_keys(config) k where $is_audit" &&   # bank_id|key|value it removes
+     pg psql -d hindsight -Atc "update public.banks set config = config - array(select k from jsonb_object_keys(config) k where $is_audit)
+       where exists (select from jsonb_object_keys(config) k where $is_audit)" &&
+     [ "$(pg psql -d hindsight -Atc "select count(*) from public.banks, jsonb_object_keys(config) k where $is_audit")" = 0 ] &&
+     echo "audit overrides OK" || echo "STOP: a bank in public still overrides audit logging"
+   ```
+
+   Record the rows it printed on the cut-over ticket. `public` is the only schema with banks until the image runs.
 5. Last, if the app has a `HINDSIGHT_API_TENANT_EXTENSION` secret, set it to `hindsight_agent_keys.extension:AgentKeysTenantExtension` *(not verified on Dev, which had none; the stop was checked locally on stock 0.10.3)*. Do not delete it: deleting it restarts stock Hindsight with no tenant extension, which admits every request into `public`. Stock Hindsight cannot import our class, so it stops (`ExtensionLoadError`) and stays down until step 5. A secret overrides the image's own value, and the guard accepts only ours. Go straight on to step 5.
 
 The six conditions that keep the Public Team safe in `public` are in [operating.md](operating.md#the-public-team-stays-in-public).
@@ -172,7 +187,7 @@ The six conditions that keep the Public Team safe in `public` are in [operating.
 ```sh
 # CT (re-run the key= line from the setup block)
 api http://127.0.0.1:$port/health                                       # 200
-api http://127.0.0.1:$port/v1/default/banks                             # 401
+keyless http://127.0.0.1:$port/v1/default/banks                         # keyless 401 OK (not verified)
 api -H "Authorization: Bearer $key" http://127.0.0.1:$port/v1/default/banks   # 200
 banks | diff /root/$app-banks-before.txt -   # every bank from step 1, no count lower (not verified)
 sed -n 's/^HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES=//p' /etc/apps/$app/.env   # Prod: the date from step 4.2 (not verified)
@@ -188,7 +203,7 @@ Then delete the secrets the image no longer reads: `cloudflared access curl "$ca
 
 ```sh
 # CT
-api http://127.0.0.1:$port/v1/default/banks   # 401 from the container now running
+keyless http://127.0.0.1:$port/v1/default/banks   # keyless 401 OK, from the container now running (not verified)
 ```
 
 ## 7. Remove the UI hostname
@@ -204,18 +219,19 @@ Port 9999 stays in `image_ports`: Conductor keeps a deployed port there for good
 
 ```sh
 # CT
-api http://127.0.0.1:$port/v1/default/banks   # 401
+keyless http://127.0.0.1:$port/v1/default/banks   # keyless 401 OK (not verified)
 ```
 
 ## 8. Reopen the bypass hostname and verify
 
-Only once the keyless check at the end of step 7 returned 401: switch the bypass domain to `access_exempt=true`, as in step 3 with `--data '{"access_exempt": true}'`. Then:
+Only once the keyless check at the end of step 7 printed `keyless 401 OK`: switch the bypass domain to `access_exempt=true`, as in step 3 with `--data '{"access_exempt": true}'`. Then:
 
 ```sh
 # Operator machine
 b=https://<bypass>
 key=$(cat <key file>)   # the file step 4 set the key from
-curl -sS -o /dev/null -w '%{http_code}\n' $b/v1/default/banks                                     # 401
+[ "$(curl -sS -o /dev/null -w '%{http_code}' $b/v1/default/banks)" = 401 ] && echo "keyless 401 OK" ||
+  echo "STOP: no 401 without a key; close the bypass hostname again (step 3)"                        # (not verified)
 curl -sS -H "Authorization: Bearer $key" $b/v1/default/banks                                      # the bank_ids in step 1's snapshot
 curl -sS -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' $b/mcp/ \
@@ -239,5 +255,5 @@ Post on the cut-over ticket the expiry that step 6 read back, and when it takes 
 1. Close the bypass hostname (step 3) and wait for the 302. **Auth state:** from then on, only callers signed in through Access reach the app.
 2. Restore the environment from the values saved in step 4, re-creating any secret step 6 deleted. Set `HINDSIGHT_API_TENANT_API_KEY` and `HINDSIGHT_CP_DATAPLANE_API_KEY` from a file, as in 4.1, then `HINDSIGHT_API_TENANT_EXTENSION` to its old value (on Prod, stock's ApiKey extension). Leave the legacy key, its expiry, the pepper, the `ACCESS` settings and `AGENT_KEYS_ADMIN_EMAILS` in place: stock Hindsight ignores them, and keeping the pepper keeps every Agent Key valid if the image comes back. If the app had no `HINDSIGHT_API_TENANT_EXTENSION` before (Dev before #703), there is nothing to restore: stock Hindsight will run with no authentication. **Auth state:** this image ignores the first two. On Prod, the guard refuses the old extension, so the image stops and stays down instead of serving without ours. Where there was no extension to restore (Dev), this image keeps running with ours, behind Access.
 3. `platform_update_app` to the stock digest from step 2, then `platform_approve_image`, then wait for the deploy as in step 2.4: the job `completed` and `Applied image ref recorded:` naming the stock digest. Until then a check in step 4 would test the wrong state: on Prod nothing answers (step 2 stopped this image), and on Dev this image still answers. Conductor refuses a rollback across repositories, so this is a new approval, not `platform_rollback_deploy`. Stock Hindsight starts against a database this image used, because the extension's `agent_keys` schema sits outside upstream's migrations; CI checks this with a personal and a Team schema present. **Auth state:** until the deploy completes, on Prod the app is down, and on Dev this image with our extension answers until stock takes over, behind Access. After it, stock's extension: the shared key reaches `public`, and Agent Keys get 401. Stock lists only `public`, so personal and Team schemas are neither reachable nor processed by the worker; their data stays.
-4. On the CT, `podman ps --filter "name=^app-$app\$" --format '{{.Image}}'` shows `localhost/app-<app>:<first 40 hex of the stock digest>` and `/version` shows the stock version. Reopen the bypass hostname only if a keyless request then gets 401 from the stock extension. Otherwise leave it closed: the app is then reachable only through Access, as it was before the cut-over. Re-create the UI hostname only if the UI comes back: `platform_request_domain container_port_label=ui`.
+4. On the CT, `podman ps --filter "name=^app-$app\$" --format '{{.Image}}'` shows `localhost/app-<app>:<first 40 hex of the stock digest>` and `/version` shows the stock version. Reopen the bypass hostname only if `keyless http://127.0.0.1:$port/v1/default/banks` (setup block) then prints `keyless 401 OK` from the stock extension. Otherwise leave it closed: the app is then reachable only through Access, as it was before the cut-over. Re-create the UI hostname only if the UI comes back: `platform_request_domain container_port_label=ui`.
 5. The target is the stock digest of the release the running image is built on: `scripts/upstream-ref.sh` at the commit that built it. For the cut-over that is stock 0.10.3, `b5da1a9a…`, which Prod already runs. The old Prod digest, from before Prod's upgrade to 0.10.3, is not a valid target, nor is any digest older than the step 2 upgrade: they predate 0.10.3's migrations, which have already run on the data. If the data itself is damaged, restore the step 1 dump instead.

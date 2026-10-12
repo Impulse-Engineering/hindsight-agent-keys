@@ -4,6 +4,7 @@ IMAGE names the image under test (default hindsight-agent-keys:test). The tests
 start the real container on Hindsight's mock LLM, so they need no credentials.
 """
 
+import concurrent.futures
 import hashlib
 import hmac
 import json
@@ -747,6 +748,20 @@ def test_a_stale_personal_schema_is_reported_to_admins_and_purged_only_by_the_op
     assert run.returncode != 0 and "syntax error" in run.stderr, run.stdout + run.stderr
     assert query(name, f"SELECT schema FROM agent_keys.people WHERE email = '{gina}'") == [{"schema": schema}]
     assert query(name, f"SELECT count(*) AS n FROM pg_namespace WHERE nspname IN ('{alices}', '{team}', '{schema}')") == [{"n": 3}]
+
+    # A schema its owner holds again by the drop step is not dropped.
+    owned = f"SELECT schema FROM agent_keys.people WHERE email = '{gina}'"
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        running = pool.submit(purge, name, schema=schema, operator=operator, wait=20)
+        deadline = time.time() + 60
+        while query(name, owned) != [{"schema": None}]:
+            assert time.time() < deadline and not running.done(), "step 1 did not unlist the schema"
+            time.sleep(0.5)
+        query(name, f"UPDATE agent_keys.people SET schema = '{schema}' WHERE email = '{gina}' RETURNING email")
+        run = running.result()
+    assert run.returncode != 0 and "Unlisted" in run.stdout, run.stdout + run.stderr
+    assert "no rows returned for \\gset" in run.stderr, run.stdout + run.stderr
+    assert query(name, f"SELECT count(*) AS n FROM pg_namespace WHERE nspname = '{schema}'") == [{"n": 1}]
 
     run = purge(name, schema=schema, operator=operator, wait=0)
     assert run.returncode == 0, run.stdout + run.stderr
