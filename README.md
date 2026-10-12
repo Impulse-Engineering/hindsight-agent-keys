@@ -2,22 +2,23 @@
 
 A container image of [Hindsight](https://github.com/vectorize-io/hindsight) (by Vectorize) with a tenant extension that gives each caller only the memory its key allows.
 
-It knows two kinds of key:
+It knows three kinds of key:
 
 - The **legacy key**, the deployment's existing shared key. It reaches the **Public Team**, whose banks live in the Postgres `public` schema.
 - **Personal Agent Keys**, which people create for themselves on the key page (below). Each reaches only its owner's own schema.
+- **Team keys**, which members create on the Teams page (below). Each reaches only its Team's schema, and only while its holder is in the Team. A Public Team key reaches `public`.
 
-Every other key, and a request with no key, gets 401 on the API and on MCP. There is one exception. Upstream answers an MCP `GET` with no session ID before authentication runs: it is the handshake probe some clients send, and it returns `200 {}` with no data. Teams are built on top of this.
+Every other key, and a request with no key, gets 401 on the API and on MCP. There is one exception. Upstream answers an MCP `GET` with no session ID before authentication runs: it is the handshake probe some clients send, and it returns `200 {}` with no data.
 
 Upstream serves these routes without a key, and they carry no memory data: `/health`, `/health/ready`, `/health/live`, `/version`, `/metrics`, `/v1/bank-template-schema`, `/docs`, `/redoc` and `/openapi.json`. Upstream also mounts our key pages under `/ext` without authentication; the extension gates them itself.
 
 ## What the image adds to upstream
 
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
-  - It lists `public` first, then every personal schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
+  - It lists `public` first, then every personal and Team schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
   - Banks cannot switch on upstream audit logging.
   - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one row a minute, whatever the event. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process.
-- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys").
+- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys" and "Teams").
 - **A startup guard**, described in its own section below.
 - **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension.
 
@@ -46,7 +47,7 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 | `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` | The Cloudflare Access team URL, such as `https://<team>.cloudflareaccess.com` (Conductor's `CF_ACCESS_TEAM_DOMAIN`). It is the JWT issuer and serves the signing keys. |
 | `HINDSIGHT_API_TENANT_ACCESS_AUD` | The Access application's AUD tag (Conductor's `CF_ACCESS_AUD`). It changes if the Access application is recreated. |
 | `HINDSIGHT_API_TENANT_ACCESS_HOST` | The app's Access-protected hostname, such as `hindsight.internal.aseva.ai`. The key pages answer only on it. |
-| `AGENT_KEYS_ADMIN_EMAILS` | Comma-separated emails of the first admins; case and spaces are ignored. For now they are the whole Key Allowlist: only they can create keys. |
+| `AGENT_KEYS_ADMIN_EMAILS` | Comma-separated emails of the first admins; case and spaces are ignored. Admins manage every Team. For now they are also the whole Key Allowlist: only they can create keys and Teams. |
 
 Without all three `ACCESS` settings the key pages refuse every request. Everything else is upstream Hindsight configuration, such as the LLM provider and its key.
 
@@ -63,7 +64,16 @@ A person on the Key Allowlist opens `https://<access host>/ext/`, names a key an
 - **Limits:** each person can create 5 keys an hour and hold 10. Both are counted in the database.
 - **Schema:** a person's first key creates their schema, `p_` plus 16 random hex digits, never derived from their email, and migrates it before the key is shown. Every later key of theirs reaches the same schema.
 
-Tables in `agent_keys`: `people` (email, schema) and `keys` (ID, HMAC, name, owner's email, schema, creation time).
+## Teams
+
+A Team is a named set of people who share one schema. A person on the Key Allowlist opens `https://<access host>/ext/teams`, the Teams page, which follows the same hostname, sign-in and state-change rules as the key page.
+
+- **Creating:** the creator becomes the Team's first owner. The Team gets its own schema, `t_` plus 16 random hex digits, migrated before the Team is shown; the worker processes it like any other. Names are unique whatever their case, and `public` is reserved for the Public Team.
+- **Members:** owners add people by email, as a member or an owner, including people who have not signed in yet; they change roles and remove people. A change that would leave a Team without an owner is refused. Admins manage every Team and see every Team on the page, whether or not they are in it.
+- **Team keys:** a member on the Key Allowlist creates a Team key the same way as a personal key, with the same limits, which count personal and Team keys together. Membership is checked on every request, so removing a member stops their Team keys on their next request.
+- **Public Team:** everyone on the Key Allowlist can create a Public Team key, which reaches the banks in `public`. The Public Team has no owners or members.
+
+Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, creation time), `teams` (schema, name) and `members` (Team schema, email, role `owner` or `member`).
 
 ## The event log
 
@@ -71,10 +81,12 @@ Events go to `agent_keys.events` in Hindsight's own database. That schema sits o
 
 | Column | Meaning |
 | --- | --- |
-| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), or `key_created` |
-| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)`, or the `<id>` part of a presented or created `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
+| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), or `member_removed` |
+| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (no key involved), or the `<id>` part of a presented or created `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
 | `client_ip` | The `X-Real-IP` address in canonical form (an IPv4-mapped IPv6 address is stored as IPv4), or `NULL` if the header is missing or not an IP address |
-| `email` | For `key_created`, the person who created the key; otherwise `NULL` |
+| `email` | For `key_created` and the Team events, the signed-in person who acted; otherwise `NULL` |
+| `team` | For the Team events and for a Team key's `key_created`, the Team's schema (`public` for the Public Team); otherwise `NULL` |
+| `member` | For `owner_added`, `member_added` and `member_removed`, the person whose membership changed; otherwise `NULL` |
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
 
@@ -139,6 +151,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | The key page answers 403 "Sign in through Cloudflare Access" | The Access JWT failed validation. Look for `agent-keys: refused an Access token` in the logs; a wrong or changed AUD tag is the usual cause. |
 | Key creation answers 503 | `HINDSIGHT_API_TENANT_KEY_PEPPER` is unset. |
 | Every Agent Key gets 401 | The pepper was changed or removed. Agent Keys must be created again. |
+| A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
 | The event log stays empty | The extension's database connection failed at startup. Look for `agent-keys` warnings in the logs, then restart the container. Refusals are still enforced. |
 
 ## License

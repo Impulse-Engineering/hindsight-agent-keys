@@ -388,12 +388,27 @@ def two_people(hindsight):
     return {email: personal_key(hindsight, email)["key"] for email in (ALICE, BOB)}
 
 
-def test_two_peoples_keys_each_see_only_their_own_banks(hindsight, two_people):
+def team_page(hindsight, method, path, email, body):
+    status, text = key_page(hindsight, method, path, email, body=body)
+    assert status == 200, text
+    return json.loads(text)
+
+
+@pytest.fixture(scope="module")
+def ci_team(hindsight):
+    """Alice's Team, with Bob as a member holding a Team key."""
+    team = team_page(hindsight, "POST", "/ext/teams", ALICE, {"name": "CI Team"})["team"]
+    team_page(hindsight, "POST", f"/ext/teams/{team}/members", ALICE, {"email": BOB, "role": "member"})
+    return {"team": team, "key": team_page(hindsight, "POST", f"/ext/teams/{team}/keys", BOB, {"name": "ci"})["key"]}
+
+
+def test_two_people_and_a_team_each_see_only_their_own_banks(hindsight, two_people, ci_team):
     port = hindsight["port"]
     assert http(port, "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
-    own = {ALICE: "alice-private", BOB: "bob-private"}
-    for email, key in two_people.items():
-        assert http(port, "PUT", f"/v1/default/banks/{own[email]}", key=key, body={"mission": "ci"})[0] in (200, 201)
+    keys = {**two_people, "team": ci_team["key"]}
+    own = {ALICE: "alice-private", BOB: "bob-private", "team": "team-shared"}
+    for holder, key in keys.items():
+        assert http(port, "PUT", f"/v1/default/banks/{own[holder]}", key=key, body={"mission": "ci"})[0] in (200, 201)
 
     init = {
         "jsonrpc": "2.0",
@@ -402,22 +417,22 @@ def test_two_peoples_keys_each_see_only_their_own_banks(hindsight, two_people):
         "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "ci", "version": "0"}},
     }
     call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "list_banks", "arguments": {}}}
-    for email, key in two_people.items():
+    for holder, key in keys.items():
         status, text = http(port, "GET", "/v1/default/banks", key=key)
         assert status == 200, text
-        assert {b["bank_id"] for b in json.loads(text)["banks"]} == {own[email]}
+        assert {b["bank_id"] for b in json.loads(text)["banks"]} == {own[holder]}
         assert mcp(port, key, init)[0] == 200
         status, messages = mcp(port, key, call)
         assert status == 200, messages
         listed = json.dumps(messages)
-        other = own[BOB] if email == ALICE else own[ALICE]
-        assert own[email] in listed
-        assert other not in listed and BANK not in listed
+        assert own[holder] in listed
+        assert not [b for b in [*own.values(), BANK] if b != own[holder] and b in listed]
 
-    # Each bank sits in its owner's generated schema, and nothing new reached public.
-    people = {r["email"]: r["schema"] for r in query(hindsight["name"], "SELECT email, schema FROM agent_keys.people")}
-    for email, bank in own.items():
-        assert query(hindsight["name"], f'SELECT bank_id FROM "{people[email]}".banks') == [{"bank_id": bank}]
+    # Each bank sits in its holder's generated schema, and nothing new reached public.
+    schemas = {r["email"]: r["schema"] for r in query(hindsight["name"], "SELECT email, schema FROM agent_keys.people")}
+    schemas["team"] = ci_team["team"]
+    for holder, bank in own.items():
+        assert query(hindsight["name"], f'SELECT bank_id FROM "{schemas[holder]}".banks') == [{"bank_id": bank}]
     public = {r["bank_id"] for r in query(hindsight["name"], "SELECT bank_id FROM public.banks")}
     assert not public & set(own.values())
 
@@ -431,6 +446,50 @@ def test_the_worker_processes_background_tasks_in_a_personal_schema(hindsight, t
     )
     assert status == 200, text
     assert "notebook" in text
+
+
+def test_the_worker_processes_background_tasks_in_a_team_schema(hindsight, ci_team):
+    port, key = hindsight["port"], ci_team["key"]
+    state = retain_and_wait(port, key, "team-memory", "The CI Team deploys on Tuesdays.")
+    assert state == "completed", "the worker did not process the retain task in a Team schema"
+    status, text = http(
+        port, "POST", "/v1/default/banks/team-memory/memories/recall", key=key, body={"query": "When does the team deploy?"}
+    )
+    assert status == 200, text
+    assert "Tuesday" in text
+
+
+def test_a_public_team_key_reaches_the_banks_in_public(hindsight, two_people):
+    port = hindsight["port"]
+    assert http(port, "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
+    key = team_page(hindsight, "POST", "/ext/teams/public/keys", CAROL, {"name": "ci"})["key"]
+    status, text = http(port, "GET", "/v1/default/banks", key=key)
+    assert status == 200, text
+    banks = {b["bank_id"] for b in json.loads(text)["banks"]}
+    assert BANK in banks and "alice-private" not in banks
+
+
+def test_removing_a_member_stops_their_team_key_on_the_next_request(hindsight, ci_team):
+    port, team = hindsight["port"], ci_team["team"]
+    team_page(hindsight, "POST", f"/ext/teams/{team}/members", ALICE, {"email": CAROL, "role": "member"})
+    key = team_page(hindsight, "POST", f"/ext/teams/{team}/keys", CAROL, {"name": "ci"})["key"]
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
+    team_page(hindsight, "DELETE", f"/ext/teams/{team}/members", ALICE, {"email": CAROL})
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
+    rows = query(hindsight["name"], f"SELECT kind, email, member FROM agent_keys.events WHERE team = '{team}' ORDER BY id")
+    assert rows[0] == {"kind": "team_created", "email": ALICE, "member": None}
+    assert rows[-1] == {"kind": "member_removed", "email": ALICE, "member": CAROL}
+
+
+def test_a_team_keeps_an_owner_and_a_unique_name_and_public_is_reserved(hindsight, ci_team):
+    team = ci_team["team"]
+    status, text = key_page(hindsight, "DELETE", f"/ext/teams/{team}/members", ALICE, body={"email": ALICE})
+    assert status == 409, text
+    for name in ("ci team", "Public"):
+        status, text = key_page(hindsight, "POST", "/ext/teams", BOB, body={"name": name})
+        assert status == 409, text
+    status, page = key_page(hindsight, "GET", "/ext/teams", BOB)
+    assert status == 200 and "CI Team" in page and f"{ALICE} (owner)" in page and f"{BOB} (member)" in page
 
 
 def test_a_new_key_is_stored_as_an_hmac_and_its_creation_logged(hindsight):
@@ -495,12 +554,13 @@ def test_a_restart_reuses_the_event_log(hindsight):
     assert [r["client_ip"] for r in rows] == ["203.0.113.61", "203.0.113.62"]
 
 
-def test_stock_hindsight_starts_on_the_same_database(hindsight, volume):
+def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
-    # The database also holds a personal schema, which stock Hindsight neither lists nor migrates.
+    # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.
     personal_key(hindsight, ERIN)
-    personal = query(hindsight["name"], "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'p\\_%'")
-    assert personal, "no personal schema to start stock Hindsight against"
+    for prefix in ("p", "t"):
+        found = query(hindsight["name"], f"SELECT nspname FROM pg_namespace WHERE nspname LIKE '{prefix}\\_%'")
+        assert found, f"no {prefix}_ schema to start stock Hindsight against"
     docker("rm", "-f", hindsight["name"])
     name = f"hak-it-stock-{RUN}"
     env = {
