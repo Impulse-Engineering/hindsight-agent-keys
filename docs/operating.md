@@ -122,7 +122,7 @@ The README's "Troubleshooting" table maps each symptom to its cause. These are t
   | `left_team` true | The owner is no longer in the Team. |
   | None of these | The secret part is wrong (a mistyped or cut-off key), or the pepper changed since the key was created. |
 
-- **The event log** *(not verified)*: `pg psql -d hindsight -Atc "select at, kind, key_id, client_ip from agent_keys.events where kind in ('key_refused', 'legacy_key_expired') order by id desc limit 20"`. It does not hold every refusal. Each client address gets at most one refusal row a minute, and through the Tunnel every caller is logged as the connector's address (Dev: `192.168.243.237`; #697 comment, item 8), so all agents share that one row. A refusal missing from the log does not mean the request was accepted.
+- **The event log** *(not verified)*: `pg psql -d hindsight -Atc "select at, kind, key_id, client_ip from agent_keys.events where kind in ('key_refused', 'legacy_key_expired') order by id desc limit 20"`. It does not hold every refusal. Each client address gets at most one refusal row a minute, and through the Tunnel every caller is logged as the connector's address (#697 comment, item 8), so all agents share that one row. A refusal missing from the log does not mean the request was accepted.
 
 ### A schema the worker is not processing
 

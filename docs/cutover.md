@@ -10,12 +10,12 @@ Each step that restarts or redeploys the app names its **auth state**: what a ca
 | --- | --- | --- |
 | App | `hindsight` on Conductor Dev | `hindsight` on Conductor Prod |
 | Container | `<vmid>` on `<node>`, nginx on `<port>` | `<vmid>` on `<node>`, nginx on `<port>` |
-| Conductor API | `https://<conductor dev>/api` | `https://<conductor prod>/api` |
+| Conductor API | `https://<conductor>/api` on Dev | `https://<conductor>/api` on Prod |
 | Primary hostname (behind Access) | `<primary>` | `<primary>` |
 | Bypass hostname (`access_exempt`) | `<bypass>` | `<bypass>` |
 | UI hostname (removed in step 7) | `<ui>` | `<ui>` |
 
-This repo is public, so it names no real hostnames or hosts. Read each value from the app's record in Conductor (`platform_get_app`).
+This repo is public, so it names no real hostnames or hosts. Read the hostnames, container and port from the app's record in Conductor (`platform_get_app`). `<conductor>` is the host of the environment's Conductor UI, the one you sign in to through Access.
 
 The order:
 
@@ -118,7 +118,7 @@ cloudflared access curl "$capi/domains/<id>" -sS -f -X PATCH -H 'Content-Type: a
 
 The change takes a few seconds to reach Cloudflare. If `closed` prints STOP right after a PATCH that succeeded, wait and run `closed <bypass>` again; go on only once it prints `bypass closed OK` *(not verified)*.
 
-If the app has no bypass hostname yet, create it closed: `platform_request_domain domain_type=managed domain=<bypass label> managed_domain_id=<zone> access_exempt=false`. Its certificate takes a few minutes. Until then, TLS handshakes fail.
+If the app has no bypass hostname yet, create it closed: `platform_request_domain domain_type=managed domain=<bypass label> managed_domain_id=<zone> access_exempt=false`, where `<bypass label>` is `<bypass>` without the zone suffix and `<zone>` is that zone's id from `platform_list_managed_domains`. Its certificate takes a few minutes. Until then, TLS handshakes fail.
 
 **Auth state:** from `bypass closed OK` on, both hostnames are behind Access. Agents on the bypass hostname get 302 until step 8.
 
