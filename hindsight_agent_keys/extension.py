@@ -16,6 +16,7 @@ import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 
 from hindsight_api.config import HindsightConfig, get_config
 from hindsight_api.extensions.tenant import (
@@ -251,7 +252,7 @@ class AgentKeysTenantExtension(TenantExtension):
         key_id = secrets.token_hex(8)
         key = f"hsk_{key_id}_{secrets.token_urlsafe(32)}"
         await self._store.add_key(key_id, self._hmac(key), name, email, schema, kind, self._clock() + KEY_LIFETIME)
-        await self._record("key_created", key_id, client_ip, email, **({"team": schema} if kind == "team" else {}))
+        await self._record("key_created", key_id, client_ip, email, team=schema if kind == "team" else None)
         return key_id, key
 
     async def list_keys(self, email: str) -> list[dict]:
@@ -354,19 +355,23 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._store.request_member(team, member, role, email)
         await self._record(f"{role}_requested", NO_KEY_ID, client_ip, member, email, team=team)
 
-    async def confirm_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
-        """As an owner or admin, give `member` the role a pending request asked for."""
-        await self._answer_request(email, team, member, client_ip, self._store.confirm_member, "confirmed")
+    async def confirm_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
+        """As an owner or admin, give `member` the role a pending request asked for. `role` is the one
+        the page showed: if the request asks for another now, nothing is granted (Refused 409)."""
+        confirm = partial(self._store.confirm_member, role=role)
+        await self._answer_request(email, team, member, client_ip, confirm, "confirmed", role)
 
     async def decline_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
         """As an owner or admin, drop a pending request for `member`; their place in the Team stays as it was."""
         await self._answer_request(email, team, member, client_ip, self._store.decline_member, "declined")
 
-    async def _answer_request(self, email, team, member, client_ip, answer, outcome) -> None:
+    async def _answer_request(self, email, team, member, client_ip, answer, outcome, shown=None) -> None:
         await self._require_manager(email, team)
         role = await answer(team, member)
         if role is None:
             raise Refused(404, "Nobody asked to add that person to the Team.")
+        if shown not in (None, role):
+            raise Refused(409, f"That request now asks for {role}; reload the page.")
         await self._record(f"{role}_{outcome}", NO_KEY_ID, client_ip, member, email, team=team)
 
     def _is_legacy(self, key: str) -> bool:
@@ -431,15 +436,15 @@ class AgentKeysTenantExtension(TenantExtension):
         client_ip: str | None,
         email: str | None = None,
         actor: str | None = None,
-        **team: str,
+        team: str | None = None,
     ) -> None:
         try:
-            await self._events.record(kind, key_id, client_ip, email, actor, **team)
+            await self._events.record(kind, key_id, client_ip, email, actor, team)
         except Exception as exc:  # noqa: BLE001 - the decision stands even if it cannot be logged
             logger.warning("agent-keys: could not record %s event: %s", kind, exc)
 
     async def list_tenants(self) -> list[Tenant]:
-        # `public` once and first, then every personal schema: startup migrates and
+        # `public` once and first, then every personal and Team schema: startup migrates and
         # the worker polls only the schemas listed here (upstream #5400).
         try:
             schemas = await self._store.tenant_schemas()

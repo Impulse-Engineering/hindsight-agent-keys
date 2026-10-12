@@ -550,10 +550,12 @@ def test_agents_manage_teams_over_both_mcp_endpoints_but_only_an_owner_lets_anyo
     ]
     team_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", ALICE, {"email": CAROL})
 
-    # Nobody is in the Team until an owner confirms on the Teams page.
+    # Nobody is in the Team until an owner confirms, on the Teams page, the role the request asks for.
+    status, text = key_page(hindsight, "POST", f"/ext/teams/{team}/confirmations", ALICE, body={"email": ERIN, "role": "owner"})
+    assert status == 409, text
     status, text = key_page(hindsight, "POST", f"/ext/teams/{team}/keys", ERIN, body={"name": "ci"})
     assert status == 403, text
-    team_page(hindsight, "POST", f"/ext/teams/{team}/confirmations", ALICE, {"email": ERIN})
+    team_page(hindsight, "POST", f"/ext/teams/{team}/confirmations", ALICE, {"email": ERIN, "role": "member"})
     erin = team_page(hindsight, "POST", f"/ext/teams/{team}/keys", ERIN, {"name": "ci"})["key"]
     assert http(port, "GET", "/v1/default/banks", key=erin)[0] == 200
 

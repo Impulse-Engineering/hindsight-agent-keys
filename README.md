@@ -17,7 +17,7 @@ Upstream serves these routes without a key, and they carry no memory data: `/hea
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
   - It lists `public` first, then every personal and Team schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
   - Banks cannot switch on upstream audit logging.
-  - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one row a minute, whatever the event. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process.
+  - It writes its own event log (see "The event log"): refused keys, and every key, Key Allowlist and Team change. A refusal row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one refusal row a minute, whatever the refusal. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process. The other rows also name the people (`email`, `actor`) and the Team (`team`) they concern, and are not throttled.
 - **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist", "Teams" and "Stale personal schemas").
 - **Team tools for agents** `hindsight_agent_keys.tools:AgentKeysMcpExtension`, on both MCP endpoints (see "Teams over MCP").
 - **A startup guard**, described in its own section below.
@@ -51,7 +51,7 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 | `HINDSIGHT_API_TENANT_ACCESS_HOST` | The app's Access-protected hostname, such as `hindsight.internal.aseva.ai`. The key pages answer only on it. |
 | `AGENT_KEYS_ADMIN_EMAILS` | Comma-separated emails of the bootstrap admins; case and spaces are ignored. They are always admins, so always on the Key Allowlist, and the admin page cannot change them. |
 
-Without all three `ACCESS` settings the key pages refuse every request. Everything else is upstream Hindsight configuration, such as the LLM provider and its key.
+Without all three `ACCESS` settings the key pages refuse every request. Keep the Access application's session duration under 30 days, including any policy session duration; Cloudflare's default is 24 hours. A key page request is a sign-in dated by its token's `iat`, and Access keeps the same token for the whole session, so a session of 30 days or more can stop the keys of someone who opens the page every day (see "Sign-in" under "Personal Agent Keys"). Everything else is upstream Hindsight configuration, such as the LLM provider and its key.
 
 Behind a proxy, set `X-Real-IP` to the real client address and overwrite any value the client sent. Otherwise the event log records whatever the client claims.
 
@@ -62,6 +62,7 @@ A person on the Key Allowlist opens `https://<access host>/ext/`, names a key an
 - **Who:** the key pages trust only the Access JWT in `Cf-Access-Jwt-Assertion`. It must be RS256, signed by a key the team publishes, issued by the team URL, carry the AUD tag, and have `exp` and `iat`. The person is its `email`, lower-cased; no other claim is read. A token without `email` (a service token) is refused. Signing keys are fetched from the team and fetched again when a token names an unknown key ID, at most every 30 seconds.
 - **Where:** only on `HINDSIGHT_API_TENANT_ACCESS_HOST`. Any other `Host`, including the bypass hostname, gets 404.
 - **State changes** (anything but `GET`) also need `Content-Type: application/json`, the header `X-Agent-Keys: 1`, and `Origin: https://<access host>`; otherwise 403.
+- **Framing:** `/ext/`, `/ext/admin` and `/ext/teams` send `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`, so no other site can frame them and trick a signed-in person into pressing their buttons.
 - **The key** has a 64-bit ID and a 256-bit secret. It is shown once. The database stores only HMAC-SHA256 of the whole key under the pepper, and a presented key is compared in constant time.
 - **Limits:** each person can create 5 keys an hour and hold 10 active (neither revoked nor expired) keys. Both are counted in the database.
 - **Schema:** a person's first key creates their schema, `p_` plus 16 random hex digits, never derived from their email, and migrates it before the key is shown. Every later key of theirs reaches the same schema.
@@ -87,7 +88,7 @@ A Team is a named set of people who share one schema. A person on the Key Allowl
 
 - **Creating:** the creator becomes the Team's first owner. The Team gets its own schema, `t_` plus 16 random hex digits, migrated before the Team is shown; the worker processes it like any other. Names are unique whatever their case, and `public` is reserved for the Public Team. Each person can create 10 Teams, counted in the database (429 after that).
 - **Members:** owners add people by email, as a member or an owner, including people who have not signed in yet; they change roles and remove people. A change that would leave a Team without an owner is refused. Admins manage every Team and see every Team on the page, whether or not they are in it.
-- **Pending requests:** people an agent asked to add over MCP are listed under their Team, with the role asked for and who asked. An owner or admin presses **Confirm** to give them that role, or **Decline** to drop the request and leave their place in the Team as it was.
+- **Pending requests:** people an agent asked to add over MCP are listed under their Team, with the role asked for and who asked. An owner or admin presses **Confirm** to give them that role, or **Decline** to drop the request and leave their place in the Team as it was. Confirm sends the role the page showed: if an agent has asked for another role since, nothing is granted and the page answers 409, so the owner reloads it and sees the new request.
 - **Team keys:** a member on the Key Allowlist creates a Team key the same way as a personal key, with the same limits, which count personal and Team keys together. Membership is checked on every request, so removing a member stops their Team keys on their next request.
 - **Public Team:** everyone on the Key Allowlist can create a Public Team key, which reaches the banks in `public`. The Public Team has no owners or members.
 
@@ -98,7 +99,7 @@ Agents manage Teams with these tools, on the multi-bank endpoint `/mcp/` and on 
 | Tool | What it does |
 | --- | --- |
 | `create_team(name)` | Creates a Team as on the Teams page, with the same limit. Returns its ID (`t_…`), which the other tools take as `team`. |
-| `list_teams()` | The person's Teams (every Team for an admin), each with the person's role, its members and its pending requests. |
+| `list_teams()` | The Teams the person is in, admins included (they manage other Teams on the Teams page), each with the person's role, its members and its pending requests. |
 | `add_team_member(team, email, role)` | Files a pending request to make the person a `member` (the default) or an `owner`. Nobody gains access until an owner or admin confirms it on the Teams page. |
 | `remove_team_member(team, email)` | Takes the person out of the Team; their Team keys stop on their next request. |
 
@@ -200,7 +201,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | --- | --- |
 | The container exits with status 78 | The startup guard refused the configuration. Its stderr names each variable to fix. |
 | The legacy key gets 401 | `HINDSIGHT_API_TENANT_LEGACY_KEY` is unset or different, or the legacy key has passed its expiry (`legacy_key_expired` in the event log). |
-| Background tasks in `public` never complete | `public` is missing from the tenant list. Check the startup logs for migration of `public`. |
+| Background tasks in a new personal or Team schema stay `pending` | The log shows `agent-keys: could not list tenants; using the last list`: the database could not be read when the worker refreshed its tenant list, so it keeps the schemas it last listed. It picks up the new schema once the database answers again. |
 | The key page answers 404 | The request's hostname is not `HINDSIGHT_API_TENANT_ACCESS_HOST`, or one of the three `ACCESS` settings is unset. |
 | The key page answers 403 "Sign in through Cloudflare Access" | The Access JWT failed validation. Look for `agent-keys: refused an Access token` in the logs; a wrong or changed AUD tag is the usual cause. |
 | Key creation answers 503 | `HINDSIGHT_API_TENANT_KEY_PEPPER` is unset. |

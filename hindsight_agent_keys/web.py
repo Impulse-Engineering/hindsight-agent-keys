@@ -21,6 +21,8 @@ from hindsight_agent_keys.store import Refused
 
 ACCESS_JWT_HEADER = "cf-access-jwt-assertion"
 STATE_CHANGE_HEADER = "x-agent-keys"
+# No page may be framed, so nobody can trick a signed-in admin into clicking Approve or Grant.
+NO_FRAMING = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'"}
 
 
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
@@ -80,9 +82,7 @@ def _stale_row(row) -> str:
 
 
 class Identity(BaseModel):
-    email: Annotated[
-        str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")
-    ]
+    email: Email
 
 
 async def _or_refused(change: Awaitable):
@@ -125,7 +125,8 @@ class AgentKeysHttpExtension(HttpExtension):
         @router.get("/", response_class=HTMLResponse)
         async def page(email: str = Depends(person)):
             note = ALLOWLIST_NOTE[await memory.tenant_extension.role(email)]
-            return PAGE.replace("$allowlist", note).replace("$email", html.escape(email))
+            # One pass, so a value that contains a placeholder is not substituted again.
+            return HTMLResponse(PAGE.substitute(allowlist=note, email=html.escape(email)), headers=NO_FRAMING)
 
         @router.post("/access-requests", status_code=204)
         async def request_access(request: Request, email: str = Depends(person)):
@@ -137,14 +138,11 @@ class AgentKeysHttpExtension(HttpExtension):
             rows = "\n".join(_allowlist_row(e, r, e in keys.bootstrap_admins) for e, r in await keys.allowlist())
             stale = "\n".join(_stale_row(r) for r in await keys.stale_schemas())
             # One pass, so a value that contains a placeholder is not substituted again.
-            return ADMIN_PAGE.substitute(rows=rows, stale=stale)
+            return HTMLResponse(ADMIN_PAGE.substitute(rows=rows, stale=stale), headers=NO_FRAMING)
 
         @admin_router.post("/people")
         async def set_role(body: RoleChange, request: Request, email: str = Depends(admin)):
-            try:
-                await memory.tenant_extension.set_role(email, body.email, body.role, client_ip(request.headers))
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            await _or_refused(memory.tenant_extension.set_role(email, body.email, body.role, client_ip(request.headers)))
             return Response(status_code=204)
 
         @router.get("/keys")
@@ -168,76 +166,55 @@ class AgentKeysHttpExtension(HttpExtension):
 
         @router.post("/keys")
         async def create_key(body: NewKey, request: Request, email: str = Depends(person)):
-            try:
-                key_id, key = await memory.tenant_extension.create_personal_key(
-                    email, body.name, client_ip(request.headers)
-                )
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            creation = memory.tenant_extension.create_personal_key(email, body.name, client_ip(request.headers))
+            key_id, key = await _or_refused(creation)
             return JSONResponse({"id": key_id, "name": body.name, "key": key}, headers={"Cache-Control": "no-store"})
 
         @router.get("/teams", response_class=HTMLResponse)
         async def teams_page(email: str = Depends(person)):
-            return teams_html(email, await memory.tenant_extension.teams(email))
+            return HTMLResponse(teams_html(email, await memory.tenant_extension.teams(email)), headers=NO_FRAMING)
 
         @router.post("/teams")
         async def create_team(body: NewTeam, request: Request, email: str = Depends(person)):
-            try:
-                team = await memory.tenant_extension.create_team(email, body.name, client_ip(request.headers))
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            team = await _or_refused(memory.tenant_extension.create_team(email, body.name, client_ip(request.headers)))
             return {"team": team, "name": body.name}
 
         @router.post("/teams/{team}/keys")
         async def create_team_key(team: str, body: NewKey, request: Request, email: str = Depends(person)):
             """`public` is the Public Team."""
-            try:
-                key_id, key = await memory.tenant_extension.create_team_key(
-                    email, team, body.name, client_ip(request.headers)
-                )
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            creation = memory.tenant_extension.create_team_key(email, team, body.name, client_ip(request.headers))
+            key_id, key = await _or_refused(creation)
             return JSONResponse({"id": key_id, "name": body.name, "key": key}, headers={"Cache-Control": "no-store"})
 
         @router.post("/teams/{team}/members")
         async def set_member(team: str, body: Member, request: Request, email: str = Depends(person)):
-            try:
-                await memory.tenant_extension.set_member(email, team, body.email, body.role, client_ip(request.headers))
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            change = memory.tenant_extension.set_member(email, team, body.email, body.role, client_ip(request.headers))
+            await _or_refused(change)
             return {"team": team, "email": body.email, "role": body.role}
 
         @router.delete("/teams/{team}/members")
         async def remove_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
-            try:
-                await memory.tenant_extension.remove_member(email, team, body.email, client_ip(request.headers))
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            await _or_refused(memory.tenant_extension.remove_member(email, team, body.email, client_ip(request.headers)))
             return {"team": team, "email": body.email}
 
         @router.post("/teams/{team}/confirmations")
-        async def confirm_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
-            """Confirm a pending request to add someone, filed by an agent over MCP."""
-            try:
-                await memory.tenant_extension.confirm_member(email, team, body.email, client_ip(request.headers))
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
-            return {"team": team, "email": body.email}
+        async def confirm_member(team: str, body: Member, request: Request, email: str = Depends(person)):
+            """Confirm a pending request to add someone, filed by an agent over MCP, for the role the page showed."""
+            change = memory.tenant_extension.confirm_member(email, team, body.email, body.role, client_ip(request.headers))
+            await _or_refused(change)
+            return {"team": team, "email": body.email, "role": body.role}
 
         @router.delete("/teams/{team}/requests")
         async def decline_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
             """Decline a pending request to add someone, filed by an agent over MCP."""
-            try:
-                await memory.tenant_extension.decline_member(email, team, body.email, client_ip(request.headers))
-            except Refused as refusal:
-                return JSONResponse({"detail": str(refusal)}, status_code=refusal.status)
+            await _or_refused(memory.tenant_extension.decline_member(email, team, body.email, client_ip(request.headers)))
             return {"team": team, "email": body.email}
 
         router.include_router(admin_router)
         return router
 
 
-PAGE = """<!doctype html>
+PAGE = Template("""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Agent Keys</title></head>
 <body>
@@ -310,7 +287,7 @@ document.getElementById("request-access")?.addEventListener("click", async () =>
 </script>
 </body>
 </html>
-"""
+""")
 
 ADMIN_PAGE = Template("""<!doctype html>
 <html lang="en">
@@ -399,7 +376,7 @@ def teams_html(email: str, teams: list[dict]) -> str:
         if t["requests"]:
             asked = "".join(
                 f"<li>{e(q['email'])} as {e(q['role'])}, asked by {e(q['by'])} "
-                f"{REQUEST_FORMS.format(url=url, email=e(q['email']))}</li>"
+                f"{REQUEST_FORMS.format(url=url, email=e(q['email']), role=e(q['role']))}</li>"
                 for q in t["requests"]
             )
             parts.append(f"<h3>Waiting for an owner to confirm</h3><ul>{asked}</ul>")
@@ -426,9 +403,10 @@ MEMBER_FORMS = """<form data-url="{url}/members" data-method="POST">
 <form data-url="{url}/members" data-method="DELETE">
 <label>Email <input name="email" type="email" required></label> <button>Remove</button></form>"""
 
-# A request an agent filed over MCP lets nobody in until an owner or admin presses Confirm.
+# A request an agent filed over MCP lets nobody in until an owner or admin presses Confirm,
+# which sends the role shown, so a request changed since is refused rather than granted.
 REQUEST_FORMS = """<form data-url="{url}/confirmations" data-method="POST">
-<input type="hidden" name="email" value="{email}"><button>Confirm</button></form>
+<input type="hidden" name="email" value="{email}"><input type="hidden" name="role" value="{role}"><button>Confirm</button></form>
 <form data-url="{url}/requests" data-method="DELETE">
 <input type="hidden" name="email" value="{email}"><button>Decline</button></form>"""
 

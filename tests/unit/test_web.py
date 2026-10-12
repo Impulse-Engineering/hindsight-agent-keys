@@ -49,6 +49,15 @@ def test_a_signed_in_person_gets_the_key_page(team):
     assert "alice@example.com" in resp.text
 
 
+@pytest.mark.parametrize("path", ["/ext/", "/ext/admin", "/ext/teams"])
+def test_the_pages_cannot_be_framed_so_their_buttons_cannot_be_clickjacked(team, path):
+    client, _, _ = pages(team)
+    resp = client.get(path, headers=signed_in(team, email="alice@example.com"))
+    assert resp.status_code == 200
+    assert resp.headers["x-frame-options"] == "DENY"
+    assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+
+
 def test_the_page_escapes_the_email(team):
     client, _, _ = pages(team)
     resp = client.get("/ext/", headers=signed_in(team, email="<b>x</b>@example.com"))

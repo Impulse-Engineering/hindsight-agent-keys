@@ -95,7 +95,7 @@ async def test_owners_and_admins_confirm_pending_requests_on_the_teams_page(team
     page = client.get("/ext/teams", headers=signed_in(team, email=DAVE)).text
     assert "&lt;b&gt;c&lt;/b&gt;@example.com as owner, asked by alice@example.com" in page and "<b>c</b>" not in page
     url = f"/ext/teams/{created}/confirmations"
-    body = {"email": "<b>c</b>@example.com"}
+    body = {"email": "<b>c</b>@example.com", "role": "owner"}
     resp = client.post(url, json=body, headers=as_person(team, DAVE))
     assert resp.status_code == 403 and "owners" in resp.json()["detail"]
     assert client.post(url, json=body, headers=as_person(team, BOB)).status_code == 200
@@ -103,6 +103,19 @@ async def test_owners_and_admins_confirm_pending_requests_on_the_teams_page(team
     assert events.rows[-1]["kind"] == "owner_confirmed"
     resp = client.post(url, json=body, headers=as_person(team, BOB))
     assert resp.status_code == 404, resp.text
+
+
+async def test_confirm_sends_the_role_the_page_showed_and_is_refused_if_the_request_changed(team):
+    client, ext, _ = pages(team)
+    created = create_team(client, team)
+    await ext.request_member(ALICE, created, CAROL, "member", None)
+    page = client.get("/ext/teams", headers=signed_in(team, email=ALICE)).text
+    assert '<input type="hidden" name="role" value="member">' in page
+    await ext.request_member(ALICE, created, CAROL, "owner", None)
+    url = f"/ext/teams/{created}/confirmations"
+    resp = client.post(url, json={"email": CAROL, "role": "member"}, headers=as_person(team, ALICE))
+    assert resp.status_code == 409 and "reload" in resp.json()["detail"]
+    assert (await ext.teams(ALICE))[0]["members"] == [{"email": ALICE, "role": "owner"}]
 
 
 async def test_declining_a_pending_request_on_the_teams_page_keeps_the_person_in_the_team(team):
@@ -123,7 +136,7 @@ STATE_CHANGES = [
     ("POST", "/ext/teams/public/keys", {"name": "ci"}),
     ("POST", "/ext/teams/t_0000000000000000/members", {"email": CAROL, "role": "member"}),
     ("DELETE", "/ext/teams/t_0000000000000000/members", {"email": CAROL}),
-    ("POST", "/ext/teams/t_0000000000000000/confirmations", {"email": CAROL}),
+    ("POST", "/ext/teams/t_0000000000000000/confirmations", {"email": CAROL, "role": "member"}),
     ("DELETE", "/ext/teams/t_0000000000000000/requests", {"email": CAROL}),
 ]
 

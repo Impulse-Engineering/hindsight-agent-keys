@@ -294,14 +294,18 @@ class PostgresKeyStore:
             by,
         )
 
-    async def confirm_member(self, team: str, email: str) -> str | None:
-        """Give the person the role a pending request asked for; returns it, or None if there was no request."""
+    async def confirm_member(self, team: str, email: str, role: str) -> str | None:
+        """Give the person `role` if a pending request asks for exactly that. Returns the role the
+        request asks for (nothing changes if it is another), or None if there is no request."""
         return await self._change_members(
             team,
-            f"WITH r AS (DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 RETURNING role)"
-            f" INSERT INTO {SCHEMA}.members (team, email, role) SELECT $1, $2, role FROM r"
-            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role RETURNING role",
+            f"WITH asked AS (SELECT role FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2),"
+            f" taken AS (DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 AND role = $3 RETURNING role),"
+            f" granted AS (INSERT INTO {SCHEMA}.members (team, email, role) SELECT $1, $2, role FROM taken"
+            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role)"
+            " SELECT role FROM asked",
             email,
+            role,
         )
 
     async def decline_member(self, team: str, email: str) -> str | None:
