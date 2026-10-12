@@ -220,6 +220,11 @@ class AgentKeysTenantExtension(TenantExtension):
         if old != role:
             await self._record(_role_change(old, role), NO_KEY_ID, client_ip, email, admin)
 
+    async def stale_schemas(self) -> list:
+        """Personal schemas no valid key has reached for 90 days: schema, owner's email and
+        last key activity (None if it never had a key). Never a Team schema or `public`."""
+        return await self._store.stale_schemas()
+
     def _hmac(self, key: str) -> bytes:
         return hmac.new(self._pepper, key.encode(), hashlib.sha256).digest()
 

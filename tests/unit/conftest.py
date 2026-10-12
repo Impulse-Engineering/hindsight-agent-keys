@@ -47,7 +47,12 @@ class MemoryStore:
         self.roles = {}
         self.teams_by_schema = {}
         self.team_roles = {}  # (team, email) -> "owner" | "member"
+        # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
+        self.stale = []
         self.fail = False
+
+    async def stale_schemas(self):
+        return self.stale
 
     async def tenant_schemas(self):
         if self.fail:
