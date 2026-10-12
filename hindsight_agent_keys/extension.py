@@ -33,6 +33,9 @@ from hindsight_agent_keys.store import PostgresKeyStore, Refused
 
 PUBLIC_SCHEMA = "public"
 
+# Roles on the Key Allowlist that may create keys; 'requested' may not.
+LISTED = ("member", "admin")
+
 # Reserved key IDs are parenthesised: a presented key's ID is alphanumeric
 # (see _AGENT_KEY_ID), so no presented key can pose as one of these.
 LEGACY_KEY_ID = "(legacy)"
@@ -111,6 +114,15 @@ def _key_id(key: str) -> str:
     return match.group(1) if match else UNRECOGNIZED_KEY_ID
 
 
+def _role_change(old: str | None, new: str | None) -> str:
+    """The event kind for an admin changing someone's role on the Key Allowlist from old to new."""
+    if new == "admin":
+        return "admin_granted"
+    if new == "member":
+        return {"admin": "admin_removed", "requested": "access_approved"}.get(old, "allowlist_added")
+    return "access_declined" if old == "requested" else "allowlist_removed"
+
+
 def _digest(value: str) -> bytes:
     # Comparing fixed-length digests keeps the comparison constant-time
     # whatever the length of the presented key.
@@ -136,7 +148,7 @@ class AgentKeysTenantExtension(TenantExtension):
             raise ValueError("HINDSIGHT_API_TENANT_KEY_PEPPER must be at least 32 bytes")
         # Without a pepper no key can be created and every Agent Key is refused.
         self._pepper = pepper or None
-        # Until the Key Allowlist is managed on the page, it is these admins.
+        # Always admins, so always on the Key Allowlist; the page cannot change them.
         self.bootstrap_admins = frozenset(
             e.strip().lower() for e in os.environ.get("AGENT_KEYS_ADMIN_EMAILS", "").split(",") if e.strip()
         )
@@ -172,19 +184,33 @@ class AgentKeysTenantExtension(TenantExtension):
             return None
         return await self._access.email(token)
 
+    async def role(self, email: str) -> str | None:
+        """The person's place on the Key Allowlist: 'admin', 'member', 'requested' (asked to join) or None."""
+        return "admin" if email in self.bootstrap_admins else await self._store.role(email)
+
+    async def allowlist(self) -> list[tuple[str, str]]:
+        """(email, role) for the bootstrap admins, then everyone else with a role, pending requests first."""
+        stored = [(r["email"], r["role"]) for r in await self._store.allowlist() if r["email"] not in self.bootstrap_admins]
+        return [(e, "admin") for e in sorted(self.bootstrap_admins)] + stored
+
+    async def request_access(self, email: str, client_ip: str | None) -> None:
+        """Ask the admins to add a signed-in person; does nothing if they already have a role."""
+        if await self.role(email) is None and await self._store.add_request(email):
+            await self._record("access_requested", NO_KEY_ID, client_ip, email, email)
+
+    async def set_role(self, admin: str, email: str, role: str | None, client_ip: str | None) -> None:
+        """An admin makes the person a 'member' or an 'admin' of the Key Allowlist, or removes them (None)."""
+        if email in self.bootstrap_admins:
+            raise Refused(409, "Admins set in AGENT_KEYS_ADMIN_EMAILS cannot be changed here.")
+        old = await self._store.set_role(email, role)
+        if old != role:
+            await self._record(_role_change(old, role), NO_KEY_ID, client_ip, email, admin)
+
     def _hmac(self, key: str) -> bytes:
         return hmac.new(self._pepper, key.encode(), hashlib.sha256).digest()
 
-    async def is_admin(self, email: str) -> bool:
-        """Admins manage the Key Allowlist and every Team."""
-        return email in self.bootstrap_admins
-
-    async def on_key_allowlist(self, email: str) -> bool:
-        # Until the Key Allowlist is stored, it is the bootstrap admins.
-        return email in self.bootstrap_admins
-
     async def _require_allowlisted(self, email: str) -> None:
-        if not await self.on_key_allowlist(email):
+        if await self.role(email) not in LISTED:
             raise Refused(403, "You are not on the Key Allowlist.")
 
     async def create_personal_key(self, email: str, name: str, client_ip: str | None) -> tuple[str, str]:
@@ -215,7 +241,7 @@ class AgentKeysTenantExtension(TenantExtension):
         if self._pepper is None:
             raise Refused(503, "Key creation is not configured.")
         await self._require_allowlisted(email)
-        if team != PUBLIC_SCHEMA and await self._store.role(team, email) is None:
+        if team != PUBLIC_SCHEMA and await self._store.team_role(team, email) is None:
             raise Refused(403, "You are not in that Team.")
         await self._store.add_person(email, None)
         return await self._add_key(email, team, "team", name, client_ip)
@@ -235,12 +261,12 @@ class AgentKeysTenantExtension(TenantExtension):
         # shortcut: a concurrent create with the same name leaves this schema empty and unlisted;
         # serialise creation by name if that ever shows up.
         await self._store.create_team(schema, name, email)
-        await self._record("team_created", NO_KEY_ID, client_ip, email, team=schema)
+        await self._record("team_created", NO_KEY_ID, client_ip, email, email, team=schema)
         return schema
 
     async def teams(self, email: str) -> list[dict]:
         """The person's Teams, or every Team for an admin, each with the person's role and its members."""
-        rows = await self._store.teams(email, everyone=await self.is_admin(email))
+        rows = await self._store.teams(email, everyone=await self.role(email) == "admin")
         return [
             {
                 "team": r["schema"],
@@ -252,20 +278,20 @@ class AgentKeysTenantExtension(TenantExtension):
         ]
 
     async def _require_manager(self, email: str, team: str) -> None:
-        if not await self.is_admin(email) and await self._store.role(team, email) != "owner":
+        if await self.role(email) != "admin" and await self._store.team_role(team, email) != "owner":
             raise Refused(403, "Only the Team's owners and admins can change its members.")
 
     async def set_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
         """As an owner or admin, add `member` to the Team as "owner" or "member", or change their role."""
         await self._require_manager(email, team)
         await self._store.set_member(team, member, role)
-        await self._record(f"{role}_added", NO_KEY_ID, client_ip, email, team=team, member=member)
+        await self._record(f"{role}_added", NO_KEY_ID, client_ip, member, email, team=team)
 
     async def remove_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
         """As an owner or admin, take `member` out of the Team."""
         await self._require_manager(email, team)
         await self._store.remove_member(team, member)
-        await self._record("member_removed", NO_KEY_ID, client_ip, email, team=team, member=member)
+        await self._record("member_removed", NO_KEY_ID, client_ip, member, email, team=team)
 
     def _is_legacy(self, key: str) -> bool:
         return bool(key) and self._legacy_digest is not None and hmac.compare_digest(_digest(key), self._legacy_digest)
@@ -283,9 +309,12 @@ class AgentKeysTenantExtension(TenantExtension):
         row = await self._store.find_key(match.group(1))
         if not hmac.compare_digest(self._hmac(key), row["digest"] if row else _NO_DIGEST) or row is None:
             return None
+        # Removing someone from the Key Allowlist disables the keys they hold.
+        if row["role"] not in LISTED and row["email"] not in self.bootstrap_admins:
+            return None
         team = row["kind"] == "team" and row["schema"] != PUBLIC_SCHEMA
         # Uncached, so removing a member stops their Team keys on their next request.
-        if team and await self._store.role(row["schema"], row["email"]) is None:
+        if team and await self._store.team_role(row["schema"], row["email"]) is None:
             return None
         return Principal(row["kind"], row["schema"], match.group(1), row["email"])
 
@@ -315,10 +344,16 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._record(kind, key_id, ip)
 
     async def _record(
-        self, kind: str, key_id: str, client_ip: str | None, email: str | None = None, **details: str
+        self,
+        kind: str,
+        key_id: str,
+        client_ip: str | None,
+        email: str | None = None,
+        actor: str | None = None,
+        **team: str,
     ) -> None:
         try:
-            await self._events.record(kind, key_id, client_ip, email, **details)
+            await self._events.record(kind, key_id, client_ip, email, actor, **team)
         except Exception as exc:  # noqa: BLE001 - the decision stands even if it cannot be logged
             logger.warning("agent-keys: could not record %s event: %s", kind, exc)
 

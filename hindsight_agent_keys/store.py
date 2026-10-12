@@ -46,6 +46,10 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.keys (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS keys_email_idx ON {SCHEMA}.keys (email);
+CREATE TABLE IF NOT EXISTS {SCHEMA}.allowlist (
+    email text PRIMARY KEY,
+    role text NOT NULL CHECK (role IN ('requested', 'member', 'admin'))
+);
 """
 
 
@@ -131,10 +135,50 @@ class PostgresKeyStore:
                 kind,
             )
 
-    async def find_key(self, key_id: str) -> asyncpg.Record | None:
-        """The key's digest, email, schema and kind."""
+    async def role(self, email: str) -> str | None:
         pool = await self._get_pool()
-        return await pool.fetchrow(f"SELECT digest, email, schema, kind FROM {SCHEMA}.keys WHERE id = $1", key_id)
+        return await pool.fetchval(f"SELECT role FROM {SCHEMA}.allowlist WHERE email = $1", email)
+
+    async def allowlist(self) -> list[asyncpg.Record]:
+        """Everyone with a role, pending requests first."""
+        pool = await self._get_pool()
+        return await pool.fetch(f"SELECT email, role FROM {SCHEMA}.allowlist ORDER BY role DESC, email")
+
+    async def add_request(self, email: str) -> bool:
+        """Record a request to join unless the person already has a role; True if recorded."""
+        pool = await self._get_pool()
+        return bool(
+            await pool.fetchval(
+                f"INSERT INTO {SCHEMA}.allowlist (email, role) VALUES ($1, 'requested')"
+                " ON CONFLICT (email) DO NOTHING RETURNING true",
+                email,
+            )
+        )
+
+    async def set_role(self, email: str, role: str | None) -> str | None:
+        """Set the person's role, or remove them with None; returns the role they had."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            old = await conn.fetchval(f"SELECT role FROM {SCHEMA}.allowlist WHERE email = $1 FOR UPDATE", email)
+            if role is None:
+                await conn.execute(f"DELETE FROM {SCHEMA}.allowlist WHERE email = $1", email)
+            else:
+                await conn.execute(
+                    f"INSERT INTO {SCHEMA}.allowlist (email, role) VALUES ($1, $2)"
+                    " ON CONFLICT (email) DO UPDATE SET role = excluded.role",
+                    email,
+                    role,
+                )
+        return old
+
+    async def find_key(self, key_id: str) -> asyncpg.Record | None:
+        """The key's digest, email, schema and kind, and its owner's role on the Key Allowlist."""
+        pool = await self._get_pool()
+        return await pool.fetchrow(
+            f"SELECT k.digest, k.email, k.schema, k.kind, a.role FROM {SCHEMA}.keys k"
+            f" LEFT JOIN {SCHEMA}.allowlist a ON a.email = k.email WHERE k.id = $1",
+            key_id,
+        )
 
     async def create_team(self, schema: str, name: str, owner: str) -> None:
         """Store a Team with its first owner, or raise Refused(409) if the name is taken."""
@@ -168,7 +212,7 @@ class PostgresKeyStore:
         pool = await self._get_pool()
         return await pool.fetch(f"SELECT email, role FROM {SCHEMA}.members WHERE team = $1 ORDER BY email", team)
 
-    async def role(self, team: str, email: str) -> str | None:
+    async def team_role(self, team: str, email: str) -> str | None:
         """The person's role in the Team, "owner" or "member", or None if they are not in it."""
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2", team, email)

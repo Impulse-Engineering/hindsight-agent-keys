@@ -19,8 +19,7 @@ DAVE = "dave@example.com"
 
 @pytest.fixture(autouse=True)
 def allowlist(monkeypatch):
-    # Until the Key Allowlist is stored it is the bootstrap admins, so Alice and Bob are
-    # both on it and admins; Carol and Dave are neither.
+    # Alice and Bob are bootstrap admins, so on the Key Allowlist; Carol and Dave are on neither.
     monkeypatch.setenv("AGENT_KEYS_ADMIN_EMAILS", f"{ALICE},{BOB}")
 
 
@@ -135,11 +134,12 @@ async def test_team_and_membership_changes_are_logged_with_who_made_them():
     await ext.set_member(ALICE, team, CAROL, "owner", None)
     await ext.set_member(ALICE, team, DAVE, "member", None)
     await ext.remove_member(CAROL, team, DAVE, None)
-    assert [(r["kind"], r["key_id"], r["email"], r["team"], r.get("member")) for r in events.rows] == [
-        ("team_created", "(none)", ALICE, team, None),
-        ("owner_added", "(none)", ALICE, team, CAROL),
-        ("member_added", "(none)", ALICE, team, DAVE),
-        ("member_removed", "(none)", CAROL, team, DAVE),
+    # `email` is whom the change concerns, `actor` who made it.
+    assert [(r["kind"], r["key_id"], r["email"], r["actor"], r["team"]) for r in events.rows] == [
+        ("team_created", "(none)", ALICE, ALICE, team),
+        ("owner_added", "(none)", CAROL, ALICE, team),
+        ("member_added", "(none)", DAVE, ALICE, team),
+        ("member_removed", "(none)", DAVE, CAROL, team),
     ]
     assert events.rows[0]["client_ip"] == "203.0.113.7"
 
@@ -205,5 +205,5 @@ async def test_team_key_creation_is_logged_with_the_team():
     team = await ext.create_team(ALICE, "Platform", None)
     key_id, _ = await ext.create_team_key(ALICE, team, "ci", "203.0.113.7")
     assert events.rows[-1] == {
-        "kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "team": team
+        "kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "actor": None, "team": team
     }

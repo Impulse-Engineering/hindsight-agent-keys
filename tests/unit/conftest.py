@@ -28,10 +28,12 @@ class RecordedEvents:
     async def stop(self):
         pass
 
-    async def record(self, kind, key_id, client_ip, email=None, **details):
+    async def record(self, kind, key_id, client_ip, email=None, actor=None, **details):
         if self.fail:
             raise RuntimeError("event store unavailable")
-        self.rows.append({"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, **details})
+        self.rows.append(
+            {"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor, **details}
+        )
 
 
 class MemoryStore:
@@ -40,8 +42,9 @@ class MemoryStore:
     def __init__(self):
         self.people = {}
         self.keys = {}
+        self.roles = {}
         self.teams_by_schema = {}
-        self.roles = {}  # (team, email) -> "owner" | "member"
+        self.team_roles = {}  # (team, email) -> "owner" | "member"
         self.fail = False
 
     async def tenant_schemas(self):
@@ -53,19 +56,19 @@ class MemoryStore:
         if name.lower() in (n.lower() for n in self.teams_by_schema.values()):
             raise Refused(409, "A Team with that name exists.")
         self.teams_by_schema[schema] = name
-        self.roles[schema, owner] = "owner"
+        self.team_roles[schema, owner] = "owner"
 
     async def team_schema(self, name):
         return next((s for s, n in self.teams_by_schema.items() if n.lower() == name.lower()), None)
 
     async def teams(self, email, everyone=False):
         rows = [
-            {"schema": s, "name": n, "role": self.roles.get((s, email))} for s, n in self.teams_by_schema.items()
+            {"schema": s, "name": n, "role": self.team_roles.get((s, email))} for s, n in self.teams_by_schema.items()
         ]
         return sorted((r for r in rows if everyone or r["role"]), key=lambda r: r["name"].lower())
 
-    async def role(self, team, email):
-        return self.roles.get((team, email))
+    async def team_role(self, team, email):
+        return self.team_roles.get((team, email))
 
     async def set_member(self, team, email, role):
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
@@ -76,14 +79,14 @@ class MemoryStore:
     def _change_members(self, team, change):
         if team not in self.teams_by_schema:
             raise Refused(404, "There is no such Team.")
-        roles = dict(self.roles)
+        roles = dict(self.team_roles)
         change(roles)
         if "owner" not in (r for (t, _), r in roles.items() if t == team):
             raise Refused(409, "A Team must keep at least one owner.")
-        self.roles = roles
+        self.team_roles = roles
 
     async def members(self, team):
-        return [{"email": e, "role": r} for (t, e), r in sorted(self.roles.items()) if t == team]
+        return [{"email": e, "role": r} for (t, e), r in sorted(self.team_roles.items()) if t == team]
 
     async def person_schema(self, email):
         return self.people.get(email)
@@ -97,7 +100,27 @@ class MemoryStore:
         self.keys[key_id] = {"digest": digest, "name": name, "email": email, "schema": schema, "kind": kind}
 
     async def find_key(self, key_id):
-        return self.keys.get(key_id)
+        key = self.keys.get(key_id)
+        return key and {**key, "role": self.roles.get(key["email"])}
+
+    async def role(self, email):
+        return self.roles.get(email)
+
+    async def add_request(self, email):
+        if email in self.roles:
+            return False
+        self.roles[email] = "requested"
+        return True
+
+    async def allowlist(self):
+        rows = sorted(({"email": e, "role": r} for e, r in self.roles.items()), key=lambda r: r["email"])
+        return sorted(rows, key=lambda r: r["role"], reverse=True)
+
+    async def set_role(self, email, role):
+        old = self.roles.pop(email, None)
+        if role is not None:
+            self.roles[email] = role
+        return old
 
     async def close(self):
         pass
