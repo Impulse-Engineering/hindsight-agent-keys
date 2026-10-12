@@ -102,6 +102,11 @@ Copy the current value of every secret this step or step 5 changes into the pass
 2. Prod only: register `HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES` and set it to the cut-over date plus 30 days (#697), for example `2026-11-30`. It is not secret, so `platform_set_secret` is fine. The extension treats it as optional, so step 6 checks it is there.
 3. If the app has a `HINDSIGHT_API_TENANT_EXTENSION` secret, set it to `hindsight_agent_keys.extension:AgentKeysTenantExtension`. Do not delete it: deleting it restarts stock Hindsight with no tenant extension, which admits every request into `public`. Stock Hindsight cannot import our class, so it stops (`ExtensionLoadError`) and stays down until step 5. A secret overrides the image's own value, and the guard accepts only ours.
 4. Delete any other secret the startup guard refuses (README, "Startup guard"), for example `HINDSIGHT_API_MCP_AUTH_TOKEN`. Otherwise the deploy exits 78 and its log names the variable.
+5. For personal Agent Keys (README, "Configuration"), set these. Until all of them are set, the key pages refuse every request and no key can be created, while the legacy key keeps working; each change restarts the app with that state.
+   - `HINDSIGHT_API_TENANT_KEY_PEPPER`: register it with `platform_request_secret`, then set it from a file as in step 4.1, generated with `python3 -c 'import secrets; print(secrets.token_urlsafe(48))' > <file>`. Changing it later invalidates every Agent Key.
+   - `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` and `HINDSIGHT_API_TENANT_ACCESS_AUD`: the `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` values in the app's `platform://apps/<app>/claude-md`. If either reads `N/A`, the app's primary hostname has no Access application to validate against; fix that first. Not secret, so `platform_set_secret` is fine.
+   - `HINDSIGHT_API_TENANT_ACCESS_HOST`: the app's primary, Access-protected hostname. `platform_set_secret`.
+   - `AGENT_KEYS_ADMIN_EMAILS`: the first admins, comma-separated. `platform_set_secret`.
 
 ## 5. Deploy the image
 

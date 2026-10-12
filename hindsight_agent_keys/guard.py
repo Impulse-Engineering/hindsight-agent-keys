@@ -10,6 +10,7 @@ import sys
 from collections.abc import Iterable, Mapping
 
 EXTENSION_PATH = "hindsight_agent_keys.extension:AgentKeysTenantExtension"
+HTTP_EXTENSION_PATH = "hindsight_agent_keys.web:AgentKeysHttpExtension"
 
 # Exit status for a configuration error (sysexits EX_CONFIG).
 EX_CONFIG = 78
@@ -51,6 +52,11 @@ def problems(env: Mapping[str, str], dotenv_files: Iterable[str] = ()) -> list[s
         found.append(
             f"HINDSIGHT_API_TENANT_EXTENSION must be {EXTENSION_PATH}; "
             "without it Hindsight admits every request into the public schema."
+        )
+    if env.get("HINDSIGHT_API_HTTP_EXTENSION", "") != HTTP_EXTENSION_PATH:
+        found.append(
+            f"HINDSIGHT_API_HTTP_EXTENSION must be {HTTP_EXTENSION_PATH}; "
+            "Hindsight serves whatever another one mounts at /ext unauthenticated, and without ours there are no key pages."
         )
     if "HINDSIGHT_API_MCP_AUTH_TOKEN" in env:
         found.append(
