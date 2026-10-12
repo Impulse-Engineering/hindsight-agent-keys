@@ -57,6 +57,16 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.allowlist (
     email text PRIMARY KEY,
     role text NOT NULL CHECK (role IN ('requested', 'member', 'admin'))
 );
+-- Personal schemas no valid key has reached for 90 days, read by the admin page and by
+-- scripts/purge-schema.sql. A key reaching the schema was valid at the latest until it
+-- expired, was revoked, or 30 days after its owner's last sign-in (extension.SIGN_IN_WINDOW);
+-- a schema with no key counts from when its owner was first recorded.
+CREATE OR REPLACE VIEW {SCHEMA}.stale_schemas AS
+SELECT p.schema, p.email, k.last_active
+FROM {SCHEMA}.people p LEFT JOIN {SCHEMA}.sign_ins s ON s.email = p.email,
+LATERAL (SELECT max(least(expires_at, revoked_at, s.last_seen + interval '30 days')) AS last_active
+         FROM {SCHEMA}.keys WHERE schema = p.schema) k
+WHERE p.schema IS NOT NULL AND coalesce(k.last_active, p.created_at) <= now() - interval '90 days';
 """
 
 
@@ -101,6 +111,12 @@ class PostgresKeyStore:
             f" UNION ALL SELECT schema, created_at FROM {SCHEMA}.teams) s ORDER BY created_at"
         )
         return [r["schema"] for r in rows]
+
+    async def stale_schemas(self) -> list[asyncpg.Record]:
+        pool = await self._get_pool()
+        return await pool.fetch(
+            f"SELECT schema, email, last_active FROM {SCHEMA}.stale_schemas ORDER BY last_active NULLS FIRST, email"
+        )
 
     async def person_schema(self, email: str) -> str | None:
         pool = await self._get_pool()

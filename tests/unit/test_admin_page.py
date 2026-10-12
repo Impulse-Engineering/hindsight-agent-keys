@@ -1,5 +1,7 @@
 """Admins manage the Key Allowlist at /ext/admin; anyone signed in can ask to join from /ext/."""
 
+from datetime import UTC, datetime
+
 import pytest
 from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.models import RequestContext
@@ -92,6 +94,17 @@ def test_the_bootstrap_admins_cannot_be_changed_from_the_page(team, role):
 def test_a_change_needs_an_email_and_a_known_role(team, body):
     client, _, _ = pages(team)
     assert client.post("/ext/admin/people", json=body, headers=as_person(team, ADMIN)).status_code == 422
+
+
+def test_admins_see_each_stale_personal_schema_with_its_owner_and_last_key_activity(team):
+    client, ext, _ = pages(team)
+    ext._store.stale = [
+        {"schema": "p_00000000000000aa", "email": "<b>gone</b>@example.com", "last_active": datetime(2026, 1, 2, 3, 4, tzinfo=UTC)},
+        {"schema": "p_00000000000000bb", "email": "keyless@example.com", "last_active": None},
+    ]
+    text = client.get("/ext/admin", headers=signed_in(team, email=ADMIN)).text
+    assert "<tr><td>p_00000000000000aa</td><td>&lt;b&gt;gone&lt;/b&gt;@example.com</td><td>2026-01-02 03:04 UTC</td></tr>" in text
+    assert "<tr><td>p_00000000000000bb</td><td>keyless@example.com</td><td>never had a key</td></tr>" in text
 
 
 def test_the_admin_page_escapes_emails(team):

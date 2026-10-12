@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -624,6 +625,73 @@ def test_revoke_identity_disables_every_key_the_person_holds(hindsight):
     assert query(hindsight["name"], f"SELECT kind, email, actor FROM agent_keys.events WHERE client_ip = '{ip}'") == [
         {"kind": "identity_revoked", "email": ERIN, "actor": ALICE}
     ]
+
+
+# psql from pg0's own installation, as the operator runs it (docs/cutover.md).
+PSQL = 'd=$(ls -d /home/hindsight/.pg0/installation/*/ | tail -1); LD_LIBRARY_PATH="$d/lib" exec "$d/bin/psql" "$@"'
+
+
+def purge(container, **variables):
+    """Run scripts/purge-schema.sql on stdin, with these psql variables."""
+    uri = in_container(container, "import json\nfrom pg0 import Pg0\nprint(json.dumps(Pg0(name='hindsight').info().uri))")
+    with open(os.path.join(ROOT, "scripts", "purge-schema.sql")) as script:
+        return subprocess.run(
+            ["docker", "exec", "-i", container, "sh", "-c", PSQL, "psql", "-X", uri,
+             *(f"--set={k}={v}" for k, v in variables.items())],
+            stdin=script, capture_output=True, text=True, timeout=300, check=False,
+        )
+
+
+def test_a_stale_personal_schema_is_reported_to_admins_and_purged_only_by_the_operator(hindsight, two_people):
+    name, gina, operator = hindsight["name"], "gina@example.test", "ops@example.test"
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": gina, "role": "member"})[0] == 204
+    personal_key(hindsight, gina)
+    team = team_page(hindsight, "POST", "/ext/teams", gina, {"name": "Gina's Team"})["team"]
+    for target in (team, "public"):
+        team_page(hindsight, "POST", f"/ext/teams/{target}/keys", gina, {"name": "ci"})
+    schema = query(name, f"SELECT schema FROM agent_keys.people WHERE email = '{gina}'")[0]["schema"]
+
+    def reported(expired_days_ago=None, signed_in_days_ago=0):
+        """Backdate every key Gina holds and her last sign-in; (schema, owner) rows of the admin page's report."""
+        expires = "now() + interval '1 day'" if expired_days_ago is None else f"now() - interval '{expired_days_ago} days'"
+        query(name, f"UPDATE agent_keys.keys SET expires_at = {expires} WHERE email = '{gina}' RETURNING id")
+        query(name, f"UPDATE agent_keys.sign_ins SET last_seen = now() - interval '{signed_in_days_ago} days'"
+                    f" WHERE email = '{gina}' RETURNING email")
+        status, text = key_page(hindsight, "GET", "/ext/admin", ALICE)
+        assert status == 200, text
+        return re.findall(r"<tr><td>([^<]*)</td><td>([^<]*)</td><td>[^<]*</td></tr>", text.partition("Stale personal schemas")[2])
+
+    assert (schema, gina) not in reported()
+    assert (schema, gina) not in reported(expired_days_ago=89)
+    # Keys that have not expired count from 30 days after their owner's last sign-in.
+    assert (schema, gina) not in reported(signed_in_days_ago=119)
+    assert (schema, gina) in reported(signed_in_days_ago=121)
+    rows = reported(expired_days_ago=91)
+    assert (schema, gina) in rows
+    # Gina's Team and Public Team keys are just as stale, yet only personal schemas are listed.
+    assert all(s.startswith("p_") for s, _ in rows)
+
+    # The script refuses anything the report does not list, and a run without the operator's email.
+    alices = query(name, f"SELECT schema FROM agent_keys.people WHERE email = '{ALICE}'")[0]["schema"]
+    for refused in (alices, team, "public", f"{schema}'; --"):
+        run = purge(name, schema=refused, operator=operator, wait=0)
+        assert run.returncode != 0 and "no rows returned for \\gset" in run.stderr, run.stdout + run.stderr
+    run = purge(name, schema=schema, wait=0)
+    assert run.returncode != 0 and "syntax error" in run.stderr, run.stdout + run.stderr
+    assert query(name, f"SELECT schema FROM agent_keys.people WHERE email = '{gina}'") == [{"schema": schema}]
+    assert query(name, f"SELECT count(*) AS n FROM pg_namespace WHERE nspname IN ('{alices}', '{team}', '{schema}')") == [{"n": 3}]
+
+    run = purge(name, schema=schema, operator=operator, wait=0)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert query(name, f"SELECT count(*) AS n FROM pg_namespace WHERE nspname = '{schema}'") == [{"n": 0}]
+    assert query(name, f"SELECT count(*) AS n FROM agent_keys.keys WHERE schema = '{schema}' AND revoked_at IS NULL") == [{"n": 0}]
+    assert query(name, "SELECT key_id, email, actor, team FROM agent_keys.events WHERE kind = 'schema_purged'") == [
+        {"key_id": "(none)", "email": gina, "actor": operator, "team": schema}
+    ]
+    assert (schema, gina) not in reported(expired_days_ago=91)
+    # Gina's next personal key gets a new schema.
+    personal_key(hindsight, gina)
+    assert query(name, f"SELECT schema FROM agent_keys.people WHERE email = '{gina}'")[0]["schema"] not in (None, schema)
 
 
 def test_the_bundled_ui_is_not_listening(hindsight):

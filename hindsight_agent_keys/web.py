@@ -73,6 +73,12 @@ def _allowlist_row(email: str, role: str, bootstrap: bool) -> str:
     return f"<tr><td>{shown}</td><td>{ROLE_LABELS[role]}</td><td>{actions}</td></tr>"
 
 
+def _stale_row(row) -> str:
+    last = row["last_active"]
+    shown = f"{last:%Y-%m-%d %H:%M} UTC" if last else "never had a key"
+    return f"<tr><td>{html.escape(row['schema'])}</td><td>{html.escape(row['email'])}</td><td>{shown}</td></tr>"
+
+
 class Identity(BaseModel):
     email: Annotated[
         str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")
@@ -129,7 +135,9 @@ class AgentKeysHttpExtension(HttpExtension):
         async def admin_page():
             keys = memory.tenant_extension
             rows = "\n".join(_allowlist_row(e, r, e in keys.bootstrap_admins) for e, r in await keys.allowlist())
-            return ADMIN_PAGE.replace("$rows", rows)
+            stale = "\n".join(_stale_row(r) for r in await keys.stale_schemas())
+            # One pass, so a value that contains a placeholder is not substituted again.
+            return ADMIN_PAGE.substitute(rows=rows, stale=stale)
 
         @admin_router.post("/people")
         async def set_role(body: RoleChange, request: Request, email: str = Depends(admin)):
@@ -286,7 +294,7 @@ document.getElementById("request-access")?.addEventListener("click", async () =>
 </html>
 """
 
-ADMIN_PAGE = """<!doctype html>
+ADMIN_PAGE = Template("""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Key Allowlist</title></head>
 <body>
@@ -310,6 +318,15 @@ ADMIN_PAGE = """<!doctype html>
 <thead><tr><th scope="col">Email</th><th scope="col">Role</th><th scope="col">Change</th></tr></thead>
 <tbody>
 $rows
+</tbody>
+</table>
+<h2>Stale personal schemas</h2>
+<p>Personal schemas that no valid key has reached for 90 days. Nothing is deleted automatically:
+an operator purges a schema with <code>scripts/purge-schema.sql</code> (README, "Stale personal schemas").</p>
+<table>
+<thead><tr><th scope="col">Schema</th><th scope="col">Owner</th><th scope="col">Last key activity</th></tr></thead>
+<tbody>
+$stale
 </tbody>
 </table>
 <script>
@@ -346,7 +363,7 @@ document.getElementById("revoke-identity").addEventListener("submit", async (eve
 </script>
 </body>
 </html>
-"""
+""")
 
 
 def teams_html(email: str, teams: list[dict]) -> str:
