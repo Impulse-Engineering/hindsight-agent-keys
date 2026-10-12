@@ -248,24 +248,24 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def create_team(self, email: str, name: str, client_ip: str | None) -> str:
         """Create a Team with the person as its first owner. Returns the Team's schema."""
-        # shortcut: no limit on Teams per person (each is a migrated schema); only signed-in people on
-        # the Key Allowlist get here. Add one, counted in the database, before agents create Teams (#708).
         await self._require_allowlisted(email)
         if name.lower() == PUBLIC_SCHEMA:
             raise Refused(409, "The name public is reserved for the Public Team.")
-        # Checked before migrating, so a taken name leaves no schema behind.
+        # Checked before migrating, so a taken name or a person at the limit leaves no schema behind.
         if await self._store.team_schema(name) is not None:
             raise Refused(409, "A Team with that name exists.")
+        await self._store.check_team_limit(email)
         schema = "t_" + secrets.token_hex(8)
         await self.context.run_migration(schema)
-        # shortcut: a concurrent create with the same name leaves this schema empty and unlisted;
-        # serialise creation by name if that ever shows up.
+        # shortcut: a concurrent create with the same name, or past the limit, leaves this schema
+        # empty and unlisted; serialise creation if that ever shows up.
         await self._store.create_team(schema, name, email)
         await self._record("team_created", NO_KEY_ID, client_ip, email, email, team=schema)
         return schema
 
     async def teams(self, email: str) -> list[dict]:
-        """The person's Teams, or every Team for an admin, each with the person's role and its members."""
+        """The person's Teams, or every Team for an admin, each with the person's role, its members
+        and the pending requests to add people."""
         rows = await self._store.teams(email, everyone=await self.role(email) == "admin")
         return [
             {
@@ -273,6 +273,10 @@ class AgentKeysTenantExtension(TenantExtension):
                 "name": r["name"],
                 "role": r["role"],
                 "members": [{"email": m["email"], "role": m["role"]} for m in await self._store.members(r["schema"])],
+                "requests": [
+                    {"email": q["email"], "role": q["role"], "by": q["requested_by"]}
+                    for q in await self._store.member_requests(r["schema"])
+                ],
             }
             for r in rows
         ]
@@ -292,6 +296,28 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._require_manager(email, team)
         await self._store.remove_member(team, member)
         await self._record("member_removed", NO_KEY_ID, client_ip, member, email, team=team)
+
+    async def request_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
+        """As an owner or admin, ask for `member` to become an "owner" or "member" of the Team.
+        Agents add people this way: nothing changes until an owner or admin confirms it on the Teams page."""
+        await self._require_manager(email, team)
+        await self._store.request_member(team, member, role, email)
+        await self._record(f"{role}_requested", NO_KEY_ID, client_ip, member, email, team=team)
+
+    async def confirm_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
+        """As an owner or admin, give `member` the role a pending request asked for."""
+        await self._answer_request(email, team, member, client_ip, self._store.confirm_member, "confirmed")
+
+    async def decline_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
+        """As an owner or admin, drop a pending request for `member`; their place in the Team stays as it was."""
+        await self._answer_request(email, team, member, client_ip, self._store.decline_member, "declined")
+
+    async def _answer_request(self, email, team, member, client_ip, answer, outcome) -> None:
+        await self._require_manager(email, team)
+        role = await answer(team, member)
+        if role is None:
+            raise Refused(404, "Nobody asked to add that person to the Team.")
+        await self._record(f"{role}_{outcome}", NO_KEY_ID, client_ip, member, email, team=team)
 
     def _is_legacy(self, key: str) -> bool:
         return bool(key) and self._legacy_digest is not None and hmac.compare_digest(_digest(key), self._legacy_digest)

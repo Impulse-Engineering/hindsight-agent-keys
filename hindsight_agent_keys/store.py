@@ -10,6 +10,8 @@ from hindsight_agent_keys.events import SCHEMA, _asyncpg_dsn
 # Per person. Counted in the database, so they hold across API processes.
 CREATIONS_PER_HOUR = 5
 ACTIVE_KEYS = 10
+# Each Team is a migrated schema, and agents can create them.
+TEAMS_PER_PERSON = 10
 
 # Idempotent and outside upstream's Alembic history, like the event log.
 # A key stores only an HMAC of the whole key, never the key.
@@ -24,9 +26,11 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.people (
 CREATE TABLE IF NOT EXISTS {SCHEMA}.teams (
     schema text PRIMARY KEY CHECK (schema <> ''),
     name text NOT NULL,
+    created_by text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS teams_name_idx ON {SCHEMA}.teams (lower(name));
+CREATE INDEX IF NOT EXISTS teams_created_by_idx ON {SCHEMA}.teams (created_by);
 -- People are members by email, whether or not they have signed in yet.
 CREATE TABLE IF NOT EXISTS {SCHEMA}.members (
     team text NOT NULL REFERENCES {SCHEMA}.teams (schema),
@@ -35,6 +39,14 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.members (
     PRIMARY KEY (team, email)
 );
 CREATE INDEX IF NOT EXISTS members_email_idx ON {SCHEMA}.members (email);
+-- Asked for over MCP; nobody joins until an owner or admin confirms on the Teams page.
+CREATE TABLE IF NOT EXISTS {SCHEMA}.member_requests (
+    team text NOT NULL REFERENCES {SCHEMA}.teams (schema),
+    email text NOT NULL,
+    role text NOT NULL CHECK (role IN ('owner', 'member')),
+    requested_by text NOT NULL,
+    PRIMARY KEY (team, email)
+);
 CREATE TABLE IF NOT EXISTS {SCHEMA}.keys (
     id text PRIMARY KEY,
     digest bytea NOT NULL,
@@ -180,12 +192,24 @@ class PostgresKeyStore:
             key_id,
         )
 
+    async def check_team_limit(self, email: str, conn: asyncpg.Connection | None = None) -> None:
+        """Raise Refused(429) if the person has created as many Teams as they may."""
+        db = conn or await self._get_pool()
+        if await db.fetchval(f"SELECT count(*) FROM {SCHEMA}.teams WHERE created_by = $1", email) >= TEAMS_PER_PERSON:
+            raise Refused(429, f"You can create at most {TEAMS_PER_PERSON} Teams.")
+
     async def create_team(self, schema: str, name: str, owner: str) -> None:
-        """Store a Team with its first owner, or raise Refused(409) if the name is taken."""
+        """Store a Team with its first owner, or raise Refused(409) if the name is taken
+        or Refused(429) if the owner is at the limit."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
+            # Serialises one person's creations, so concurrent ones count each other.
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{SCHEMA}.teams:{owner}")
+            await self.check_team_limit(owner, conn)
             try:
-                await conn.execute(f"INSERT INTO {SCHEMA}.teams (schema, name) VALUES ($1, $2)", schema, name)
+                await conn.execute(
+                    f"INSERT INTO {SCHEMA}.teams (schema, name, created_by) VALUES ($1, $2, $3)", schema, name, owner
+                )
             except asyncpg.UniqueViolationError:
                 raise Refused(409, "A Team with that name exists.") from None
             await conn.execute(
@@ -230,14 +254,48 @@ class PostgresKeyStore:
     async def remove_member(self, team: str, email: str) -> None:
         await self._change_members(team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2", email)
 
-    async def _change_members(self, team: str, sql: str, *args: str) -> None:
-        """Run one change to the Team's members; Refused(404) if there is no such Team,
-        Refused(409) if the change would leave it without an owner."""
+    async def request_member(self, team: str, email: str, role: str, by: str) -> None:
+        """Ask for the person to get this role in the Team; replaces an earlier request for them."""
+        await self._change_members(
+            team,
+            f"INSERT INTO {SCHEMA}.member_requests (team, email, role, requested_by) VALUES ($1, $2, $3, $4)"
+            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role, requested_by = excluded.requested_by",
+            email,
+            role,
+            by,
+        )
+
+    async def confirm_member(self, team: str, email: str) -> str | None:
+        """Give the person the role a pending request asked for; returns it, or None if there was no request."""
+        return await self._change_members(
+            team,
+            f"WITH r AS (DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 RETURNING role)"
+            f" INSERT INTO {SCHEMA}.members (team, email, role) SELECT $1, $2, role FROM r"
+            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role RETURNING role",
+            email,
+        )
+
+    async def decline_member(self, team: str, email: str) -> str | None:
+        """Drop a pending request; returns the role it asked for, or None if there was no request."""
+        return await self._change_members(
+            team, f"DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 RETURNING role", email
+        )
+
+    async def member_requests(self, team: str) -> list[asyncpg.Record]:
+        pool = await self._get_pool()
+        return await pool.fetch(
+            f"SELECT email, role, requested_by FROM {SCHEMA}.member_requests WHERE team = $1 ORDER BY email", team
+        )
+
+    async def _change_members(self, team: str, sql: str, *args: str) -> str | None:
+        """Run one change to the Team's members and return its first value; Refused(404) if there
+        is no such Team, Refused(409) if the change would leave it without an owner."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
             # Locking the Team makes concurrent changes see each other's owners.
             if await conn.fetchval(f"SELECT 1 FROM {SCHEMA}.teams WHERE schema = $1 FOR UPDATE", team) is None:
                 raise Refused(404, "There is no such Team.")
-            await conn.execute(sql, team, *args)
+            value = await conn.fetchval(sql, team, *args)
             if not await conn.fetchval(f"SELECT count(*) FROM {SCHEMA}.members WHERE team = $1 AND role = 'owner'", team):
                 raise Refused(409, "A Team must keep at least one owner.")
+        return value

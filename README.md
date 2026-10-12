@@ -19,6 +19,7 @@ Upstream serves these routes without a key, and they carry no memory data: `/hea
   - Banks cannot switch on upstream audit logging.
   - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one row a minute, whatever the event. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process.
 - **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist" and "Teams").
+- **Team tools for agents** `hindsight_agent_keys.tools:AgentKeysMcpExtension`, on both MCP endpoints (see "Teams over MCP").
 - **A startup guard**, described in its own section below.
 - **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension.
 
@@ -31,6 +32,7 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 | A `.env` file exists at `/app/api/.env`, `/app/.env` or `/.env` | Upstream loads the first one it finds over the process environment, after the guard has checked it. |
 | `HINDSIGHT_API_TENANT_EXTENSION` is not ours | Without our extension Hindsight admits every request into `public`. |
 | `HINDSIGHT_API_HTTP_EXTENSION` is not ours | Hindsight serves whatever another HTTP extension mounts at `/ext` without authentication, and without ours there are no key pages. |
+| `HINDSIGHT_API_MCP_EXTENSION` is not ours | Another MCP extension would add its own tools to every MCP endpoint, and without ours agents cannot manage Teams. |
 | `HINDSIGHT_API_MCP_AUTH_TOKEN` is set, even empty | It bypasses the tenant extension for MCP. |
 | `HINDSIGHT_API_DATABASE_SCHEMA` is anything but `public` | The worker would skip the Public Team's background tasks. |
 | `HINDSIGHT_ENABLE_CP` is not `false` | The bundled UI sends one shared key for every visitor. |
@@ -64,7 +66,7 @@ A person on the Key Allowlist opens `https://<access host>/ext/`, names a key an
 - **Limits:** each person can create 5 keys an hour and hold 10. Both are counted in the database.
 - **Schema:** a person's first key creates their schema, `p_` plus 16 random hex digits, never derived from their email, and migrates it before the key is shown. Every later key of theirs reaches the same schema.
 
-Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, creation time), `allowlist` (email, role), `teams` (schema, name) and `members` (Team schema, email, role `owner` or `member`).
+Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, creation time), `allowlist` (email, role), `teams` (schema, name, creator's email), `members` (Team schema, email, role `owner` or `member`) and `member_requests` (Team schema, email, role asked for, who asked).
 
 ## The Key Allowlist
 
@@ -79,10 +81,24 @@ Only people on the Key Allowlist can create Agent Keys. The bootstrap admins in 
 
 A Team is a named set of people who share one schema. A person on the Key Allowlist opens `https://<access host>/ext/teams`, the Teams page, which follows the same hostname, sign-in and state-change rules as the key page.
 
-- **Creating:** the creator becomes the Team's first owner. The Team gets its own schema, `t_` plus 16 random hex digits, migrated before the Team is shown; the worker processes it like any other. Names are unique whatever their case, and `public` is reserved for the Public Team.
+- **Creating:** the creator becomes the Team's first owner. The Team gets its own schema, `t_` plus 16 random hex digits, migrated before the Team is shown; the worker processes it like any other. Names are unique whatever their case, and `public` is reserved for the Public Team. Each person can create 10 Teams, counted in the database (429 after that).
 - **Members:** owners add people by email, as a member or an owner, including people who have not signed in yet; they change roles and remove people. A change that would leave a Team without an owner is refused. Admins manage every Team and see every Team on the page, whether or not they are in it.
+- **Pending requests:** people an agent asked to add over MCP are listed under their Team, with the role asked for and who asked. An owner or admin presses **Confirm** to give them that role, or **Decline** to drop the request and leave their place in the Team as it was.
 - **Team keys:** a member on the Key Allowlist creates a Team key the same way as a personal key, with the same limits, which count personal and Team keys together. Membership is checked on every request, so removing a member stops their Team keys on their next request.
 - **Public Team:** everyone on the Key Allowlist can create a Public Team key, which reaches the banks in `public`. The Public Team has no owners or members.
+
+### Teams over MCP
+
+Agents manage Teams with these tools, on the multi-bank endpoint `/mcp/` and on every single-bank endpoint `/mcp/<bank>/`. They act as the person whose personal Agent Key the agent sends, with that person's rights; a Team key, a Public Team key and the legacy key get an error from every one of them.
+
+| Tool | What it does |
+| --- | --- |
+| `create_team(name)` | Creates a Team as on the Teams page, with the same limit. Returns its ID (`t_…`), which the other tools take as `team`. |
+| `list_teams()` | The person's Teams (every Team for an admin), each with the person's role, its members and its pending requests. |
+| `add_team_member(team, email, role)` | Files a pending request to make the person a `member` (the default) or an `owner`. Nobody gains access until an owner or admin confirms it on the Teams page. |
+| `remove_team_member(team, email)` | Takes the person out of the Team; their Team keys stop on their next request. |
+
+A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer. Only owners and admins can file requests and remove people. A bank whose config sets `mcp_enabled_tools` hides every tool not named there, these included.
 
 ## The event log
 
@@ -90,11 +106,11 @@ Events go to `agent_keys.events` in Hindsight's own database. That schema sits o
 
 | Column | Meaning |
 | --- | --- |
-| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed`, or a Team change: `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), `member_removed` |
+| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed`, or a Team change: `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), `owner_requested` or `member_requested` (an agent asked over MCP to make the person an owner or a member; nothing changed yet), `owner_confirmed` or `member_confirmed` (an owner or admin confirmed that request, so the person now has that role), `owner_declined` or `member_declined` (an owner or admin dropped that request), `member_removed` |
 | `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (also every Key Allowlist and Team change), or the `<id>` part of a presented or created `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
 | `client_ip` | The `X-Real-IP` address in canonical form (an IPv4-mapped IPv6 address is stored as IPv4), or `NULL` if the header is missing or not an IP address |
 | `email` | For `key_created`, the person who created the key; for a Key Allowlist or Team change, the person it concerns (for `team_created`, the creator); otherwise `NULL` |
-| `actor` | For a Key Allowlist or Team change, who made it: the admin or owner, or for `access_requested` the person asking; otherwise `NULL` |
+| `actor` | For a Key Allowlist or Team change, who made it: the admin or owner (for `*_requested`, the person whose personal key the agent used), or for `access_requested` the person asking; otherwise `NULL` |
 | `team` | For a Team change and for a Team key's `key_created`, the Team's schema (`public` for the Public Team); otherwise `NULL` |
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
@@ -162,6 +178,8 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | A person's Agent Keys all get 401 at once | They were removed from the Key Allowlist (`allowlist_removed` in the event log). Adding them back restores the keys. |
 | Every Agent Key gets 401 | The pepper was changed or removed. Agent Keys must be created again. |
 | A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
+| An agent added someone to a Team but they still have no access | Adding over MCP only files a request. An owner or admin must press **Confirm** under the Team on `/ext/teams`. |
+| The Team tools are missing from an MCP endpoint | The bank's `mcp_enabled_tools` config does not list them. |
 | The event log stays empty | The extension's database connection failed at startup. Look for `agent-keys` warnings in the logs, then restart the container. Refusals are still enforced. |
 
 ## License
