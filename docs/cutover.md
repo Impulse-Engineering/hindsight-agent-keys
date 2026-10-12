@@ -48,7 +48,7 @@ pg() { t=$1; shift; podman run --rm -i --network "container:app-$app" -e PGPASSW
   "$(podman ps --filter "name=^app-$app\$" --format '{{.Image}}')" \
   -h 127.0.0.1 -p "$(sed -n 4p $pg0/instances/hindsight/data/postmaster.pid)" -U hindsight "$@"; }
 api() { curl -sS -o /dev/null -w '%{http_code}\n' "$@"; }
-keyless() { [ "$(api "$@")" = 401 ] && echo "keyless 401 OK" || echo "STOP: no 401 without a key; do not reopen the bypass hostname"; }   # (not verified)
+keyless() { [ "$(api "$@")" = 401 ] && echo "keyless 401 OK" || { echo "STOP: no 401 without a key; do not reopen the bypass hostname"; return 1; }; }   # (not verified)
 banks() { pg psql -d hindsight -Atc "select b.bank_id, (select count(*) from memory_units m where m.bank_id = b.bank_id),
   (select count(*) from documents d where d.bank_id = b.bank_id), (select count(*) from mental_models x where x.bank_id = b.bank_id)
   from banks b order by 1"; }   # bank_id|memory units|documents|mental models
@@ -64,7 +64,7 @@ pg pg_dump -Fc hindsight > "$out" &&
   pg pg_restore -f /dev/null < "$out" &&   # reads every block, so a truncated dump fails here
   pg pg_restore --list < "$out" > "$out.toc" && grep ' TABLE ' "$out.toc" > /dev/null &&
   banks > /root/$app-banks-before.txt && cat /root/$app-banks-before.txt &&   # the baseline for steps 2 and 6
-  sha256sum "$out" && echo "backup OK" || echo "BACKUP FAILED: do not continue"
+  sha256sum "$out" && echo "backup OK" || { echo "BACKUP FAILED: do not continue"; false; }
 ```
 
 - Copy the dump off the CT: on the node, `pct pull <vmid> /root/<file> /root/<file>`, then `scp` it somewhere safe. Its `sha256sum` there must match the one above.
@@ -167,7 +167,7 @@ Each change restarts the app, so keep this order. Until 4.5, stock Hindsight res
      pg psql -d hindsight -Atc "update public.banks set config = config - array(select k from jsonb_object_keys(config) k where $is_audit)
        where exists (select from jsonb_object_keys(config) k where $is_audit)" &&
      [ "$(pg psql -d hindsight -Atc "select count(*) from public.banks, jsonb_object_keys(config) k where $is_audit")" = 0 ] &&
-     echo "audit overrides OK" || echo "STOP: a bank in public still overrides audit logging"
+     echo "audit overrides OK" || { echo "STOP: a bank in public still overrides audit logging"; false; }
    ```
 
    Record the rows it printed on the cut-over ticket. `public` is the only schema with banks until the image runs.
@@ -196,6 +196,8 @@ pg psql -d hindsight -Atc 'select * from agent_keys.events order by 1 desc limit
 ```
 
 The check runs on the CT because both hostnames are behind Access now. **Prod:** the `banks` diff must be empty: #712 requires the two banks unchanged.
+
+Then run the step 4.4 audit block again; it must end in `audit overrides OK` *(not verified)*. Stock ran after that block, so a bank could have stored `audit_log_enabled` in between; the image refuses the setting from now on, so this check holds.
 
 Then delete the secrets the image no longer reads: `cloudflared access curl "$capi/secrets/<KEY>" -sS -X DELETE` (platform admin) *(not verified)* for `HINDSIGHT_API_TENANT_API_KEY`, `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_API_TENANT_EXTENSION`. Each deletion restarts the app.
 
@@ -231,7 +233,7 @@ Only once the keyless check at the end of step 7 printed `keyless 401 OK`: switc
 b=https://<bypass>
 key=$(cat <key file>)   # the file step 4 set the key from
 [ "$(curl -sS -o /dev/null -w '%{http_code}' $b/v1/default/banks)" = 401 ] && echo "keyless 401 OK" ||
-  echo "STOP: no 401 without a key; close the bypass hostname again (step 3)"                        # (not verified)
+  { echo "STOP: no 401 without a key; close the bypass hostname again (step 3)"; false; }            # (not verified)
 curl -sS -H "Authorization: Bearer $key" $b/v1/default/banks                                      # the bank_ids in step 1's snapshot
 curl -sS -H "Authorization: Bearer $key" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' $b/mcp/ \
