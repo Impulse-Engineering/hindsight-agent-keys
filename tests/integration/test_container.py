@@ -256,6 +256,7 @@ def hindsight(volume):
         ("HINDSIGHT_API_MCP_AUTH_TOKEN", "any-token"),
         ("HINDSIGHT_ENABLE_CP", "true"),
         ("HINDSIGHT_API_DATABASE_SCHEMA", "sentinel"),
+        ("HINDSIGHT_API_AUDIT_LOG_ACTIONS", ""),
     ],
 )
 def test_the_container_refuses_to_start_with_an_unsafe_setting(variable, value):
@@ -341,6 +342,28 @@ def test_the_legacy_key_lists_banks_over_mcp(hindsight):
     status, messages = mcp(port, LEGACY, call)
     assert status == 200, messages
     assert BANK in json.dumps(messages)
+
+
+def test_a_bank_config_cannot_switch_on_upstream_audit_logging(hindsight):
+    # A bank row stored under stock Hindsight, or restored verbatim by transfer/import or clone
+    # (engine/transfer/importer.py:1063-1069), can carry audit_log_enabled. Upstream reads it
+    # before authenticating (api/http.py:4984-4995, engine/memory_engine.py:3149-3170).
+    port, name, bank = hindsight["port"], hindsight["name"], "ci-audit"
+    # Inserted as a restore would, so no cached copy of the row hides the stored config.
+    query(
+        name,
+        "INSERT INTO public.banks (bank_id, name, mission, internal_id, config) VALUES"
+        f" ('{bank}', '{bank}', '', gen_random_uuid(), '{{\"audit_log_enabled\": true}}') RETURNING bank_id",
+    )
+    before = query(name, "SELECT count(*) AS n FROM public.audit_log")
+    recall = {"query": "Where does Alice work?"}
+    assert http(port, "POST", f"/v1/default/banks/{bank}/memories/recall", body=recall)[0] == 401
+    assert http(port, "POST", f"/v1/default/banks/{bank}/memories/recall", key=LEGACY, body=recall)[0] == 200
+    call = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "recall", "arguments": recall}}
+    assert mcp(port, None, call, f"/mcp/{bank}/")[0] == 401
+    call_tool(port, LEGACY, f"/mcp/{bank}/", "recall", **recall)
+    time.sleep(5)  # upstream writes audit rows in the background
+    assert query(name, "SELECT count(*) AS n FROM public.audit_log") == before
 
 
 def test_public_is_fully_migrated_at_startup(hindsight):

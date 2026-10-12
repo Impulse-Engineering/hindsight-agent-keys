@@ -35,6 +35,8 @@ Conductor has no MCP tool for switching a domain's `access_exempt`, removing a d
 # Operator machine
 capi=https://platform.apps.dev.aseva.ai/api/apps/hindsight   # Prod: https://platform.apps.aseva.ai/api/apps/hindsight
 cloudflared access curl "$capi/domains" -sS   # the app's extra hostnames and their ids; the primary is not listed
+closed() { [ "$(curl -sS -o /dev/null -w '%{http_code}' "https://$1/health")" = 302 ] && echo "bypass closed OK" ||
+  { echo "STOP: the bypass hostname still answers without Access"; return 1; }; }   # closed <bypass> (not verified)
 ```
 
 Commands marked **CT** run as root on the app's container: `ssh root@<node>`, then `pct enter <vmid>`. `podman exec` fails there (`setrlimit RLIMIT_NOFILE`), so the database tools run in a throwaway container that joins the app's network and borrows pg0's own PostgreSQL binaries from the volume. pg0's user, password and database are all `hindsight` (upstream's defaults in `hindsight_api/pg0.py`), and the database is reachable only inside the app container's network namespace.
@@ -107,14 +109,16 @@ On the CT, `curl -sS http://127.0.0.1:$port/version` shows the new version, and 
 ## 3. Close the bypass hostname
 
 ```sh
-# Operator machine
-cloudflared access curl "$capi/domains/<id>" -sS -X PATCH -H 'Content-Type: application/json' --data '{"access_exempt": false}'
-curl -sS -o /dev/null -w '%{http_code}\n' https://<bypass>/health   # 302 (to Cloudflare Access), within seconds
+# Operator machine. Go no further until this prints "bypass closed OK" (not verified)
+cloudflared access curl "$capi/domains/<id>" -sS -f -X PATCH -H 'Content-Type: application/json' --data '{"access_exempt": false}' &&
+  closed <bypass>   # (not verified)
 ```
+
+The change takes a few seconds to reach Cloudflare. If `closed` prints STOP right after a PATCH that succeeded, wait and run `closed <bypass>` again; go on only once it prints `bypass closed OK` *(not verified)*.
 
 If the app has no bypass hostname yet, create it closed: `platform_request_domain domain_type=managed domain=hindsight-api.internal managed_domain_id=<zone> access_exempt=false`. Its certificate takes a few minutes. Until then, TLS handshakes fail.
 
-**Auth state:** from the 302 on, both hostnames are behind Access. Agents on the bypass hostname get 302 until step 8.
+**Auth state:** from `bypass closed OK` on, both hostnames are behind Access. Agents on the bypass hostname get 302 until step 8.
 
 **Prod:** the bypass hostname is already exempt (#697 comment, item 6), so this closes it, and Prod's agents are down from here to step 8.
 
@@ -156,21 +160,7 @@ Each change restarts the app, so keep this order. Until 4.5, stock Hindsight res
    - `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` and `HINDSIGHT_API_TENANT_ACCESS_AUD`: the `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` values in the app's `platform://apps/<app>/claude-md`. If either reads `N/A`, the app's primary hostname has no Access application to validate against; fix that first. Not secret, so `platform_set_secret` is fine *(not verified)*.
    - `HINDSIGHT_API_TENANT_ACCESS_HOST`: the app's primary hostname, from the table above. `platform_set_secret` *(not verified)*.
    - `AGENT_KEYS_ADMIN_EMAILS`: the first admins, comma-separated. `platform_set_secret` *(not verified)*.
-4. Delete any other secret the startup guard refuses (README, "Startup guard"), for example `HINDSIGHT_API_MCP_AUTH_TOKEN`, with `cloudflared access curl "$capi/secrets/<KEY>" -sS -X DELETE` (platform admin) *(not verified)*. Otherwise the deploy exits 78 and its log names the variable. **Prod:** `platform_get_secret_keys` *(not verified)* lists the app's secrets; #697 found only the tenant ones.
-
-   Then remove what the guard cannot see: a bank's stored config can set `audit_log_enabled`, and upstream obeys it whatever the environment says (`resolve_full_config` in `engine/memory_engine.py`). Stock Hindsight let any bank set it; the image stops that only from the deploy on. Run this while stock still runs, since `pg` needs the app's container *(not verified)*:
-
-   ```sh
-   # CT. Stop the cut-over unless this ends with "audit overrides OK" (not verified)
-   is_audit="lower(regexp_replace(k, '^HINDSIGHT_API_', '')) = 'audit_log_enabled'"   # a stored key as upstream's normalize_config_key reads it
-   pg psql -d hindsight -Atc "select bank_id, k, config->k from public.banks, jsonb_object_keys(config) k where $is_audit" &&   # bank_id|key|value it removes
-     pg psql -d hindsight -Atc "update public.banks set config = config - array(select k from jsonb_object_keys(config) k where $is_audit)
-       where exists (select from jsonb_object_keys(config) k where $is_audit)" &&
-     [ "$(pg psql -d hindsight -Atc "select count(*) from public.banks, jsonb_object_keys(config) k where $is_audit")" = 0 ] &&
-     echo "audit overrides OK" || { echo "STOP: a bank in public still overrides audit logging"; false; }
-   ```
-
-   Record the rows it printed on the cut-over ticket. `public` is the only schema with banks until the image runs.
+4. Delete any other secret the startup guard refuses (README, "Startup guard"), for example `HINDSIGHT_API_MCP_AUTH_TOKEN`, with `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)*. Otherwise the deploy exits 78 and its log names the variable. **Prod:** `platform_get_secret_keys` *(not verified)* lists the app's secrets; #697 found only the tenant ones.
 5. Last, if the app has a `HINDSIGHT_API_TENANT_EXTENSION` secret, set it to `hindsight_agent_keys.extension:AgentKeysTenantExtension` *(not verified on Dev, which had none; the stop was checked locally on stock 0.10.3)*. Do not delete it: deleting it restarts stock Hindsight with no tenant extension, which admits every request into `public`. Stock Hindsight cannot import our class, so it stops (`ExtensionLoadError`) and stays down until step 5. A secret overrides the image's own value, and the guard accepts only ours. Go straight on to step 5.
 
 The six conditions that keep the Public Team safe in `public` are in [operating.md](operating.md#the-public-team-stays-in-public).
@@ -197,9 +187,7 @@ pg psql -d hindsight -Atc 'select * from agent_keys.events order by 1 desc limit
 
 The check runs on the CT because both hostnames are behind Access now. **Prod:** the `banks` diff must be empty: #712 requires the two banks unchanged.
 
-Then run the step 4.4 audit block again; it must end in `audit overrides OK` *(not verified)*. Stock ran after that block, so a bank could have stored `audit_log_enabled` in between; the image refuses the setting from now on, so this check holds.
-
-Then delete the secrets the image no longer reads: `cloudflared access curl "$capi/secrets/<KEY>" -sS -X DELETE` (platform admin) *(not verified)* for `HINDSIGHT_API_TENANT_API_KEY`, `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_API_TENANT_EXTENSION`. Each deletion restarts the app.
+Then delete the secrets the image no longer reads: `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)* for `HINDSIGHT_API_TENANT_API_KEY`, `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_API_TENANT_EXTENSION`. Each deletion restarts the app.
 
 **Auth state:** down during each restart. After it, this image again; once the `HINDSIGHT_API_TENANT_EXTENSION` secret is gone, the image's own value applies, which is ours. After the last deletion, run the keyless check again:
 
@@ -212,7 +200,7 @@ keyless http://127.0.0.1:$port/v1/default/banks   # keyless 401 OK, from the con
 
 ```sh
 # Operator machine
-cloudflared access curl "$capi/domains/<id>" -sS -X DELETE
+cloudflared access curl "$capi/domains/<id>" -sS -f -X DELETE   # (not verified)
 ```
 
 Port 9999 stays in `image_ports`: Conductor keeps a deployed port there for good (`imagePortsAppendOnlyError`, aseva-foundation-hosting `conductor/docs/LXC-CONTAINER-PIPELINE.md`, "`image_ports` is append-only after provisioning"). Nothing listens on it.
@@ -254,7 +242,7 @@ Post on the cut-over ticket the expiry that step 6 read back, and when it takes 
 
 *(Not verified: rollback has not been run on Dev. Its commands are those of steps 2 to 4.)*
 
-1. Close the bypass hostname (step 3) and wait for the 302. **Auth state:** from then on, only callers signed in through Access reach the app.
+1. Close the bypass hostname as in step 3. Do nothing below until `closed <bypass>` prints `bypass closed OK` *(not verified)*. **Auth state:** from then on, only callers signed in through Access reach the app.
 2. Restore the environment from the values saved in step 4, re-creating any secret step 6 deleted. Set `HINDSIGHT_API_TENANT_API_KEY` and `HINDSIGHT_CP_DATAPLANE_API_KEY` from a file, as in 4.1, then `HINDSIGHT_API_TENANT_EXTENSION` to its old value (on Prod, stock's ApiKey extension). Leave the legacy key, its expiry, the pepper, the `ACCESS` settings and `AGENT_KEYS_ADMIN_EMAILS` in place: stock Hindsight ignores them, and keeping the pepper keeps every Agent Key valid if the image comes back. If the app had no `HINDSIGHT_API_TENANT_EXTENSION` before (Dev before #703), there is nothing to restore: stock Hindsight will run with no authentication. **Auth state:** this image ignores the first two. On Prod, the guard refuses the old extension, so the image stops and stays down instead of serving without ours. Where there was no extension to restore (Dev), this image keeps running with ours, behind Access.
 3. `platform_update_app` to the stock digest from step 2, then `platform_approve_image`, then wait for the deploy as in step 2.4: the job `completed` and `Applied image ref recorded:` naming the stock digest. Until then a check in step 4 would test the wrong state: on Prod nothing answers (step 2 stopped this image), and on Dev this image still answers. Conductor refuses a rollback across repositories, so this is a new approval, not `platform_rollback_deploy`. Stock Hindsight starts against a database this image used, because the extension's `agent_keys` schema sits outside upstream's migrations; CI checks this with a personal and a Team schema present. **Auth state:** until the deploy completes, on Prod the app is down, and on Dev this image with our extension answers until stock takes over, behind Access. After it, stock's extension: the shared key reaches `public`, and Agent Keys get 401. Stock lists only `public`, so personal and Team schemas are neither reachable nor processed by the worker; their data stays.
 4. On the CT, `podman ps --filter "name=^app-$app\$" --format '{{.Image}}'` shows `localhost/app-<app>:<first 40 hex of the stock digest>` and `/version` shows the stock version. Reopen the bypass hostname only if `keyless http://127.0.0.1:$port/v1/default/banks` (setup block) then prints `keyless 401 OK` from the stock extension. Otherwise leave it closed: the app is then reachable only through Access, as it was before the cut-over. Re-create the UI hostname only if the UI comes back: `platform_request_domain container_port_label=ui`.

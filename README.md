@@ -16,12 +16,12 @@ Upstream serves these routes without a key, and they carry no memory data: `/hea
 
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
   - It lists `public` first, then every personal and Team schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
-  - Banks cannot switch on upstream audit logging from now on. A bank that stored the setting under stock Hindsight keeps it, so the cut-over removes it (docs/cutover.md, step 4.4).
+  - Banks cannot switch on upstream audit logging from now on. A bank that stored the setting under stock Hindsight, or brought it in through a bank import or clone, keeps it, but it has no effect: see "Safe defaults".
   - It writes its own event log (see "The event log"): refused keys, and every key, Key Allowlist and Team change. A refusal row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one refusal row a minute, whatever the refusal. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process. The other rows also name the people (`email`, `actor`) and the Team (`team`) they concern, and are not throttled.
 - **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist", "Teams" and "Stale personal schemas").
 - **Team tools for agents** `hindsight_agent_keys.tools:AgentKeysMcpExtension`, on both MCP endpoints (see "Teams over MCP").
 - **A startup guard**, described in its own section below.
-- **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension.
+- **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension. Audit logging stays off for every bank because the audit action allowlist, `HINDSIGHT_API_AUDIT_LOG_ACTIONS`, is `(none)`, which names no action. Upstream checks that deployment-wide list before a bank's stored `audit_log_enabled`, and no bank can change it.
 
 ## Startup guard
 
@@ -37,6 +37,7 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 | `HINDSIGHT_API_DATABASE_SCHEMA` is anything but `public` | The worker would skip the Public Team's background tasks. |
 | `HINDSIGHT_ENABLE_CP` is not `false` | The bundled UI sends one shared key for every visitor. |
 | `HINDSIGHT_API_AUDIT_LOG_ENABLED` is `true` | Unauthenticated requests would write into the Public Team's audit log. |
+| `HINDSIGHT_API_AUDIT_LOG_ACTIONS` is not `(none)` (parsed as upstream parses it: split on commas, spaces trimmed, empty entries dropped) | Any other list, including the empty one that means every action, lets a bank's stored `audit_log_enabled` write unauthenticated requests into the Public Team's audit log. |
 | `HINDSIGHT_API_MCP_STATELESS` is not `true` (read exactly as upstream reads it) | A stateful MCP session can keep a revoked key's identity. |
 
 ## Configuration
@@ -219,7 +220,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | One person's Agent Key gets 401 | The key was revoked, it expired (90 days after its creation or last renewal), or its owner has not opened the key page for 30 days. The owner sees each key's state on the key page; opening the page revives keys held back by the 30-day rule. |
 | A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
 | An agent added someone to a Team but they still have no access | Adding over MCP only files a request. An owner or admin must press **Confirm** under the Team on `/ext/teams`. |
-| Upstream's `public.audit_log` gains rows | A bank in `public` still stores an `audit_log_enabled` override from before the cut-over. Remove it with the command in docs/cutover.md, step 4.4; upstream caches bank config for up to 30 seconds. |
+| Upstream's `public.audit_log` gains rows | The app runs an image older than the `HINDSIGHT_API_AUDIT_LOG_ACTIONS=(none)` default, or not this image: the guard refuses any other value. Check the digest the app runs. |
 | The Team tools are missing from an MCP endpoint | The bank's `mcp_enabled_tools` config does not list them. |
 | The event log stays empty | The extension's database connection failed at startup. Look for `agent-keys` warnings in the logs, then restart the container. Refusals are still enforced. |
 

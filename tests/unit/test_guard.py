@@ -10,6 +10,7 @@ SAFE = {
     "HINDSIGHT_API_MCP_EXTENSION": "hindsight_agent_keys.tools:AgentKeysMcpExtension",
     "HINDSIGHT_ENABLE_CP": "false",
     "HINDSIGHT_API_MCP_STATELESS": "true",
+    "HINDSIGHT_API_AUDIT_LOG_ACTIONS": "(none)",
 }
 
 
@@ -100,9 +101,24 @@ def test_refuses_stateful_mcp(value):
     assert "HINDSIGHT_API_MCP_STATELESS" in found[0]
 
 
+# Upstream reads the allowlist as [a.strip() for a in value.split(",") if a.strip()] and audits
+# every action when it is empty (config.py:5265-5267, engine/audit.py:144 and 159-161), and every
+# audit path checks it before a bank's stored audit_log_enabled (engine/audit.py:170 and 193,
+# api/http.py:4990, mcp_tools.py:916 and 967). Only "(none)" names no action.
+@pytest.mark.parametrize("value", [None, "", " , ", "retain", "(none),recall"])
+def test_refuses_an_audit_allowlist_that_could_name_an_action(value):
+    found = problems(env(HINDSIGHT_API_AUDIT_LOG_ACTIONS=value))
+    assert len(found) == 1
+    assert "HINDSIGHT_API_AUDIT_LOG_ACTIONS" in found[0]
+
+
+def test_accepts_the_audit_allowlist_as_upstream_parses_it():
+    assert problems(env(HINDSIGHT_API_AUDIT_LOG_ACTIONS=" (none) ,")) == []
+
+
 def test_reports_every_problem_at_once():
     found = problems({"HINDSIGHT_API_MCP_AUTH_TOKEN": "x"})
-    assert len(found) == 6
+    assert len(found) == 7
 
 
 def test_accepts_stateless_mcp_in_any_case():
