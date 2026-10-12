@@ -43,7 +43,7 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 
 | Variable | Meaning |
 | --- | --- |
-| `HINDSIGHT_API_TENANT_LEGACY_KEY` | The legacy key. Without it every key is refused. Supply it as a secret. |
+| `HINDSIGHT_API_TENANT_LEGACY_KEY` | The legacy key, which reaches the Public Team. Without it only Agent Keys work. Supply it as a secret. |
 | `HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES` | Optional ISO date or datetime (a bare date means midnight UTC). From then on the legacy key is refused. An unreadable value stops startup. |
 | `HINDSIGHT_API_TENANT_KEY_PEPPER` | The server-side secret Agent Keys are hashed with, at least 32 bytes; a shorter value stops startup. Without it no key can be created and every Agent Key is refused; the legacy key still works. Changing it invalidates every Agent Key. Supply it as a secret. |
 | `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` | The Cloudflare Access team URL, such as `https://<team>.cloudflareaccess.com` (Conductor's `CF_ACCESS_TEAM_DOMAIN`). It is the JWT issuer and serves the signing keys. |
@@ -190,14 +190,16 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 
 ## Moving a Conductor app onto the image
 
-[docs/cutover.md](docs/cutover.md) is the runbook: back up pg0, upgrade to the stock release this image is built on, then swap the image while the bypass hostname is behind Access.
+[docs/cutover.md](docs/cutover.md) is the runbook: back up pg0, upgrade to the stock release this image is built on, then swap the image while the bypass hostname is behind Access. It also covers the rollback.
+
+[docs/operating.md](docs/operating.md) covers running it afterwards: the Key Allowlist, Agent Keys, Teams, revoking an identity, upstream upgrades and troubleshooting.
 
 ## Troubleshooting
 
 | Symptom | Cause |
 | --- | --- |
 | The container exits with status 78 | The startup guard refused the configuration. Its stderr names each variable to fix. |
-| Every request gets 401 | `HINDSIGHT_API_TENANT_LEGACY_KEY` is unset or different, or the legacy key has passed its expiry. |
+| The legacy key gets 401 | `HINDSIGHT_API_TENANT_LEGACY_KEY` is unset or different, or the legacy key has passed its expiry (`legacy_key_expired` in the event log). |
 | Background tasks in `public` never complete | `public` is missing from the tenant list. Check the startup logs for migration of `public`. |
 | The key page answers 404 | The request's hostname is not `HINDSIGHT_API_TENANT_ACCESS_HOST`, or one of the three `ACCESS` settings is unset. |
 | The key page answers 403 "Sign in through Cloudflare Access" | The Access JWT failed validation. Look for `agent-keys: refused an Access token` in the logs; a wrong or changed AUD tag is the usual cause. |
