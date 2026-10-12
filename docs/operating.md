@@ -6,8 +6,8 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 
 | | Dev | Prod |
 | --- | --- | --- |
-| Key pages (behind Access) | `https://hindsight.internal.dev.aseva.ai/ext/` | `https://hindsight.internal.aseva.ai/ext/` |
-| Agents: API and MCP (bypass hostname) | `https://hindsight-api.internal.dev.aseva.ai` | `https://hindsight-api.internal.aseva.ai` |
+| Key pages (behind Access) | `https://<primary>/ext/` | `https://<primary>/ext/` |
+| Agents: API and MCP (bypass hostname) | `https://<bypass>` | `https://<bypass>` |
 
 ## Who does what
 
