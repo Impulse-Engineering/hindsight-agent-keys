@@ -2,22 +2,23 @@
 
 A container image of [Hindsight](https://github.com/vectorize-io/hindsight) (by Vectorize) with a tenant extension that gives each caller only the memory its key allows.
 
-It knows two kinds of key:
+It knows three kinds of key:
 
 - The **legacy key**, the deployment's existing shared key. It reaches the **Public Team**, whose banks live in the Postgres `public` schema.
 - **Personal Agent Keys**, which people create for themselves on the key page (below). Each reaches only its owner's own schema.
+- **Team keys**, which members create on the Teams page (below). Each reaches only its Team's schema, and only while its holder is in the Team. A Public Team key reaches `public`.
 
-Every other key, and a request with no key, gets 401 on the API and on MCP. There is one exception. Upstream answers an MCP `GET` with no session ID before authentication runs: it is the handshake probe some clients send, and it returns `200 {}` with no data. Teams are built on top of this.
+Every other key, and a request with no key, gets 401 on the API and on MCP. There is one exception. Upstream answers an MCP `GET` with no session ID before authentication runs: it is the handshake probe some clients send, and it returns `200 {}` with no data.
 
 Upstream serves these routes without a key, and they carry no memory data: `/health`, `/health/ready`, `/health/live`, `/version`, `/metrics`, `/v1/bank-template-schema`, `/docs`, `/redoc` and `/openapi.json`. Upstream also mounts our key pages under `/ext` without authentication; the extension gates them itself.
 
 ## What the image adds to upstream
 
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
-  - It lists `public` first, then every personal schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
+  - It lists `public` first, then every personal and Team schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
   - Banks cannot switch on upstream audit logging.
   - Refused keys go to its own event log. Each row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one row a minute, whatever the event. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process.
-- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys" and "The Key Allowlist").
+- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist" and "Teams").
 - **A startup guard**, described in its own section below.
 - **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension.
 
@@ -62,12 +63,12 @@ A person on the Key Allowlist opens `https://<access host>/ext/`, names a key an
 - **The key** has a 64-bit ID and a 256-bit secret. It is shown once. The database stores only HMAC-SHA256 of the whole key under the pepper, and a presented key is compared in constant time.
 - **Limits:** each person can create 5 keys an hour and hold 10 active (neither revoked nor expired) keys. Both are counted in the database.
 - **Schema:** a person's first key creates their schema, `p_` plus 16 random hex digits, never derived from their email, and migrates it before the key is shown. Every later key of theirs reaches the same schema.
-- **Life:** a key works for 90 days from its creation or its last renewal. The page lists the person's own keys with their state; the owner can renew an unexpired key for 90 days from then, and revoke a key. A revoked or expired key cannot be renewed.
+- **Life:** every Agent Key, personal or Team, works for 90 days from its creation or its last renewal. The page lists the keys the person holds with their state; the owner can renew an unexpired key for 90 days from then, and revoke a key. A revoked or expired key cannot be renewed.
 - **Sign-in:** a key also works only while its owner has signed in through Access within the last 30 days, so offboarding someone in the identity provider stops their keys without touching Hindsight. Every key page request is a sign-in, dated by when Access issued the token (its `iat`), not by when the page was loaded. Signing in again revives the keys.
 - **Revoke identity:** an admin enters a person's email on `/ext/admin` to revoke every key that person holds. They can still create new keys while they are on the Key Allowlist; remove them from it as well to stop that.
 - **When changes take effect:** there is no auth cache. Every request looks its key up, so a revocation, an expiry or a lapsed sign-in refuses the key's next request, including inside an MCP session that is already open (MCP is stateless).
 
-Tables in `agent_keys`: `people` (email, schema), `keys` (ID, HMAC, name, owner's email, schema, and creation, expiry and revocation times), `sign_ins` (email, last Access sign-in) and `allowlist` (email, role).
+Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, and creation, expiry and revocation times), `sign_ins` (email, last Access sign-in), `allowlist` (email, role), `teams` (schema, name) and `members` (Team schema, email, role `owner` or `member`).
 
 ## The Key Allowlist
 
@@ -78,17 +79,27 @@ Only people on the Key Allowlist can create Agent Keys. The bootstrap admins in 
 - **Removing someone** stops them creating keys and disables the keys they hold: every request with a key checks its owner is still on the list. Their keys are not deleted, so adding them back makes the keys work again.
 - **Logging:** every change is an event (see "The event log").
 
+## Teams
+
+A Team is a named set of people who share one schema. A person on the Key Allowlist opens `https://<access host>/ext/teams`, the Teams page, which follows the same hostname, sign-in and state-change rules as the key page.
+
+- **Creating:** the creator becomes the Team's first owner. The Team gets its own schema, `t_` plus 16 random hex digits, migrated before the Team is shown; the worker processes it like any other. Names are unique whatever their case, and `public` is reserved for the Public Team.
+- **Members:** owners add people by email, as a member or an owner, including people who have not signed in yet; they change roles and remove people. A change that would leave a Team without an owner is refused. Admins manage every Team and see every Team on the page, whether or not they are in it.
+- **Team keys:** a member on the Key Allowlist creates a Team key the same way as a personal key, with the same limits, which count personal and Team keys together. Membership is checked on every request, so removing a member stops their Team keys on their next request.
+- **Public Team:** everyone on the Key Allowlist can create a Public Team key, which reaches the banks in `public`. The Public Team has no owners or members.
+
 ## The event log
 
 Events go to `agent_keys.events` in Hindsight's own database. That schema sits outside upstream's migration history, so stock Hindsight still starts against the same database.
 
 | Column | Meaning |
 | --- | --- |
-| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, `key_renewed`, `key_revoked`, `identity_revoked`, or a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed` |
-| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (also `identity_revoked` and every Key Allowlist change), or the `<id>` part of a presented, created, renewed or revoked `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
+| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, `key_renewed`, `key_revoked`, `identity_revoked`, a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed`, or a Team change: `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), `member_removed` |
+| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (also `identity_revoked` and every Key Allowlist and Team change), or the `<id>` part of a presented, created, renewed or revoked `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
 | `client_ip` | The `X-Real-IP` address in canonical form (an IPv4-mapped IPv6 address is stored as IPv4), or `NULL` if the header is missing or not an IP address |
-| `email` | For `key_created`, `key_renewed` and `key_revoked`, the key's owner; for `identity_revoked`, the person whose keys were revoked; for a Key Allowlist change, the person it concerns; otherwise `NULL` |
-| `actor` | For `identity_revoked`, the admin who revoked it; for a Key Allowlist change, who made it: the admin, or for `access_requested` the person asking; otherwise `NULL` |
+| `email` | For `key_created`, `key_renewed` and `key_revoked`, the key's owner; for `identity_revoked`, the person whose keys were revoked; for a Key Allowlist or Team change, the person it concerns (for `team_created`, the creator); otherwise `NULL` |
+| `actor` | For `identity_revoked`, the admin who revoked it; for a Key Allowlist or Team change, who made it: the admin or owner, or for `access_requested` the person asking; otherwise `NULL` |
+| `team` | For a Team change and for a Team key's `key_created`, the Team's schema (`public` for the Public Team); otherwise `NULL` |
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
 
@@ -155,6 +166,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | A person's Agent Keys all get 401 at once | They were removed from the Key Allowlist (`allowlist_removed` in the event log). Adding them back restores the keys. |
 | Every Agent Key gets 401 | The pepper was changed or removed. Agent Keys must be created again. |
 | One person's Agent Key gets 401 | The key was revoked, it expired (90 days after its creation or last renewal), or its owner has not opened the key page for 30 days. The owner sees each key's state on the key page; opening the page revives keys held back by the 30-day rule. |
+| A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
 | The event log stays empty | The extension's database connection failed at startup. Look for `agent-keys` warnings in the logs, then restart the container. Refusals are still enforced. |
 
 ## License
