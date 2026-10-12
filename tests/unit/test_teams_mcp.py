@@ -1,5 +1,6 @@
 """Agents manage Teams over MCP, but adding someone waits for an owner on the Teams page."""
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -24,8 +25,10 @@ def allowlist(monkeypatch):
 
 
 def server():
-    events = RecordedEvents()
-    ext = AgentKeysTenantExtension({"key_pepper": PEPPER, "legacy_key": LEGACY}, store=MemoryStore(), events=events)
+    store, events = MemoryStore(), RecordedEvents()
+    # Everyone has just signed in through Access; test_key_lifecycle covers sign-ins.
+    store.sign_ins.update(dict.fromkeys((ALICE, BOB, CAROL), datetime.now(UTC)))
+    ext = AgentKeysTenantExtension({"key_pepper": PEPPER, "legacy_key": LEGACY}, store=store, events=events)
     ext.set_context(Migrations())
     mcp = FastMCP("test")
     # Registered as upstream registers an MCP extension's tools (api/mcp.py:201-204).

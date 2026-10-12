@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 
 import asyncpg
 
@@ -55,9 +56,15 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.keys (
     schema text NOT NULL CHECK (schema <> ''),
     -- A Team key (Public Team included) works only while its holder is in the Team.
     kind text NOT NULL CHECK (kind IN ('personal', 'team')),
-    created_at timestamptz NOT NULL DEFAULT now()
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    revoked_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS keys_email_idx ON {SCHEMA}.keys (email);
+CREATE TABLE IF NOT EXISTS {SCHEMA}.sign_ins (
+    email text PRIMARY KEY,
+    last_seen timestamptz NOT NULL
+);
 CREATE TABLE IF NOT EXISTS {SCHEMA}.allowlist (
     email text PRIMARY KEY,
     role text NOT NULL CHECK (role IN ('requested', 'member', 'admin'))
@@ -122,15 +129,17 @@ class PostgresKeyStore:
             schema,
         )
 
-    async def add_key(self, key_id: str, digest: bytes, name: str, email: str, schema: str, kind: str) -> None:
+    async def add_key(
+        self, key_id: str, digest: bytes, name: str, email: str, schema: str, kind: str, expires_at: datetime
+    ) -> None:
         """Store a key, or raise Refused(429) if its owner is at a limit."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
             # Locking the person makes concurrent creations count each other.
             await conn.execute(f"SELECT 1 FROM {SCHEMA}.people WHERE email = $1 FOR UPDATE", email)
             active, recent = await conn.fetchrow(
-                f"SELECT count(*), count(*) FILTER (WHERE created_at > now() - interval '1 hour')"
-                f" FROM {SCHEMA}.keys WHERE email = $1",
+                "SELECT count(*) FILTER (WHERE revoked_at IS NULL AND expires_at > now()),"
+                f" count(*) FILTER (WHERE created_at > now() - interval '1 hour') FROM {SCHEMA}.keys WHERE email = $1",
                 email,
             )
             if active >= ACTIVE_KEYS:
@@ -138,13 +147,15 @@ class PostgresKeyStore:
             if recent >= CREATIONS_PER_HOUR:
                 raise Refused(429, f"You can create at most {CREATIONS_PER_HOUR} keys an hour.")
             await conn.execute(
-                f"INSERT INTO {SCHEMA}.keys (id, digest, name, email, schema, kind) VALUES ($1, $2, $3, $4, $5, $6)",
+                f"INSERT INTO {SCHEMA}.keys (id, digest, name, email, schema, kind, expires_at)"
+                " VALUES ($1, $2, $3, $4, $5, $6, $7)",
                 key_id,
                 digest,
                 name,
                 email,
                 schema,
                 kind,
+                expires_at,
             )
 
     async def role(self, email: str) -> str | None:
@@ -184,11 +195,13 @@ class PostgresKeyStore:
         return old
 
     async def find_key(self, key_id: str) -> asyncpg.Record | None:
-        """The key's digest, email, schema and kind, and its owner's role on the Key Allowlist."""
+        """The key's digest, email, schema, kind, expiry and revocation, its owner's role on
+        the Key Allowlist and its owner's last sign-in, in one indexed lookup."""
         pool = await self._get_pool()
         return await pool.fetchrow(
-            f"SELECT k.digest, k.email, k.schema, k.kind, a.role FROM {SCHEMA}.keys k"
-            f" LEFT JOIN {SCHEMA}.allowlist a ON a.email = k.email WHERE k.id = $1",
+            f"SELECT k.digest, k.email, k.schema, k.kind, k.expires_at, k.revoked_at, a.role, s.last_seen"
+            f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.allowlist a ON a.email = k.email"
+            f" LEFT JOIN {SCHEMA}.sign_ins s ON s.email = k.email WHERE k.id = $1",
             key_id,
         )
 
@@ -299,3 +312,47 @@ class PostgresKeyStore:
             if not await conn.fetchval(f"SELECT count(*) FROM {SCHEMA}.members WHERE team = $1 AND role = 'owner'", team):
                 raise Refused(409, "A Team must keep at least one owner.")
         return value
+
+    async def signed_in(self, email: str, at: datetime) -> None:
+        """Record a sign-in through Access; an older one never replaces a newer one."""
+        pool = await self._get_pool()
+        await pool.execute(
+            f"INSERT INTO {SCHEMA}.sign_ins (email, last_seen) VALUES ($1, $2) ON CONFLICT (email)"
+            f" DO UPDATE SET last_seen = greatest({SCHEMA}.sign_ins.last_seen, EXCLUDED.last_seen)",
+            email,
+            at,
+        )
+
+    async def list_keys(self, email: str) -> list[dict]:
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            f"SELECT id, name, created_at, expires_at, revoked_at FROM {SCHEMA}.keys"
+            " WHERE email = $1 ORDER BY created_at, id",
+            email,
+        )
+        return [dict(r) for r in rows]
+
+    async def renew_key(self, email: str, key_id: str, now: datetime, expires_at: datetime) -> bool:
+        """Move the expiry of the person's key unless it is revoked or already expired."""
+        pool = await self._get_pool()
+        renewed = await pool.fetchval(
+            f"UPDATE {SCHEMA}.keys SET expires_at = $4"
+            " WHERE id = $1 AND email = $2 AND revoked_at IS NULL AND expires_at > $3 RETURNING id",
+            key_id,
+            email,
+            now,
+            expires_at,
+        )
+        return renewed is not None
+
+    async def revoke_keys(self, email: str, now: datetime, key_id: str | None = None) -> int:
+        """Revoke one of the person's keys, or with no key ID all of them; returns how many."""
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            f"UPDATE {SCHEMA}.keys SET revoked_at = $2"
+            " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) RETURNING id",
+            email,
+            now,
+            key_id,
+        )
+        return len(rows)

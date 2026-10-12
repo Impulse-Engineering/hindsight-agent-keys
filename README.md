@@ -63,17 +63,21 @@ A person on the Key Allowlist opens `https://<access host>/ext/`, names a key an
 - **Where:** only on `HINDSIGHT_API_TENANT_ACCESS_HOST`. Any other `Host`, including the bypass hostname, gets 404.
 - **State changes** (anything but `GET`) also need `Content-Type: application/json`, the header `X-Agent-Keys: 1`, and `Origin: https://<access host>`; otherwise 403.
 - **The key** has a 64-bit ID and a 256-bit secret. It is shown once. The database stores only HMAC-SHA256 of the whole key under the pepper, and a presented key is compared in constant time.
-- **Limits:** each person can create 5 keys an hour and hold 10. Both are counted in the database.
+- **Limits:** each person can create 5 keys an hour and hold 10 active (neither revoked nor expired) keys. Both are counted in the database.
 - **Schema:** a person's first key creates their schema, `p_` plus 16 random hex digits, never derived from their email, and migrates it before the key is shown. Every later key of theirs reaches the same schema.
+- **Life:** every Agent Key, personal or Team, works for 90 days from its creation or its last renewal. The page lists the keys the person holds with their state; the owner can renew an unexpired key for 90 days from then, and revoke a key. A revoked or expired key cannot be renewed.
+- **Sign-in:** a key also works only while its owner has signed in through Access within the last 30 days, so offboarding someone in the identity provider stops their keys without touching Hindsight. Every key page request is a sign-in, dated by when Access issued the token (its `iat`), not by when the page was loaded. Signing in again revives the keys.
+- **Revoke identity:** an admin enters a person's email on `/ext/admin` to revoke every key that person holds. They can still create new keys while they are on the Key Allowlist; remove them from it as well to stop that.
+- **When changes take effect:** there is no auth cache. Every request looks its key up, so a revocation, an expiry or a lapsed sign-in refuses the key's next request, including inside an MCP session that is already open (MCP is stateless).
 
-Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, creation time), `allowlist` (email, role), `teams` (schema, name, creator's email), `members` (Team schema, email, role `owner` or `member`) and `member_requests` (Team schema, email, role asked for, who asked).
+Tables in `agent_keys`: `people` (email, schema, empty until the person's first personal key), `keys` (ID, HMAC, name, owner's email, schema, kind `personal` or `team`, and creation, expiry and revocation times), `sign_ins` (email, last Access sign-in), `allowlist` (email, role), `teams` (schema, name, creator's email), `members` (Team schema, email, role `owner` or `member`) and `member_requests` (Team schema, email, role asked for, who asked).
 
 ## The Key Allowlist
 
 Only people on the Key Allowlist can create Agent Keys. The bootstrap admins in `AGENT_KEYS_ADMIN_EMAILS` are always on it; everyone else has a row in `agent_keys.allowlist` with the role `member`, `admin`, or `requested` (asked to join, not yet on the list).
 
 - **Asking to join:** a signed-in person who is not on the list sees a button on `/ext/` that files a request. Asking again changes nothing.
-- **Admins** (bootstrap admins and anyone granted admin rights) manage the list at `https://<access host>/ext/admin`: add people by email, approve or decline requests, grant and remove admin rights, and remove people. Everyone else gets 403 on every `/ext/admin` route. The bootstrap admins cannot be changed there (409); edit the secret instead.
+- **Admins** (bootstrap admins and anyone granted admin rights) manage the list at `https://<access host>/ext/admin`: add people by email, approve or decline requests, grant and remove admin rights, and remove people. The same page revokes an identity (see "Personal Agent Keys"). Everyone else gets 403 on every `/ext/admin` route. The bootstrap admins cannot be changed there (409); edit the secret instead.
 - **Removing someone** stops them creating keys and disables the keys they hold: every request with a key checks its owner is still on the list. Their keys are not deleted, so adding them back makes the keys work again.
 - **Logging:** every change is an event (see "The event log").
 
@@ -106,11 +110,11 @@ Events go to `agent_keys.events` in Hindsight's own database. That schema sits o
 
 | Column | Meaning |
 | --- | --- |
-| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed`, or a Team change: `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), `owner_requested` or `member_requested` (an agent asked over MCP to make the person an owner or a member; nothing changed yet), `owner_confirmed` or `member_confirmed` (an owner or admin confirmed that request, so the person now has that role), `owner_declined` or `member_declined` (an owner or admin dropped that request), `member_removed` |
-| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (also every Key Allowlist and Team change), or the `<id>` part of a presented or created `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
+| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, `key_renewed`, `key_revoked`, `identity_revoked`, a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed`, or a Team change: `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), `owner_requested` or `member_requested` (an agent asked over MCP to make the person an owner or a member; nothing changed yet), `owner_confirmed` or `member_confirmed` (an owner or admin confirmed that request, so the person now has that role), `owner_declined` or `member_declined` (an owner or admin dropped that request), `member_removed` |
+| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (also `identity_revoked` and every Key Allowlist and Team change), or the `<id>` part of a presented, created, renewed or revoked `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
 | `client_ip` | The `X-Real-IP` address in canonical form (an IPv4-mapped IPv6 address is stored as IPv4), or `NULL` if the header is missing or not an IP address |
-| `email` | For `key_created`, the person who created the key; for a Key Allowlist or Team change, the person it concerns (for `team_created`, the creator); otherwise `NULL` |
-| `actor` | For a Key Allowlist or Team change, who made it: the admin or owner (for `*_requested`, the person whose personal key the agent used), or for `access_requested` the person asking; otherwise `NULL` |
+| `email` | For `key_created`, `key_renewed` and `key_revoked`, the key's owner; for `identity_revoked`, the person whose keys were revoked; for a Key Allowlist or Team change, the person it concerns (for `team_created`, the creator); otherwise `NULL` |
+| `actor` | For `identity_revoked`, the admin who revoked it; for a Key Allowlist or Team change, who made it: the admin or owner (for `*_requested`, the person whose personal key the agent used), or for `access_requested` the person asking; otherwise `NULL` |
 | `team` | For a Team change and for a Team key's `key_created`, the Team's schema (`public` for the Public Team); otherwise `NULL` |
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
@@ -177,6 +181,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | Key creation answers 503 | `HINDSIGHT_API_TENANT_KEY_PEPPER` is unset. |
 | A person's Agent Keys all get 401 at once | They were removed from the Key Allowlist (`allowlist_removed` in the event log). Adding them back restores the keys. |
 | Every Agent Key gets 401 | The pepper was changed or removed. Agent Keys must be created again. |
+| One person's Agent Key gets 401 | The key was revoked, it expired (90 days after its creation or last renewal), or its owner has not opened the key page for 30 days. The owner sees each key's state on the key page; opening the page revives keys held back by the 30-day rule. |
 | A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
 | An agent added someone to a Team but they still have no access | Adding over MCP only files a request. An owner or admin must press **Confirm** under the Team on `/ext/teams`. |
 | The Team tools are missing from an MCP endpoint | The bank's `mcp_enabled_tools` config does not list them. |

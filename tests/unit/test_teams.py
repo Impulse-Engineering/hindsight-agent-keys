@@ -1,6 +1,7 @@
 """Teams share one schema between named people; their owners manage who is in them."""
 
 import re
+from datetime import UTC, datetime
 
 import pytest
 from conftest import MemoryStore, Migrations, RecordedEvents
@@ -25,6 +26,8 @@ def allowlist(monkeypatch):
 
 def extension():
     store, migrations, events = MemoryStore(), Migrations(), RecordedEvents()
+    # Everyone has just signed in through Access; test_key_lifecycle covers sign-ins.
+    store.sign_ins.update(dict.fromkeys((ALICE, BOB, CAROL, DAVE), datetime.now(UTC)))
     ext = AgentKeysTenantExtension({"key_pepper": PEPPER}, store=store, events=events)
     ext.set_context(migrations)
     return ext, store, migrations, events

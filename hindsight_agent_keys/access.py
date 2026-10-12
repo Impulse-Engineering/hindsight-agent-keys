@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 
 import jwt
 
@@ -25,8 +26,8 @@ class AccessVerifier:
             f"{self._issuer}/cdn-cgi/access/certs", timeout=5, cooldown_duration=refetch_cooldown
         )
 
-    async def email(self, token: str) -> str | None:
-        """The person's lowercase email, or None if the token is not valid."""
+    async def email(self, token: str) -> tuple[str, datetime] | None:
+        """The person's lowercase email and when Access issued the token, or None if it is not valid."""
         try:
             # PyJWKClient fetches with blocking urllib.
             key = await asyncio.to_thread(self._keys.get_signing_key_from_jwt, token)
@@ -45,4 +46,5 @@ class AccessVerifier:
         email = claims.get("email")
         if not isinstance(email, str) or not email:
             return None
-        return email.lower()
+        # iat is when the person signed in to Access; replaying a token cannot make it newer.
+        return email.lower(), datetime.fromtimestamp(claims["iat"], UTC)

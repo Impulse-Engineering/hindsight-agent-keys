@@ -1,5 +1,7 @@
 """Admins manage the Key Allowlist; people not on it can ask to join."""
 
+from datetime import UTC, datetime
+
 import pytest
 from conftest import MemoryStore, Migrations, RecordedEvents
 from hindsight_api.extensions.tenant import AuthenticationError
@@ -22,6 +24,8 @@ def admins(monkeypatch):
 
 def extension():
     store, events = MemoryStore(), RecordedEvents()
+    # Everyone has just signed in through Access; test_key_lifecycle covers sign-ins.
+    store.sign_ins.update(dict.fromkeys((ADMIN, CAROL, DAVE, ERIN), datetime.now(UTC)))
     ext = AgentKeysTenantExtension({"key_pepper": PEPPER}, store=store, events=events)
     ext.set_context(Migrations())
     return ext, events
