@@ -160,7 +160,7 @@ Each change restarts the app, so keep this order. Until 4.5, stock Hindsight res
    - `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` and `HINDSIGHT_API_TENANT_ACCESS_AUD`: the `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` values in the app's `platform://apps/<app>/claude-md`. If either reads `N/A`, the app's primary hostname has no Access application to validate against; fix that first. Not secret, so `platform_set_secret` is fine *(not verified)*.
    - `HINDSIGHT_API_TENANT_ACCESS_HOST`: the app's primary hostname, from the table above. `platform_set_secret` *(not verified)*.
    - `AGENT_KEYS_ADMIN_EMAILS`: the first admins, comma-separated. `platform_set_secret` *(not verified)*.
-4. Delete any other secret the startup guard refuses (README, "Startup guard"), for example `HINDSIGHT_API_MCP_AUTH_TOKEN`, with `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)*. Otherwise the deploy exits 78 and its log names the variable. **Prod:** `platform_get_secret_keys` *(not verified)* lists the app's secrets; #697 found only the tenant ones.
+4. Delete any other secret the startup guard refuses (README, "Startup guard"), for example `HINDSIGHT_API_MCP_AUTH_TOKEN`, with `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)*. Otherwise the deploy exits 78 and its log names the variable. `platform_get_secret_keys` *(not verified)* lists the app's secrets; delete only those listed, since `-f` fails on one that is not there. **Prod:** #697 found only the tenant ones.
 5. Last, if the app has a `HINDSIGHT_API_TENANT_EXTENSION` secret, set it to `hindsight_agent_keys.extension:AgentKeysTenantExtension` *(not verified on Dev, which had none; the stop was checked locally on stock 0.10.3)*. Do not delete it: deleting it restarts stock Hindsight with no tenant extension, which admits every request into `public`. Stock Hindsight cannot import our class, so it stops (`ExtensionLoadError`) and stays down until step 5. A secret overrides the image's own value, and the guard accepts only ours. Go straight on to step 5.
 
 The six conditions that keep the Public Team safe in `public` are in [operating.md](operating.md#the-public-team-stays-in-public).
@@ -187,7 +187,7 @@ pg psql -d hindsight -Atc 'select * from agent_keys.events order by 1 desc limit
 
 The check runs on the CT because both hostnames are behind Access now. **Prod:** the `banks` diff must be empty: #712 requires the two banks unchanged.
 
-Then delete the secrets the image no longer reads: `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)* for `HINDSIGHT_API_TENANT_API_KEY`, `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_API_TENANT_EXTENSION`. Each deletion restarts the app.
+Then delete the secrets the image no longer reads: `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)* for each of `HINDSIGHT_API_TENANT_API_KEY`, `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_API_TENANT_EXTENSION` that `platform_get_secret_keys` lists; `-f` fails on a secret that is not there (Dev has no `HINDSIGHT_API_TENANT_EXTENSION`). Each deletion restarts the app.
 
 **Auth state:** down during each restart. After it, this image again; once the `HINDSIGHT_API_TENANT_EXTENSION` secret is gone, the image's own value applies, which is ours. After the last deletion, run the keyless check again:
 
