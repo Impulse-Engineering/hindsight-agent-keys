@@ -16,7 +16,7 @@ Upstream serves these routes without a key, and they carry no memory data: `/hea
 
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
   - It lists `public` first, then every personal and Team schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
-  - Banks cannot switch on upstream audit logging.
+  - Banks cannot switch on upstream audit logging from now on. A bank that stored the setting under stock Hindsight keeps it, so the cut-over removes it (docs/cutover.md, step 4.4).
   - It writes its own event log (see "The event log"): refused keys, and every key, Key Allowlist and Team change. A refusal row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one refusal row a minute, whatever the refusal. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process. The other rows also name the people (`email`, `actor`) and the Team (`team`) they concern, and are not throttled.
 - **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist", "Teams" and "Stale personal schemas").
 - **Team tools for agents** `hindsight_agent_keys.tools:AgentKeysMcpExtension`, on both MCP endpoints (see "Teams over MCP").
@@ -124,9 +124,9 @@ read -r -p 'Schema ID to purge: ' schema && read -r -p 'Your email: ' operator &
 
 1. **Unlist** (one transaction). It stops, changing nothing, unless the schema is listed as stale at that moment and the email is set. It locks the owner's row as key creation does, so a key created meanwhile counts. Before and during it, no valid key reaches the schema; after it, every key that names the schema is revoked, the schema is off the tenant list so the worker stops processing it, and the owner's next personal key creates a new schema.
 2. **Wait** 60 seconds, so tasks the worker had already claimed there finish.
-3. **Drop** (one transaction): revokes again any key that names the schema (one created in the instant before step 1), drops the schema, and records a `schema_purged` event naming the owner, the operator and the schema.
+3. **Drop** (one transaction). It stops, changing nothing, if a row in `agent_keys.people` names the schema again. Otherwise it revokes again any key that names the schema (one created in the instant before step 1), drops the schema, and records a `schema_purged` event naming the owner, the operator and the schema.
 
-psql stops at the first error with a non-zero status. If the output ends at `Unlisted`, step 3 failed: no key reaches the schema and its data is intact. Put it back on the list with `pg psql -X -d hindsight -c "UPDATE agent_keys.people SET schema = '<ID>' WHERE email = '<owner>' AND schema IS NULL RETURNING email"` and run the script again; its keys stay revoked, so this reopens nothing. If that returns no row, the owner already has a new schema, and the old one stays unlisted and unreachable until it is dropped by hand.
+psql stops at the first error with a non-zero status. If the output ends at `Unlisted` followed by `no rows returned for \gset`, step 3 found the schema in use again and dropped nothing: it is back on the tenant list with its owner, so the worker processes it and their keys created since step 1 work, while the keys step 1 revoked stay revoked. Purge it only if `/ext/admin` lists it as stale again. If the output ends at `Unlisted` with any other error, step 3 failed: no key reaches the schema and its data is intact. Put it back on the list with `pg psql -X -d hindsight -c "UPDATE agent_keys.people SET schema = '<ID>' WHERE email = '<owner>' AND schema IS NULL RETURNING email"` and run the script again; its keys stay revoked, so this reopens nothing. If that returns no row, the owner already has a new schema, and the old one stays unlisted and unreachable until it is dropped by hand.
 
 ## The event log
 
@@ -210,6 +210,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | One person's Agent Key gets 401 | The key was revoked, it expired (90 days after its creation or last renewal), or its owner has not opened the key page for 30 days. The owner sees each key's state on the key page; opening the page revives keys held back by the 30-day rule. |
 | A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
 | An agent added someone to a Team but they still have no access | Adding over MCP only files a request. An owner or admin must press **Confirm** under the Team on `/ext/teams`. |
+| Upstream's `public.audit_log` gains rows | A bank in `public` still stores an `audit_log_enabled` override from before the cut-over. Remove it with the command in docs/cutover.md, step 4.4; upstream caches bank config for up to 30 seconds. |
 | The Team tools are missing from an MCP endpoint | The bank's `mcp_enabled_tools` config does not list them. |
 | The event log stays empty | The extension's database connection failed at startup. Look for `agent-keys` warnings in the logs, then restart the container. Refusals are still enforced. |
 

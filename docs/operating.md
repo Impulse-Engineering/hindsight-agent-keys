@@ -65,7 +65,7 @@ To check from the CT *(not verified)*: `pg psql -d hindsight -Atc "select id, ki
 
 ## Stale personal schemas
 
-`/ext/admin` lists each personal schema that no valid key has reached for 90 days. Nothing is deleted on its own. To purge one, follow the README, ["Stale personal schemas"](../README.md#stale-personal-schemas): take a backup first ([cutover.md](cutover.md), step 1), copy `scripts/purge-schema.sql` onto the CT, and run it for one schema at a time. If its drop step fails, put the schema back on the list as the README shows and run the script again.
+`/ext/admin` lists each personal schema that no valid key has reached for 90 days. Nothing is deleted on its own. To purge one, follow the README, ["Stale personal schemas"](../README.md#stale-personal-schemas): take a backup first ([cutover.md](cutover.md), step 1), copy `scripts/purge-schema.sql` onto the CT, and run it for one schema at a time. If its drop step stops, read its last error: `no rows returned for \gset` means the schema is in use again and nothing was dropped; any other error means put the schema back on the list as the README shows and run the script again.
 
 ## The Public Team stays in `public`
 
@@ -77,7 +77,7 @@ The banks that existed before the cut-over are the Public Team, in the `public` 
 | 2 | `authenticate()` rejects unknown keys and never returns an empty schema. | The tenant extension. A key it does not accept gets 401; an accepted key reaches `public`, a `p_…` schema or a `t_…` schema, and the keys table refuses an empty schema. |
 | 3 | `list_tenants()` returns `public` once, plus every personal and Team schema. | The tenant extension. Startup fails rather than run with a partial list. |
 | 4 | `HINDSIGHT_API_DATABASE_SCHEMA` stays `public`. | The startup guard. |
-| 5 | Upstream audit logging stays off; the extension logs key and membership events itself. | The startup guard refuses `HINDSIGHT_API_AUDIT_LOG_ENABLED=true`, no bank can switch it on, and events go to `agent_keys.events`. |
+| 5 | Upstream audit logging stays off; the extension logs key and membership events itself. | The startup guard refuses `HINDSIGHT_API_AUDIT_LOG_ENABLED=true`, no bank can switch it on from the deploy on, the cut-over removes any `audit_log_enabled` a `public` bank stored before ([cutover.md](cutover.md), step 4.4), and events go to `agent_keys.events`. |
 | 6 | Extension code reaches data only through engine calls made with the caller's key. | Code review. The extension's own SQL touches only `agent_keys`, and it creates schemas through upstream's migration call. Purging a schema is an operator script, not extension code. |
 
 ## Upgrading upstream Hindsight
