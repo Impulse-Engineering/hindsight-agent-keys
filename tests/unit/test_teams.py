@@ -9,7 +9,7 @@ from hindsight_api.extensions.tenant import AuthenticationError
 from hindsight_api.models import RequestContext
 
 from hindsight_agent_keys.extension import AgentKeysTenantExtension
-from hindsight_agent_keys.store import Refused
+from hindsight_agent_keys.store import TEAMS_PER_PERSON, Refused
 
 PEPPER = "pepper-0123456789abcdef0123456789abcdef"
 ALICE = "alice@example.com"
@@ -40,7 +40,13 @@ async def test_a_person_on_the_key_allowlist_creates_a_team_and_is_its_first_own
     assert migrations.schemas == [team]
     assert [t.schema for t in await ext.list_tenants()] == ["public", team]
     assert await ext.teams(ALICE) == [
-        {"team": team, "name": "Platform", "role": "owner", "members": [{"email": ALICE, "role": "owner"}]}
+        {
+            "team": team,
+            "name": "Platform",
+            "role": "owner",
+            "members": [{"email": ALICE, "role": "owner"}],
+            "requests": [],
+        }
     ]
 
 
@@ -201,6 +207,97 @@ async def test_everyone_on_the_key_allowlist_creates_public_team_keys_that_reach
     with pytest.raises(Refused) as refusal:
         await ext.create_team_key(CAROL, "public", "ci", None)
     assert refusal.value.status == 403
+
+
+def pending(teams, team):
+    return [r for t in teams if t["team"] == team for r in t["requests"]]
+
+
+async def test_asking_to_add_someone_grants_nothing_until_an_owner_confirms():
+    ext, _, _, _ = extension()
+    team = await ext.create_team(ALICE, "Platform", None)
+    await ext.request_member(ALICE, team, BOB, "owner", None)
+    assert roles(await ext.teams(ALICE), team) == {ALICE: "owner"}
+    assert pending(await ext.teams(ALICE), team) == [{"email": BOB, "role": "owner", "by": ALICE}]
+    with pytest.raises(Refused):
+        await ext.create_team_key(BOB, team, "ci", None)
+    await ext.set_member(ALICE, team, CAROL, "owner", None)
+    # Any owner confirms; the person gets the role that was asked for.
+    await ext.confirm_member(CAROL, team, BOB, None)
+    assert roles(await ext.teams(ALICE), team) == {ALICE: "owner", BOB: "owner", CAROL: "owner"}
+    assert pending(await ext.teams(ALICE), team) == []
+    await ext.create_team_key(BOB, team, "ci", None)
+
+
+async def test_only_owners_and_admins_ask_for_and_confirm_new_members():
+    ext, _, _, _ = extension()
+    team = await ext.create_team(ALICE, "Platform", None)
+    await ext.set_member(ALICE, team, DAVE, "member", None)
+    with pytest.raises(Refused) as refusal:
+        await ext.request_member(DAVE, team, CAROL, "member", None)
+    assert refusal.value.status == 403
+    await ext.request_member(BOB, team, CAROL, "member", None)
+    with pytest.raises(Refused) as refusal:
+        await ext.confirm_member(DAVE, team, CAROL, None)
+    assert refusal.value.status == 403
+    await ext.confirm_member(BOB, team, CAROL, None)
+    assert roles(await ext.teams(ALICE), team)[CAROL] == "member"
+
+
+async def test_confirming_without_a_pending_request_is_refused():
+    ext, _, _, _ = extension()
+    team = await ext.create_team(ALICE, "Platform", None)
+    with pytest.raises(Refused) as refusal:
+        await ext.confirm_member(ALICE, team, CAROL, None)
+    assert refusal.value.status == 404
+    assert roles(await ext.teams(ALICE), team) == {ALICE: "owner"}
+
+
+async def test_declining_a_request_drops_only_the_request():
+    ext, _, _, events = extension()
+    team = await ext.create_team(ALICE, "Platform", None)
+    await ext.set_member(ALICE, team, DAVE, "member", None)
+    await ext.request_member(ALICE, team, DAVE, "owner", None)
+    with pytest.raises(Refused) as refusal:
+        await ext.decline_member(DAVE, team, DAVE, None)
+    assert refusal.value.status == 403
+    await ext.decline_member(ALICE, team, DAVE, None)
+    assert roles(await ext.teams(ALICE), team) == {ALICE: "owner", DAVE: "member"}
+    assert pending(await ext.teams(ALICE), team) == []
+    assert (events.rows[-1]["kind"], events.rows[-1]["email"], events.rows[-1]["actor"]) == ("owner_declined", DAVE, ALICE)
+    for answer in (ext.confirm_member, ext.decline_member):
+        with pytest.raises(Refused) as refusal:
+            await answer(ALICE, team, DAVE, None)
+        assert refusal.value.status == 404
+
+
+async def test_requests_and_their_confirmations_are_logged_with_who_made_them():
+    ext, _, _, events = extension()
+    team = await ext.create_team(ALICE, "Platform", None)
+    await ext.request_member(ALICE, team, CAROL, "owner", "203.0.113.8")
+    await ext.request_member(ALICE, team, DAVE, "member", None)
+    await ext.confirm_member(BOB, team, CAROL, None)
+    await ext.confirm_member(CAROL, team, DAVE, None)
+    # `email` is whom the request concerns, `actor` who asked for or confirmed it.
+    assert [(r["kind"], r["key_id"], r["email"], r["actor"], r["team"]) for r in events.rows[1:]] == [
+        ("owner_requested", "(none)", CAROL, ALICE, team),
+        ("member_requested", "(none)", DAVE, ALICE, team),
+        ("owner_confirmed", "(none)", CAROL, BOB, team),
+        ("member_confirmed", "(none)", DAVE, CAROL, team),
+    ]
+    assert events.rows[1]["client_ip"] == "203.0.113.8"
+
+
+async def test_each_person_creates_a_limited_number_of_teams():
+    ext, _, migrations, _ = extension()
+    for n in range(TEAMS_PER_PERSON):
+        await ext.create_team(ALICE, f"Team {n}", None)
+    with pytest.raises(Refused) as refusal:
+        await ext.create_team(ALICE, "One more", None)
+    assert refusal.value.status == 429
+    # Refused before migrating, so no schema is left behind; others are unaffected.
+    assert len(migrations.schemas) == TEAMS_PER_PERSON
+    await ext.create_team(BOB, "One more", None)
 
 
 async def test_team_key_creation_is_logged_with_the_team():
