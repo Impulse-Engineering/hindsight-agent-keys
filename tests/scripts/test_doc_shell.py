@@ -1,9 +1,9 @@
 """Checks the shell the README and docs give operators (CODING_STANDARDS rule 7).
 
 A gate is a doc function that prints STOP when its check fails. Each gate runs
-under the shell its block names (sh or bash) against fake curl and cloudflared
-on PATH, which answer with one status and apply the flags the docs use as
-curl 8 does, and must succeed only on the status it waits for.
+under bash in a bash block and under sh otherwise, against fake curl and
+cloudflared on PATH, which answer with one status and apply the flags the docs
+use as curl 8 does, and must succeed only on the status it waits for.
 """
 
 import glob
@@ -16,16 +16,14 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DOCS = [os.path.join(ROOT, "README.md"), *sorted(glob.glob(os.path.join(ROOT, "docs", "**", "*.md"), recursive=True))]
-FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([\w+-]*)[^\n]*\n(.*?)^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL)
+FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([\w+-]*)[^\n]*\n(.*?)^[ \t]*\1[`~]*[ \t]*$", re.MULTILINE | re.DOTALL)
 SHELLS = ("", "sh", "bash", "shell", "zsh")  # an untagged block may hold shell, so it is read too
+COMPOUND = ("if", "case", "while", "until", "for")
 DEFINITION = re.compile(r"[ \t]*(?:function[ \t]+(\w+)|(\w+)[ \t]*\(\))")
 OPERATORS = ("||", "&&", ";", "|", "&", "(", ")", "\n")
 ANSWERS = ("200", "302", "401", "403", "404", "500", "refused")
 PRINTS = ("echo", "printf")
 FAILS = (["false"], ["return", "1"], ["exit", "1"])
-CURL_SHORT_ARGS = "AbcCdDeEFHKmoPQrtTuUwxXyYz"  # curl 8's short options that take an argument
-CURL_LONG_ARGS = ("--data", "--data-binary", "--data-raw", "--data-urlencode", "--form", "--header", "--json",
-                  "--output", "--request", "--user", "--write-out")
 
 # Answers $FAKE_ANSWER. Refuses any option the docs do not use, so a new flag
 # turns the test red instead of being ignored.
@@ -127,7 +125,7 @@ def definitions(words):
 
 
 def functions(path):
-    """Each shell function a doc defines, as (name, source, the shell its block names)."""
+    """Each shell function a doc defines, as (name, source, bash for a bash block or else sh)."""
     found = []
     for language, block in blocks(path):
         lines = block.splitlines(keepends=True)
@@ -168,6 +166,15 @@ def commands(text):
     return found
 
 
+def curl_options_with_an_argument():
+    """The options curl itself lists as taking an argument, so a -f after one is read as its argument."""
+    help_text = subprocess.run(["curl", "--help", "all"], capture_output=True, text=True, check=True).stdout
+    return {opt for pair in re.findall(r"^\s*(?:(-\w), )?(--[\w.-]+) <", help_text, re.MULTILINE) for opt in pair if opt}
+
+
+CURL_ARGS = curl_options_with_an_argument()
+
+
 def unsafe_calls(text):
     """curl calls that may PUT, PATCH or DELETE (a method in a variable may) without -f, so an HTTP
     error still exits 0. Options are read as curl reads them: -sSX DELETE is -s -S -X DELETE."""
@@ -182,13 +189,13 @@ def unsafe_calls(text):
                 fails = True
             elif word.startswith("--request="):
                 method = word[len("--request=") :]
-            elif word in CURL_LONG_ARGS:
+            elif word.startswith("--") and word in CURL_ARGS:
                 value = rest.pop(0) if rest else ""
                 method = value if word == "--request" else method
             elif re.match(r"-[a-zA-Z]", word):
                 for n, c in enumerate(word[1:], 1):
                     fails = fails or c == "f"
-                    if c in CURL_SHORT_ARGS:
+                    if f"-{c}" in CURL_ARGS:
                         value = word[n + 1 :] or (rest.pop(0) if rest else "")
                         method = value if c == "X" else method
                         break
@@ -199,7 +206,8 @@ def unsafe_calls(text):
 
 def open_failures(text):
     """Failure branches that print (|| echo …, || { echo …; }, || ( echo … )) but exit 0: the branch
-    does not end in false, return 1 or exit 1, or a later || recovers from it."""
+    does not end in false, return 1 or exit 1, or a later | or || takes over its status. A compound
+    command after || (if, case, a loop) is refused: write the branch as { …; }."""
     words, found = tokens(text), []
     for i in (i for i, w in enumerate(words) if w == "||"):
         j = i + 1
@@ -207,6 +215,9 @@ def open_failures(text):
             j += 1
         opener = words[j] if j < len(words) else ""
         closer = {"{": "}", "(": ")"}.get(opener)
+        if opener in COMPOUND:
+            found.append(" ".join(words[i : j + 1]))
+            continue
         if not closer:
             k = next((k for k in range(j, len(words)) if words[k] in OPERATORS), len(words))
             if set(PRINTS) & set(words[j:k]):
@@ -222,7 +233,7 @@ def open_failures(text):
             elif k > j:
                 statements[-1].append(words[k])
         printed = [w for s in statements for w in s if w in PRINTS]
-        if printed and ([s for s in statements if s][-1] not in FAILS or words[k + 1 : k + 2] == ["||"]):
+        if printed and ([s for s in statements if s][-1] not in FAILS or words[k + 1 : k + 2] in (["|"], ["||"])):
             found.append(" ".join(words[i : k + 2]))
     return found
 
@@ -262,8 +273,9 @@ def test_every_fence_that_may_hold_shell_is_read(tmp_path):
     doc = tmp_path / "doc.md"
     doc.write_text(
         "``` sh\na\n```\n\n  ~~~bash\n  b\n  ~~~\n\n```\nc\n```\n\n````shell\nd\n````\n\n```text\ne\n```\n"
+        "\n```sh\nf\n`````\n\n~~~\ng\n~~~~\n"
     )
-    assert blocks(str(doc)) == [("sh", "a\n"), ("bash", "  b\n"), ("", "c\n"), ("shell", "d\n")]
+    assert blocks(str(doc)) == [("sh", "a\n"), ("bash", "  b\n"), ("", "c\n"), ("shell", "d\n"), ("sh", "f\n"), ("", "g\n")]
 
 
 @pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
@@ -300,6 +312,9 @@ def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, 
         ("cloudflared access curl https://x -sSXPATCH", 1),
         ("curl -sS -X DELETE --data '-f' https://x", 1),
         ('curl -sS -X "$method" https://x', 1),
+        ("curl --cookie --fail -X DELETE https://x", 1),
+        ("curl --user-agent -f -X DELETE https://x", 1),
+        ("curl -A -f -X DELETE https://x", 1),
         ("curl -sSfX DELETE https://x\ncurl -H 'X-f: 1' -fsS -X PUT https://x", 0),
         ("curl -sS -f -X PUT https://x/z\ncurl -fsS -X DELETE https://x\ncurl --fail -X PATCH https://x", 0),
         ('curl -sS -o /dev/null -w "%{http_code}" https://x/health', 0),
@@ -327,6 +342,9 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ("check || printf 'STOP\\n'", 1),
         ("check || { echo STOP; return 1; } || true", 1),
         ('check || ( echo "STOP: failed" )', 1),
+        ("check || { echo STOP; false; } | tee /dev/null", 1),
+        ("check || ( echo STOP; exit 1 ) | cat", 1),
+        ("check || if true; then echo STOP; fi", 1),
         ("check 2>&1 || { echo STOP; false; }\ncheck || ( echo STOP; exit 1 )", 0),
         ('check || { echo "STOP: a; b"; false; }\nx() { check || { echo STOP; return 1; }; }', 0),
         ("check || { echo STOP; exit 1; }\ncheck || exit 1", 0),
