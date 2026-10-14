@@ -233,7 +233,10 @@ def open_failures(text):
             elif k > j:
                 statements[-1].append(words[k])
         printed = [w for s in statements for w in s if w in PRINTS]
-        if printed and ([s for s in statements if s][-1] not in FAILS or words[k + 1 : k + 2] in (["|"], ["||"])):
+        after = k + 1
+        while after < len(words) and (r := re.match(r"\d*[<>]+&?", words[after])):
+            after += 2 if r.end() == len(words[after]) else 1  # "2>" "file", or "2>&1" in one word
+        if printed and ([s for s in statements if s][-1] not in FAILS or words[after : after + 1] in (["|"], ["||"])):
             found.append(" ".join(words[i : k + 2]))
     return found
 
@@ -345,6 +348,9 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ("check || { echo STOP; false; } | tee /dev/null", 1),
         ("check || ( echo STOP; exit 1 ) | cat", 1),
         ("check || if true; then echo STOP; fi", 1),
+        ('check || { echo "STOP: failed"; false; } 2>&1 | tee /dev/null', 1),
+        ("check || { echo STOP; false; } 2>/dev/null || true", 1),
+        ("check || ( echo STOP; exit 1 ) > /tmp/log 2>&1 | cat", 1),
         ("check 2>&1 || { echo STOP; false; }\ncheck || ( echo STOP; exit 1 )", 0),
         ('check || { echo "STOP: a; b"; false; }\nx() { check || { echo STOP; return 1; }; }', 0),
         ("check || { echo STOP; exit 1; }\ncheck || exit 1", 0),
