@@ -1,9 +1,9 @@
 """Checks the shell the README and docs give operators (CODING_STANDARDS rule 7).
 
 A gate is a doc function that prints STOP when its check fails. Each gate runs
-under sh against fake curl and cloudflared on PATH, which answer with one
-status and apply the flags the docs use as curl 8 does, and must succeed only
-on the status it waits for.
+under the shell its block names (sh or bash) against fake curl and cloudflared
+on PATH, which answer with one status and apply the flags the docs use as
+curl 8 does, and must succeed only on the status it waits for.
 """
 
 import glob
@@ -17,10 +17,12 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DOCS = [os.path.join(ROOT, "README.md"), *sorted(glob.glob(os.path.join(ROOT, "docs", "**", "*.md"), recursive=True))]
-FENCE = re.compile(r"^[ \t]*```(?:sh|bash|shell)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
-DEFINITION = re.compile(r"^[ \t]*(?:function[ \t]+)?(\w+)[ \t]*\(\)[ \t]*\{", re.MULTILINE)
+FENCE = re.compile(r"^[ \t]*```(sh|bash|shell)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
+DEFINITION = re.compile(r"[ \t]*(?:function[ \t]+(\w+)|(\w+)[ \t]*\(\))")
 OPERATORS = ("||", "&&", ";", "|", "&", "(", ")", "\n")
 ANSWERS = ("200", "302", "401", "403", "404", "500", "refused")
+PRINTS = ("echo", "printf")
+FAILS = (["false"], ["return", "1"], ["exit", "1"])
 
 # Answers $FAKE_ANSWER. Refuses any option the docs do not use, so a new flag
 # turns the test red instead of being ignored.
@@ -72,6 +74,7 @@ exec curl "$@" -H "cf-access-token: fake"
 
 
 def blocks(path):
+    """A doc's shell blocks, as (language, text)."""
     with open(path) as fh:
         return FENCE.findall(fh.read())
 
@@ -83,7 +86,9 @@ def tokens(text):
     while i < len(text):
         c = text[i]
         op = next((o for o in OPERATORS if text.startswith(o, i)), None)
-        if c in " \t" or op:
+        if text.startswith((">&", "<&"), i):  # a redirection such as 2>&1; its & is not an operator
+            word, i = (word or "") + text[i : i + 2], i + 2
+        elif c in " \t" or op:
             if word is not None:
                 out.append(word)
                 word = None
@@ -111,10 +116,16 @@ def tokens(text):
     return found
 
 
+def definitions(words):
+    """How many functions shell words define, so a form functions() misses shows up."""
+    starts = [i for i, w in enumerate(words) if i == 0 or words[i - 1] in (*OPERATORS, "{", "}")]
+    return sum(words[i] == "function" or (words[i] not in OPERATORS and words[i + 1 : i + 3] == ["(", ")"]) for i in starts)
+
+
 def functions(path):
-    """Each shell function a doc defines, as (name, source)."""
+    """Each shell function a doc defines, as (name, source, the shell its block names)."""
     found = []
-    for block in blocks(path):
+    for language, block in blocks(path):
         lines = block.splitlines(keepends=True)
         for start, line in enumerate(lines):
             if not (m := DEFINITION.match(line)):
@@ -125,11 +136,11 @@ def functions(path):
                     words = tokens(source)
                 except ValueError:  # a quote that closes on a later line
                     continue
-                if words.count("{") == words.count("}"):
-                    found.append((m.group(1), source))
+                if words.count("{") == words.count("}") > 0:
+                    found.append((m.group(1) or m.group(2), source, "bash" if language == "bash" else "sh"))
                     break
             else:
-                raise ValueError(f"{path}: {m.group(1)}() never closes, so it cannot be checked")
+                raise ValueError(f"{path}: {m.group(1) or m.group(2)}() has no {{ }} body that closes, so it cannot be checked")
     return found
 
 
@@ -138,7 +149,7 @@ def shell_in(path):
     with open(path) as fh:
         text = fh.read()
     spans = re.findall(r"`([^`\n]+)`", FENCE.sub("", text))
-    return "\n".join(FENCE.findall(text) + [s for s in spans if "curl" in s])
+    return "\n".join([block for _, block in FENCE.findall(text)] + [s for s in spans if "curl" in s])
 
 
 def commands(text):
@@ -167,33 +178,37 @@ def unsafe_calls(text):
 
 
 def open_failures(text):
-    """Failure branches (|| echo …, || { echo …; }) that do not end in false, return 1 or exit 1."""
+    """Failure branches that print (|| echo …, || { echo …; }) but exit 0: the branch does not end
+    in false, return 1 or exit 1, or a later || recovers from it."""
     words, found = tokens(text), []
     for i in (i for i, w in enumerate(words) if w == "||"):
         j = i + 1
         while words[j : j + 1] == ["\n"]:
             j += 1
-        if words[j : j + 1] == ["echo"]:
-            found.append(" ".join(words[i : i + 8]))
-        elif words[j : j + 2] == ["{", "echo"]:
-            depth, statements = 0, [[]]
-            for k in range(j, len(words)):
-                depth += {"{": 1, "}": -1}.get(words[k], 0)
-                if depth == 0:
-                    break
-                if words[k] in (";", "\n"):
-                    statements.append([])
-                elif k > j:
-                    statements[-1].append(words[k])
-            if [s for s in statements if s][-1] not in (["false"], ["return", "1"], ["exit", "1"]):
-                found.append(" ".join(words[i : k + 1]))
+        if words[j : j + 1] != ["{"]:
+            k = next((k for k in range(j, len(words)) if words[k] in OPERATORS), len(words))
+            if set(PRINTS) & set(words[j:k]):
+                found.append(" ".join(words[i:k]))
+            continue
+        depth, statements = 0, [[]]
+        for k in range(j, len(words)):
+            depth += {"{": 1, "}": -1}.get(words[k], 0)
+            if depth == 0:
+                break
+            if words[k] in (";", "\n"):
+                statements.append([])
+            elif k > j:
+                statements[-1].append(words[k])
+        printed = [w for s in statements for w in s if w in PRINTS]
+        if printed and ([s for s in statements if s][-1] not in FAILS or words[k + 1 : k + 2] == ["||"]):
+            found.append(" ".join(words[i : k + 2]))
     return found
 
 
 GATES = [
-    pytest.param(path, name, source, id=f"{os.path.relpath(path, ROOT)}:{name}")
+    pytest.param(path, name, source, shell, id=f"{os.path.relpath(path, ROOT)}:{name}")
     for path in DOCS
-    for name, source in functions(path)
+    for name, source, shell in functions(path)
     if re.search(r"""echo ["']?STOP""", source)
 ]
 
@@ -208,19 +223,34 @@ def fakes(tmp_path_factory):
 
 
 def test_the_runbook_gates_are_found():
-    assert {name for _, name, _ in (gate.values for gate in GATES)} >= {"closed", "keyless"}
+    assert {name for _, name, _, _ in (gate.values for gate in GATES)} >= {"closed", "keyless"}
 
 
-@pytest.mark.parametrize("path,name,source", GATES)
-def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, name, source):
+def test_functions_are_found_in_every_form_sh_and_bash_allow(tmp_path):
+    doc = tmp_path / "doc.md"
+    doc.write_text(
+        "```sh\na()\n{\n  echo STOP\n}\nb () { echo STOP; }\n```\n\n"
+        "```bash\nfunction c {\n  echo STOP\n}\nfunction d() { echo STOP; }\n```\n"
+    )
+    assert [(name, shell) for name, _, shell in functions(str(doc))] == [("a", "sh"), ("b", "sh"), ("c", "bash"), ("d", "bash")]
+    assert sum(definitions(tokens(block)) for _, block in blocks(str(doc))) == 4
+
+
+@pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
+def test_every_function_a_doc_defines_is_found(path):
+    assert len(functions(path)) == sum(definitions(tokens(block)) for _, block in blocks(path))
+
+
+@pytest.mark.parametrize("path,name,source,shell", GATES)
+def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, name, source, shell):
     waits_for = set(re.findall(r'= "?(\d{3})\b', source))
     assert len(waits_for) == 1, f"{name} compares against {waits_for or 'no status'}; a gate waits for one"
-    defined = "".join(f"{s}\n" for _, s in functions(path))
+    defined = "".join(f"{s}\n" for _, s, block_shell in functions(path) if block_shell == shell)
     env = {**os.environ, "PATH": f"{fakes}:{os.environ['PATH']}"}
     passed = set()
     for answer in ANSWERS:
         result = subprocess.run(
-            ["sh", "-c", f"{defined}{name} example.invalid"],
+            [shell, "-c", f"{defined}{name} example.invalid"],
             cwd=tmp_path, env={**env, "FAKE_ANSWER": answer}, capture_output=True, text=True, check=False, timeout=30,
         )
         assert "fake " not in result.stderr, result.stderr
@@ -257,6 +287,11 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ("check || { echo STOP; true; }", 1),
         ("check || { echo STOP; foo && false; }", 1),
         ('y="$(check || echo STOP)"', 1),
+        ('check || { >&2 echo "STOP: failed"; }', 1),
+        ("check || >&2 echo STOP", 1),
+        ("check || printf 'STOP\\n'", 1),
+        ("check || { echo STOP; return 1; } || true", 1),
+        ("check 2>&1 || { echo STOP; false; }", 0),
         ('check || { echo "STOP: a; b"; false; }\nx() { check || { echo STOP; return 1; }; }', 0),
         ("check || { echo STOP; exit 1; }\ncheck || exit 1", 0),
     ],
