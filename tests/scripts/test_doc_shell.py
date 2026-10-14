@@ -7,7 +7,6 @@ curl 8 does, and must succeed only on the status it waits for.
 """
 
 import glob
-import itertools
 import os
 import re
 import subprocess
@@ -17,12 +16,16 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DOCS = [os.path.join(ROOT, "README.md"), *sorted(glob.glob(os.path.join(ROOT, "docs", "**", "*.md"), recursive=True))]
-FENCE = re.compile(r"^[ \t]*```(sh|bash|shell)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
+FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([\w+-]*)[^\n]*\n(.*?)^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL)
+SHELLS = ("", "sh", "bash", "shell", "zsh")  # an untagged block may hold shell, so it is read too
 DEFINITION = re.compile(r"[ \t]*(?:function[ \t]+(\w+)|(\w+)[ \t]*\(\))")
 OPERATORS = ("||", "&&", ";", "|", "&", "(", ")", "\n")
 ANSWERS = ("200", "302", "401", "403", "404", "500", "refused")
 PRINTS = ("echo", "printf")
 FAILS = (["false"], ["return", "1"], ["exit", "1"])
+CURL_SHORT_ARGS = "AbcCdDeEFHKmoPQrtTuUwxXyYz"  # curl 8's short options that take an argument
+CURL_LONG_ARGS = ("--data", "--data-binary", "--data-raw", "--data-urlencode", "--form", "--header", "--json",
+                  "--output", "--request", "--user", "--write-out")
 
 # Answers $FAKE_ANSWER. Refuses any option the docs do not use, so a new flag
 # turns the test red instead of being ignored.
@@ -74,9 +77,10 @@ exec curl "$@" -H "cf-access-token: fake"
 
 
 def blocks(path):
-    """A doc's shell blocks, as (language, text)."""
+    """A doc's fenced blocks that may hold shell (sh, bash, shell, zsh or untagged), as (language, text)."""
     with open(path) as fh:
-        return FENCE.findall(fh.read())
+        found = [(m[2].lower(), m[3]) for m in FENCE.finditer(fh.read())]
+    return [(language, text) for language, text in found if language in SHELLS]
 
 
 def tokens(text):
@@ -149,7 +153,7 @@ def shell_in(path):
     with open(path) as fh:
         text = fh.read()
     spans = re.findall(r"`([^`\n]+)`", FENCE.sub("", text))
-    return "\n".join([block for _, block in FENCE.findall(text)] + [s for s in spans if "curl" in s])
+    return "\n".join([block for _, block in blocks(path)] + [s for s in spans if "curl" in s])
 
 
 def commands(text):
@@ -165,34 +169,52 @@ def commands(text):
 
 
 def unsafe_calls(text):
-    """curl calls that PUT, PATCH or DELETE without -f, so an HTTP error still exits 0."""
+    """curl calls that may PUT, PATCH or DELETE (a method in a variable may) without -f, so an HTTP
+    error still exits 0. Options are read as curl reads them: -sSX DELETE is -s -S -X DELETE."""
     unsafe = []
     for words in commands(text):
-        methods = {b for a, b in itertools.pairwise(words) if a in ("-X", "--request")}
-        methods |= {w[2:] for w in words if w.startswith("-X") and len(w) > 2}
-        methods |= {w[len("--request=") :] for w in words if w.startswith("--request=")}
-        fails = any(w in ("--fail", "--fail-with-body") or re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", w) for w in words)
-        if "curl" in words and methods & {"PUT", "PATCH", "DELETE"} and not fails:
+        if "curl" not in words:
+            continue
+        method, fails, rest = None, False, words[words.index("curl") + 1 :]
+        while rest:
+            word = rest.pop(0)
+            if word in ("--fail", "--fail-with-body"):
+                fails = True
+            elif word.startswith("--request="):
+                method = word[len("--request=") :]
+            elif word in CURL_LONG_ARGS:
+                value = rest.pop(0) if rest else ""
+                method = value if word == "--request" else method
+            elif re.match(r"-[a-zA-Z]", word):
+                for n, c in enumerate(word[1:], 1):
+                    fails = fails or c == "f"
+                    if c in CURL_SHORT_ARGS:
+                        value = word[n + 1 :] or (rest.pop(0) if rest else "")
+                        method = value if c == "X" else method
+                        break
+        if method and (method.upper() in ("PUT", "PATCH", "DELETE") or "$" in method) and not fails:
             unsafe.append(" ".join(words))
     return unsafe
 
 
 def open_failures(text):
-    """Failure branches that print (|| echo …, || { echo …; }) but exit 0: the branch does not end
-    in false, return 1 or exit 1, or a later || recovers from it."""
+    """Failure branches that print (|| echo …, || { echo …; }, || ( echo … )) but exit 0: the branch
+    does not end in false, return 1 or exit 1, or a later || recovers from it."""
     words, found = tokens(text), []
     for i in (i for i, w in enumerate(words) if w == "||"):
         j = i + 1
         while words[j : j + 1] == ["\n"]:
             j += 1
-        if words[j : j + 1] != ["{"]:
+        opener = words[j] if j < len(words) else ""
+        closer = {"{": "}", "(": ")"}.get(opener)
+        if not closer:
             k = next((k for k in range(j, len(words)) if words[k] in OPERATORS), len(words))
             if set(PRINTS) & set(words[j:k]):
                 found.append(" ".join(words[i:k]))
             continue
         depth, statements = 0, [[]]
         for k in range(j, len(words)):
-            depth += {"{": 1, "}": -1}.get(words[k], 0)
+            depth += {opener: 1, closer: -1}.get(words[k], 0)
             if depth == 0:
                 break
             if words[k] in (";", "\n"):
@@ -236,6 +258,14 @@ def test_functions_are_found_in_every_form_sh_and_bash_allow(tmp_path):
     assert sum(definitions(tokens(block)) for _, block in blocks(str(doc))) == 4
 
 
+def test_every_fence_that_may_hold_shell_is_read(tmp_path):
+    doc = tmp_path / "doc.md"
+    doc.write_text(
+        "``` sh\na\n```\n\n  ~~~bash\n  b\n  ~~~\n\n```\nc\n```\n\n````shell\nd\n````\n\n```text\ne\n```\n"
+    )
+    assert blocks(str(doc)) == [("sh", "a\n"), ("bash", "  b\n"), ("", "c\n"), ("shell", "d\n")]
+
+
 @pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
 def test_every_function_a_doc_defines_is_found(path):
     assert len(functions(path)) == sum(definitions(tokens(block)) for _, block in blocks(path))
@@ -266,6 +296,11 @@ def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, 
         ("curl -sS -X DELETE https://x/y && curl -sSf -X PUT https://x/z", 1),
         ('[ "$(curl -sS -o /dev/null -w \'%{http_code}\' -X DELETE "$u")" = 204 ]', 1),
         ("curl -sS --request=PUT https://x/z", 1),
+        ("curl -sSX DELETE https://x", 1),
+        ("cloudflared access curl https://x -sSXPATCH", 1),
+        ("curl -sS -X DELETE --data '-f' https://x", 1),
+        ('curl -sS -X "$method" https://x', 1),
+        ("curl -sSfX DELETE https://x\ncurl -H 'X-f: 1' -fsS -X PUT https://x", 0),
         ("curl -sS -f -X PUT https://x/z\ncurl -fsS -X DELETE https://x\ncurl --fail -X PATCH https://x", 0),
         ('curl -sS -o /dev/null -w "%{http_code}" https://x/health', 0),
     ],
@@ -291,7 +326,8 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ("check || >&2 echo STOP", 1),
         ("check || printf 'STOP\\n'", 1),
         ("check || { echo STOP; return 1; } || true", 1),
-        ("check 2>&1 || { echo STOP; false; }", 0),
+        ('check || ( echo "STOP: failed" )', 1),
+        ("check 2>&1 || { echo STOP; false; }\ncheck || ( echo STOP; exit 1 )", 0),
         ('check || { echo "STOP: a; b"; false; }\nx() { check || { echo STOP; return 1; }; }', 0),
         ("check || { echo STOP; exit 1; }\ncheck || exit 1", 0),
     ],

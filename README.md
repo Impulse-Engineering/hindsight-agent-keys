@@ -168,11 +168,11 @@ docker build -t hindsight-agent-keys:test .
 uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
-Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They also check the shell this README and `docs/` give operators (`tests/scripts/test_doc_shell.py`):
+Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They also check the shell this README and `docs/` give operators (`tests/scripts/test_doc_shell.py`), in every fenced block tagged `sh`, `bash`, `shell` or `zsh`, or not tagged:
 
 - Each gate, a function that prints STOP when its check fails, runs under the shell its block names (`sh` or `bash`) against fake `curl` and `cloudflared` answering 200, 302, 401, 403, 404, 500 and a refused connection. It must succeed only on the status it waits for. Every function a doc defines must be found, whatever its form.
-- A `curl` that sends PUT, PATCH or DELETE uses `-f`, in a shell block or an inline command.
-- A failure branch that prints (`|| echo …`, `|| { echo …; }`, or the same with `printf`) ends in `false`, `return 1` or `exit 1`, and no later `||` recovers from it.
+- A `curl` that sends PUT, PATCH or DELETE, or a method held in a variable, uses `-f`, in a shell block or an inline command. Options are read as curl reads them, so `-sSX DELETE` counts.
+- A failure branch that prints (`|| echo …`, `|| { echo …; }`, `|| ( echo … )`, or the same with `printf`) ends in `false`, `return 1` or `exit 1`, and no later `||` recovers from it.
 
 They need git, jq and pytest on the host:
 
