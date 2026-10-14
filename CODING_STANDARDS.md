@@ -1,6 +1,6 @@
 # Coding standards
 
-Reviewers apply these to every PR. Each rule is a judgement call that no linter makes; ruff, shellcheck and actionlint run in CI. shellcheck covers `scripts/` and `docker/` only. The shell blocks in the README and `docs/` are checked by `tests/scripts/test_doc_shell.py` instead (README, "Tests"): gates fail closed, state-changing `curl` calls use `-f`, and failure branches end in failure.
+Reviewers apply these to every PR. Each rule is a judgement call that no linter makes; ruff, shellcheck and actionlint run in CI. shellcheck covers `scripts/`, `docker/` and, through actionlint, the workflows' `run:` steps. The shell in the README and `docs/` is checked by `tests/scripts/test_doc_shell.py` instead (README, "Tests"): gates fail closed, a `curl` that sends PUT, PATCH or DELETE uses `-f`, and failure branches end in failure.
 
 1. **Check the effective configuration.** Anything that validates configuration reads it as upstream will at runtime: the same sources (the process environment and any `.env` upstream loads), the same parsing (for example `value.lower() == "true"` with no strip), and the same defaults. The test cites the upstream code it mirrors.
 2. **Bound every write that unauthenticated input can trigger.**

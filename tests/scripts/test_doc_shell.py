@@ -18,7 +18,7 @@ import pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DOCS = [os.path.join(ROOT, "README.md"), *sorted(glob.glob(os.path.join(ROOT, "docs", "**", "*.md"), recursive=True))]
 FENCE = re.compile(r"^[ \t]*```(?:sh|bash|shell)[ \t]*\n(.*?)^[ \t]*```", re.MULTILINE | re.DOTALL)
-DEFINITION = re.compile(r"^[ \t]*(\w+)\(\)[ \t]*\{", re.MULTILINE)
+DEFINITION = re.compile(r"^[ \t]*(?:function[ \t]+)?(\w+)[ \t]*\(\)[ \t]*\{", re.MULTILINE)
 OPERATORS = ("||", "&&", ";", "|", "&", "(", ")", "\n")
 ANSWERS = ("200", "302", "401", "403", "404", "500", "refused")
 
@@ -102,7 +102,13 @@ def tokens(text):
             word, i = (word or "") + text[i + 1 : i + 2], i + 2
         else:
             word, i = (word or "") + c, i + 1
-    return out + ([word] if word is not None else [])
+    found = []
+    for token in out + ([word] if word is not None else []):
+        found.append(token)
+        # A quoted "$(...)" is one word; its commands still run.
+        if token not in OPERATORS and (sub := re.search(r"\$\((.*)\)", token, re.DOTALL)):
+            found += ["(", *tokens(sub.group(1)), ")"]
+    return found
 
 
 def functions(path):
@@ -122,6 +128,8 @@ def functions(path):
                 if words.count("{") == words.count("}"):
                     found.append((m.group(1), source))
                     break
+            else:
+                raise ValueError(f"{path}: {m.group(1)}() never closes, so it cannot be checked")
     return found
 
 
@@ -151,6 +159,7 @@ def unsafe_calls(text):
     for words in commands(text):
         methods = {b for a, b in itertools.pairwise(words) if a in ("-X", "--request")}
         methods |= {w[2:] for w in words if w.startswith("-X") and len(w) > 2}
+        methods |= {w[len("--request=") :] for w in words if w.startswith("--request=")}
         fails = any(w in ("--fail", "--fail-with-body") or re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", w) for w in words)
         if "curl" in words and methods & {"PUT", "PATCH", "DELETE"} and not fails:
             unsafe.append(" ".join(words))
@@ -225,6 +234,8 @@ def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, 
     [
         ('cloudflared access curl "$capi/domains/1" -sS -X PATCH --data \'{"a": 1}\'', 1),
         ("curl -sS -X DELETE https://x/y && curl -sSf -X PUT https://x/z", 1),
+        ('[ "$(curl -sS -o /dev/null -w \'%{http_code}\' -X DELETE "$u")" = 204 ]', 1),
+        ("curl -sS --request=PUT https://x/z", 1),
         ("curl -sS -f -X PUT https://x/z\ncurl -fsS -X DELETE https://x\ncurl --fail -X PATCH https://x", 0),
         ('curl -sS -o /dev/null -w "%{http_code}" https://x/health', 0),
     ],
@@ -245,6 +256,7 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ('check ||\n  { echo "STOP: a; b"; }', 1),
         ("check || { echo STOP; true; }", 1),
         ("check || { echo STOP; foo && false; }", 1),
+        ('y="$(check || echo STOP)"', 1),
         ('check || { echo "STOP: a; b"; false; }\nx() { check || { echo STOP; return 1; }; }', 0),
         ("check || { echo STOP; exit 1; }\ncheck || exit 1", 0),
     ],
