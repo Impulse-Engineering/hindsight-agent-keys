@@ -127,15 +127,19 @@ def span(text, node):
 
 
 # shortcut: shell in a quoted string (sh -c '…', ssh host '…') is not read; read it when a doc runs commands that way.
-def scripts(text, shell):
-    """Shell text and its syntax tree, then each heredoc body in it that reads as shell (a script fed to ssh or sh)."""
-    found = [(text, tree := syntax_tree(text, shell))]
-    for heredoc in (node["Hdoc"] for node in nodes(tree) if node.get("Hdoc")):
-        body = span(text, heredoc).rpartition("\n")[0]  # the span ends with the closing delimiter
-        try:  # read as bash, which takes all sh syntax too: the command it is fed to picks the shell
-            found += scripts(body, "bash")
-        except ValueError:  # not shell: SQL, JSON or a file's content
-            pass
+def scripts(text, shell, dialect=None):
+    """Shell text as (text, syntax tree, the shell that runs it), then each heredoc body in it that reads as
+    shell (a script fed to ssh or sh). A body is read as bash, which takes all sh syntax too, and runs in
+    bash when the command it is fed to names bash, else in sh."""
+    found = [(text, tree := syntax_tree(text, dialect or shell), shell)]
+    for stmt in nodes(tree):
+        for redirect in (r for r in stmt.get("Redirs") or [] if r.get("Hdoc")):
+            body = span(text, redirect["Hdoc"]).rpartition("\n")[0]  # the span ends with the closing delimiter
+            receiver = words(stmt["Cmd"]) if stmt.get("Cmd", {}).get("Type") == "CallExpr" else []
+            try:
+                found += scripts(body, "bash" if "bash" in map(os.path.basename, receiver) else "sh", "bash")
+            except ValueError:  # not shell: SQL, JSON or a file's content
+                pass
     return found
 
 
@@ -167,26 +171,26 @@ def prints(command):
 
 def commands(text, shell="sh"):
     """Each simple command in shell text, including those in $(...) and heredoc bodies, as its words."""
-    return [words(call) for _, tree in scripts(text, shell) for call in nodes(tree, "CallExpr")]
+    return [words(call) for _, tree, _ in scripts(text, shell) for call in nodes(tree, "CallExpr")]
 
 
 def functions(path):
-    """Each shell function a doc defines, as (name, source, bash for a bash block or else sh, scope). The scope is
+    """Each shell function a doc defines, as (name, source, the shell that runs it, scope). The scope is
     None for a block, whose functions the operator's shell keeps for later blocks, or the heredoc body that
     defines it, which runs in a shell of its own."""
     found = []
     for language, text in blocks(path):
         shell = "bash" if language == "bash" else "sh"
-        for script, tree in scripts(text, shell):
+        for script, tree, runs in scripts(text, shell):
             scope = None if script is text else script
-            found += [(decl["Name"]["Value"], span(script, decl), shell, scope) for decl in nodes(tree, "FuncDecl")]
+            found += [(decl["Name"]["Value"], span(script, decl), runs, scope) for decl in nodes(tree, "FuncDecl")]
     return found
 
 
 def waits_for(source, shell):
     """The statuses a gate compares against: [ "$code" = 401 ] or [[ $code == 401 ]]."""
     pairs = [(c[i], c[i + 1]) for c in commands(source, shell) for i in range(len(c) - 1)]
-    pairs += [(test["Op"], word(test["Y"])) for _, tree in scripts(source, shell) for test in nodes(tree, "BinaryTest")]
+    pairs += [(test["Op"], word(test["Y"])) for _, tree, _ in scripts(source, shell) for test in nodes(tree, "BinaryTest")]
     return {status for op, status in pairs if op in ("=", "==") and re.fullmatch(r"\d{3}", status)}
 
 
@@ -205,7 +209,7 @@ def unsafe_calls(text, shell="sh"):
     """curl calls that may PUT, PATCH or DELETE (a method in a variable may) without -f, so an HTTP
     error still exits 0. Options are read as curl reads them: -sSX DELETE is -s -S -X DELETE."""
     unsafe = []
-    for script, tree in scripts(text, shell):
+    for script, tree, _ in scripts(text, shell):
         for call in nodes(tree, "CallExpr"):
             if "curl" not in (command := words(call)):
                 continue
@@ -267,7 +271,7 @@ def open_failures(text, shell="sh"):
     discards its status (status_lost). A compound command after || (if, case, a loop) is refused: write the
     branch as { …; }."""
     found = []
-    for script, tree in scripts(text, shell):
+    for script, tree, _ in scripts(text, shell):
         parent = parents(tree)
         for node in (node for node in nodes(tree, "BinaryCmd") if node["Op"] == "||"):
             branch = node["Y"]["Cmd"]  # a | after a group binds to it, so a pipeline is the branch
@@ -314,15 +318,16 @@ def test_functions_are_found_in_every_form_sh_and_bash_allow(tmp_path):
     doc = tmp_path / "doc.md"
     doc.write_text(
         "```sh\na()\n{\n  echo STOP\n}\nb () { echo STOP; }\ne ( ) { echo STOP; }; f() ( echo STOP )\n"
-        "ssh h sh <<'EOF'\nk() {\n  echo STOP\n}\nEOF\n```\n\n"
+        "ssh h sh <<'EOF'\nk() {\n  echo STOP\n}\nEOF\npct exec 1 -- /bin/bash <<'EOF'\nm() { [[ -n $1 ]] || echo STOP; }\nEOF\n```\n\n"
         "```bash\nfunction c {\n  echo STOP\n}\nfunction d() { echo STOP; }\n```\n"
     )
     found = functions(str(doc))
     assert [(name, shell) for name, _, shell, _ in found] == [
-        ("a", "sh"), ("b", "sh"), ("e", "sh"), ("f", "sh"), ("k", "sh"), ("c", "bash"), ("d", "bash"),
+        ("a", "sh"), ("b", "sh"), ("e", "sh"), ("f", "sh"), ("k", "sh"), ("m", "bash"), ("c", "bash"), ("d", "bash"),
     ]
-    assert found[4:] == [  # a heredoc body runs in a shell of its own, so it is k's scope
+    assert found[4:] == [  # a heredoc body runs in a shell of its own, the one the command it is fed to names
         ("k", "k() {\n  echo STOP\n}", "sh", "k() {\n  echo STOP\n}"),
+        ("m", "m() { [[ -n $1 ]] || echo STOP; }", "bash", "m() { [[ -n $1 ]] || echo STOP; }"),
         ("c", "function c {\n  echo STOP\n}", "bash", None),
         ("d", "function d() { echo STOP; }", "bash", None),
     ]
