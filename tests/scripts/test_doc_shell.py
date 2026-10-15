@@ -31,18 +31,23 @@ FAILS = (["false"], ["return", "1"], ["exit", "1"])
 # Answers $FAKE_ANSWER. Refuses any option the docs do not use, so a new flag
 # turns the test red instead of being ignored.
 FAKE_CURL = f"""#!{sys.executable}
-import os, sys
-takes = {{"-o": "o", "-w": "w", "-X": "X", "-H": "H", "-d": "d", "--data": "d", "--data-binary": "d"}}
+import os, re, sys
+takes = {{"-o": "o", "-w": "w", "-X": "X", "--request": "X", "-H": "H", "-d": "d", "--data": "d", "--data-binary": "d"}}
 switches = {{"-s": "s", "-S": "S", "-f": "f", "--fail": "f", "--fail-with-body": "F"}}
 args, flags, values, urls = sys.argv[1:], set(), {{}}, []
 while args:
     arg = args.pop(0)
     if arg in takes:
         values[takes[arg]] = args.pop(0)
+    elif arg.startswith("--request="):
+        values["X"] = arg[len("--request="):]
     elif arg in switches:
         flags.add(switches[arg])
-    elif arg.startswith("-") and set(arg[1:]) <= set("sSf") and len(arg) > 2:
-        flags.update(arg[1:])
+    elif re.fullmatch(r"-[sSf]*(X.*)?", arg) and len(arg) > 2:  # a cluster: -sSf, -fX DELETE, -sSXDELETE
+        cluster, x, method = arg[1:].partition("X")
+        flags.update(cluster)
+        if x:
+            values["X"] = method or args.pop(0)
     elif arg.startswith("-"):
         sys.exit(f"fake curl: unsupported option {{arg}}")
     else:
@@ -161,24 +166,27 @@ def prints(command):
 
 
 def commands(text, shell="sh"):
-    """Each simple command in shell text, including those in $(...), as its words."""
-    return [words(call) for call in nodes(syntax_tree(text, shell), "CallExpr")]
+    """Each simple command in shell text, including those in $(...) and heredoc bodies, as its words."""
+    return [words(call) for _, tree in scripts(text, shell) for call in nodes(tree, "CallExpr")]
 
 
 def functions(path):
-    """Each shell function a doc defines, in a heredoc body too, as (name, source, bash for a bash block or else sh)."""
+    """Each shell function a doc defines, as (name, source, bash for a bash block or else sh, scope). The scope is
+    None for a block, whose functions the operator's shell keeps for later blocks, or the heredoc body that
+    defines it, which runs in a shell of its own."""
     found = []
     for language, text in blocks(path):
         shell = "bash" if language == "bash" else "sh"
-        found += [(decl["Name"]["Value"], span(script, decl), shell) for script, tree in scripts(text, shell) for decl in nodes(tree, "FuncDecl")]
+        for script, tree in scripts(text, shell):
+            scope = None if script is text else script
+            found += [(decl["Name"]["Value"], span(script, decl), shell, scope) for decl in nodes(tree, "FuncDecl")]
     return found
 
 
 def waits_for(source, shell):
     """The statuses a gate compares against: [ "$code" = 401 ] or [[ $code == 401 ]]."""
-    tree = syntax_tree(source, shell)
-    pairs = [(c[i], c[i + 1]) for c in map(words, nodes(tree, "CallExpr")) for i in range(len(c) - 1)]
-    pairs += [(test["Op"], word(test["Y"])) for test in nodes(tree, "BinaryTest")]
+    pairs = [(c[i], c[i + 1]) for c in commands(source, shell) for i in range(len(c) - 1)]
+    pairs += [(test["Op"], word(test["Y"])) for _, tree in scripts(source, shell) for test in nodes(tree, "BinaryTest")]
     return {status for op, status in pairs if op in ("=", "==") and re.fullmatch(r"\d{3}", status)}
 
 
@@ -223,24 +231,42 @@ def unsafe_calls(text, shell="sh"):
     return unsafe
 
 
+def parents(tree):
+    """Each node's parent node, by id."""
+    found = {}
+    for node in nodes(tree):
+        for value in node.values():
+            for child in value if isinstance(value, list) else [value]:
+                if isinstance(child, dict):
+                    found[id(child)] = node
+    return found
+
+
+def status_lost(node, parent):
+    """Whether what encloses a command discards its failure: ! or & on it, or a | or || it is the left side
+    of, through any group, subshell or && around it. A later statement in the same list is the shortcut below."""
+    child = node
+    while (up := parent.get(id(child))) is not None:
+        if up.get("Negated") or up.get("Background") or (up.get("Type") == "BinaryCmd" and up["X"] is child and up["Op"] != "&&"):
+            return True
+        if up.get("Type") in ("Block", "Subshell") and up["Stmts"][-1] is not child:
+            return False
+        if up.get("Type") not in (None, "BinaryCmd", "Block", "Subshell"):
+            return False  # a function body, $(...), an if or a loop: its status goes to whoever reads it
+        child = up
+    return False
+
+
 # shortcut: a status reset by a later command (|| { …; false; }; true) is not seen; gate tests catch it in a gate, so check what follows a branch when a doc writes one outside.
 def open_failures(text, shell="sh"):
     """Failure branches that print (|| echo …, || { echo …; }, || ( echo … )) but exit 0: the branch
-    does not end in false, return 1 or exit 1 (not negated or in the background), the list is sent to the
-    background, or a later | or || takes over its status. A compound command after || (if, case, a loop) is refused: write the
+    does not end in false, return 1 or exit 1 (not negated or in the background), or what encloses it
+    discards its status (status_lost). A compound command after || (if, case, a loop) is refused: write the
     branch as { …; }."""
     found = []
     for script, tree in scripts(text, shell):
-        ors = [node for node in nodes(tree, "BinaryCmd") if node["Op"] == "||"]
-        # Nobody waits for a list sent to the background, and in (a || b) && c || d, d sets the status.
-        overridden = {id(n) for stmt in nodes(tree) if stmt.get("Background") for n in nodes(stmt, "BinaryCmd")}
-        for node in ors:
-            inner = node["X"]["Cmd"]
-            while inner.get("Type") == "BinaryCmd" and inner["Op"] in ("&&", "||"):
-                if inner["Op"] == "||":
-                    overridden.add(id(inner))
-                inner = inner["X"]["Cmd"]
-        for node in ors:
+        parent = parents(tree)
+        for node in (node for node in nodes(tree, "BinaryCmd") if node["Op"] == "||"):
             branch = node["Y"]["Cmd"]  # a | after a group binds to it, so a pipeline is the branch
             printed = any(prints(words(call)) for call in nodes(branch, "CallExpr"))
             last = branch.get("Stmts", [{}])[-1]
@@ -250,16 +276,21 @@ def open_failures(text, shell="sh"):
                 and last.get("Cmd", {}).get("Type") == "CallExpr"
                 and words(last["Cmd"]) in FAILS
             )
-            if branch["Type"] in COMPOUND or (printed and (not fails or id(node) in overridden)):
+            if branch["Type"] in COMPOUND or (printed and (not fails or status_lost(node, parent))):
                 found.append(span(script, node))
     return found
 
 
+def is_gate(source, shell):
+    """Whether a function prints STOP when its check fails, in a heredoc body too."""
+    return any(prints(c) and any(w.startswith("STOP") for w in c) for c in commands(source, shell))
+
+
 GATES = [
-    pytest.param(path, name, source, shell, id=f"{os.path.relpath(path, ROOT)}:{name}")
+    pytest.param(path, name, source, shell, scope, id=f"{os.path.relpath(path, ROOT)}:{name}")
     for path in DOCS
-    for name, source, shell in functions(path)
-    if any(prints(c) and any(w.startswith("STOP") for w in c) for c in commands(source, shell))
+    for name, source, shell, scope in functions(path)
+    if is_gate(source, shell)
 ]
 
 
@@ -273,7 +304,7 @@ def fakes(tmp_path_factory):
 
 
 def test_the_runbook_gates_are_found():
-    assert {name for _, name, _, _ in (gate.values for gate in GATES)} >= {"closed", "keyless"}
+    assert {gate.values[1] for gate in GATES} >= {"closed", "keyless"}
 
 
 def test_functions_are_found_in_every_form_sh_and_bash_allow(tmp_path):
@@ -283,20 +314,46 @@ def test_functions_are_found_in_every_form_sh_and_bash_allow(tmp_path):
         "ssh h sh <<'EOF'\nk() {\n  echo STOP\n}\nEOF\n```\n\n"
         "```bash\nfunction c {\n  echo STOP\n}\nfunction d() { echo STOP; }\n```\n"
     )
-    assert [(name, source, shell) for name, source, shell in functions(str(doc))][-3:] == [
-        ("k", "k() {\n  echo STOP\n}", "sh"), ("c", "function c {\n  echo STOP\n}", "bash"), ("d", "function d() { echo STOP; }", "bash"),
-    ]
-    assert [(name, shell) for name, _, shell in functions(str(doc))] == [
+    found = functions(str(doc))
+    assert [(name, shell) for name, _, shell, _ in found] == [
         ("a", "sh"), ("b", "sh"), ("e", "sh"), ("f", "sh"), ("k", "sh"), ("c", "bash"), ("d", "bash"),
     ]
+    assert found[4:] == [  # a heredoc body runs in a shell of its own, so it is k's scope
+        ("k", "k() {\n  echo STOP\n}", "sh", "k() {\n  echo STOP\n}"),
+        ("c", "function c {\n  echo STOP\n}", "bash", None),
+        ("d", "function d() { echo STOP; }", "bash", None),
+    ]
 
 
-def test_the_fake_curl_fails_with_body_as_curl_does(fakes):
-    result = subprocess.run(
-        [fakes / "curl", "-sS", "--fail-with-body", "-X", "DELETE", "https://example.invalid"],
-        env={**os.environ, "FAKE_ANSWER": "500"}, capture_output=True, text=True, check=False,
+@pytest.mark.parametrize(
+    "source,gate",
+    [
+        ('g() { c || echo "STOP: failed"; }', True),
+        ("g() {\n  ssh h sh <<'EOF'\nc || echo 'STOP: failed'\nEOF\n}", True),
+        ("g() { echo OK; }", False),
+    ],
+)
+def test_a_gate_is_a_function_that_prints_stop(source, gate):
+    assert is_gate(source, "sh") == gate
+
+
+@pytest.mark.parametrize(
+    "args,answer,result",
+    [
+        (["-sS", "--fail-with-body", "-X", "DELETE"], "500", (22, "answer 500\n")),
+        (["-fX", "DELETE"], "500", (22, "")),
+        (["-sSfX", "DELETE"], "500", (22, "")),
+        (["-sSXDELETE"], "500", (0, "answer 500\n")),
+        (["--request", "DELETE", "--fail"], "500", (22, "")),
+        (["--request=DELETE", "--fail"], "500", (22, "")),
+    ],
+)
+def test_the_fake_curl_reads_options_as_curl_does(fakes, args, answer, result):
+    run = subprocess.run(
+        [fakes / "curl", *args, "https://example.invalid"],
+        env={**os.environ, "FAKE_ANSWER": answer}, capture_output=True, text=True, check=False,
     )
-    assert (result.returncode, result.stdout) == (22, "answer 500\n"), result.stderr
+    assert (run.returncode, run.stdout) == result, run.stderr
 
 
 def test_a_block_is_read_in_its_own_dialect(tmp_path):
@@ -322,17 +379,18 @@ def test_every_fence_that_may_hold_shell_is_read(tmp_path):
     [
         ("sh", 'g() { [ "$(c)" = "302" ] || echo STOP; }', {"302"}),
         ("bash", "g() { [[ $c == 401 ]] || echo STOP; }", {"401"}),
+        ("sh", "g() {\n  ssh h sh <<'EOF'\n[ \"$(c)\" = 302 ] || echo STOP\nEOF\n}", {"302"}),
     ],
 )
 def test_a_gate_waits_for_the_status_it_compares_against(shell, source, status):
     assert waits_for(source, shell) == status
 
 
-@pytest.mark.parametrize("path,name,source,shell", GATES)
-def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, name, source, shell):
+@pytest.mark.parametrize("path,name,source,shell,scope", GATES)
+def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, name, source, shell, scope):
     status = waits_for(source, shell)
     assert len(status) == 1, f"{name} compares against {status or 'no status'}; a gate waits for one"
-    defined = "".join(f"{s}\n" for _, s, block_shell in functions(path) if block_shell == shell)
+    defined = "".join(f"{s}\n" for _, s, sh, sc in functions(path) if (sh, sc) == (shell, scope))
     env = {**os.environ, "PATH": f"{fakes}:{os.environ['PATH']}"}
     passed = set()
     for answer in ANSWERS:
@@ -406,6 +464,11 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ("check || { echo STOP; false; } &", 1),
         ("check || { echo STOP; false; } >/dev/null &", 1),
         ("(check || { echo STOP; false; }) &\nwait", 1),
+        ("! (check || { echo STOP; false; })", 1),
+        ("(check || { echo STOP; false; }) | cat", 1),
+        ("(check || { echo STOP; false; }) && next || true", 1),
+        ("(check || { echo STOP; false; }) || true", 1),
+        ("cat | (check || { echo STOP; false; })\n{ check || { echo STOP; return 1; }; } && next", 0),
         ("check || ! { echo STOP; false; }", 1),
         ("ssh h <<'EOF'\ncheck || echo STOP\nEOF", 1),
         ("check 2>&1 || { echo STOP; false; }\ncheck || ( echo STOP; exit 1 )", 0),
