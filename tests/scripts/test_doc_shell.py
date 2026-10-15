@@ -23,10 +23,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 DOCS = [os.path.join(ROOT, "README.md"), *sorted(glob.glob(os.path.join(ROOT, "docs", "**", "*.md"), recursive=True))]
 MARKDOWN = MarkdownIt("commonmark")
 SHELLS = ("", "sh", "bash", "shell", "zsh")  # an untagged block may hold shell, so it is read too
-PLACEHOLDER = re.compile(r"<([A-Za-z](?:[\w ./:-]*\w)?)>")  # <port>, <key file>, <host:port>: the operator types a value there
+PLACEHOLDER = re.compile(r"<([A-Za-z](?:[\w ./:@+-]*\w)?)>")  # <port>, <key file>, <host:port>, <a@b.c>: a value typed there
 COMPOUND = ("IfClause", "CaseClause", "WhileClause", "ForClause")
 ANSWERS = ("200", "302", "401", "403", "404", "500", "refused")
 PRINTS = ("echo", "printf")
+PSQL_VARIABLE = re.compile(r"(?<!:):(?:['\"]?[A-Za-z_]|\{\?)")  # :name, :'name', :"name", :{?name}
 FAILS = (["false"], ["return", "1"], ["exit", "1"])
 
 # Answers $FAKE_ANSWER. Refuses any option the docs do not use, so a new flag
@@ -92,10 +93,10 @@ def blocks(path):
 
 
 def shell_in(path):
-    """A doc's shell blocks, then its inline commands that call curl, as (bash or sh, text)."""
+    """A doc's shell blocks, then its inline commands that call curl or psql, as (bash or sh, text)."""
     with open(path) as fh:
         spans = [c.content for t in MARKDOWN.parse(fh.read()) if t.type == "inline" for c in t.children if c.type == "code_inline"]
-    return [("bash" if language == "bash" else "sh", text) for language, text in blocks(path)] + [("sh", s) for s in spans if "curl" in s]
+    return [("bash" if language == "bash" else "sh", text) for language, text in blocks(path)] + [("sh", s) for s in spans if "curl" in s or "psql" in s]
 
 
 @functools.cache
@@ -147,9 +148,9 @@ def scripts(text, shell, dialect=None):
 def unquote(part, quoted=False):
     """A word part as sh reads it: quotes and escapes removed, an expansion read as $ since its value is unknown."""
     if part["Type"] == "Lit":
-        return re.sub(r'\\([$`"\\])' if quoted else r"\\(.)", r"\1", part["Value"])
+        return re.sub(r'\\([$`"\\])' if quoted else r"\\(.)", r"\1", part.get("Value", ""))
     if part["Type"] == "SglQuoted":
-        return part["Value"]
+        return part.get("Value", "")  # '' has no Value
     if part["Type"] == "DblQuoted":
         return "".join(unquote(p, quoted=True) for p in part.get("Parts", []))
     return "$"
@@ -195,14 +196,35 @@ def waits_for(source, shell):
     return {status for op, status in pairs if op in ("=", "==") and re.fullmatch(r"\d{3}", status)}
 
 
-def curl_options_with_an_argument():
-    """The options curl itself lists as taking an argument (<file>, or [protocol://]host for --proxy), so a
-    -f after one is read as its argument."""
-    help_text = subprocess.run(["curl", "--help", "all"], capture_output=True, text=True, check=True).stdout
-    return {opt for pair in re.findall(r"^\s*(?:(-\w), )?(--[\w.-]+) [<\[]", help_text, re.MULTILINE) for opt in pair if opt}
+def options_with_an_argument(*command, pattern):
+    """The options a tool's own help lists as taking an argument, so the word after one is its value, not an option."""
+    help_text = subprocess.run(command, capture_output=True, text=True, check=True).stdout
+    return {opt for match in re.findall(pattern, help_text, re.MULTILINE) for opt in match if opt}
 
 
-CURL_ARGS = curl_options_with_an_argument()
+# curl shows the argument as <file>, or as [protocol://]host for --proxy; psql as --dbname=DBNAME.
+CURL_ARGS = options_with_an_argument("curl", "--help", "all", pattern=r"^\s*(?:(-\w), )?(--[\w.-]+) [<\[]")
+PSQL_ARGS = options_with_an_argument("psql", "--help", pattern=r"^\s+(-\w), (--[\w-]+)=(?:, (--[\w-]+)=)?")
+
+
+def options(args, takes):
+    """A command's arguments as (option, value) pairs, read as the tool reads them: -sSX DELETE is -s, -S and
+    -X DELETE, and an option in takes consumes its argument. An operand comes back as (None, operand)."""
+    found, rest = [], list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg.startswith("--"):
+            name, eq, value = arg.partition("=")
+            found.append((name, value if eq else rest.pop(0) if name in takes and rest else None))
+        elif re.match(r"-[a-zA-Z0-9]", arg):
+            for n, c in enumerate(arg[1:], 1):
+                if f"-{c}" in takes:
+                    found.append((f"-{c}", arg[n + 1 :] or (rest.pop(0) if rest else "")))
+                    break
+                found.append((f"-{c}", None))
+        else:
+            found.append((None, arg))
+    return found
 
 
 # shortcut: the PUT that -T (upload a file) implies is not modelled; model it when a doc uploads with curl.
@@ -214,23 +236,9 @@ def unsafe_calls(text, shell="sh"):
         for call in nodes(tree, "CallExpr"):
             if "curl" not in (command := words(call)):
                 continue
-            method, fails, rest = None, False, command[command.index("curl") + 1 :]
-            while rest:
-                arg = rest.pop(0)
-                if arg in ("--fail", "--fail-with-body"):
-                    fails = True
-                elif arg.startswith("--request="):
-                    method = arg[len("--request=") :]
-                elif arg.startswith("--") and arg in CURL_ARGS:
-                    value = rest.pop(0) if rest else ""
-                    method = value if arg == "--request" else method
-                elif re.match(r"-[a-zA-Z]", arg):
-                    for n, c in enumerate(arg[1:], 1):
-                        fails = fails or c == "f"
-                        if f"-{c}" in CURL_ARGS:
-                            value = arg[n + 1 :] or (rest.pop(0) if rest else "")
-                            method = value if c == "X" else method
-                            break
+            given = options(command[command.index("curl") + 1 :], CURL_ARGS)
+            fails = any(name in ("-f", "--fail", "--fail-with-body") for name, _ in given)
+            method = next((value for name, value in reversed(given) if name in ("-X", "--request")), None)
             if method and (method.upper() in ("PUT", "PATCH", "DELETE") or "$" in method) and not fails:
                 unsafe.append(span(script, call))
     return unsafe
@@ -263,6 +271,49 @@ def status_lost(node, parent):
             return False  # a function body, $(...), an if's or a loop's body: its status goes to whoever reads it
         child = up
     return False
+
+
+def fed(script, node):
+    """What the commands under node write: echo and printf words, and heredoc and here-string bodies."""
+    text = [w for command in map(words, nodes(node, "CallExpr")) if prints(command) for w in command]
+    for stmt in nodes(node):
+        for redirect in stmt.get("Redirs") or []:
+            if redirect.get("Hdoc") or redirect.get("Op") == "<<<":  # an expansion in either reads as $
+                text.append(word(redirect.get("Hdoc") or redirect["Word"]))
+    return text
+
+
+def piped_into(script, node, parent):
+    """What a pipe feeds a command, through any group, subshell or list around it."""
+    while (up := parent.get(id(node))) is not None:
+        if up.get("Type") == "BinaryCmd" and up["Op"] in ("|", "|&"):
+            return fed(script, up["X"]) if up["Y"] is node else []
+        if up.get("Type") not in (None, "Block", "Subshell", "BinaryCmd"):
+            return []
+        node = up
+    return []
+
+
+# shortcut: psql's syntax is read with regexes, so a :name or <a b> in an SQL comment or string counts (fails red),
+# an abbreviated --comm is not resolved, and SQL from < file is not read; parse the SQL when a doc needs one of these.
+def pasted_values(text, shell="sh"):
+    """psql calls whose SQL takes a value other than as a psql variable (-v name=... and :'name' in SQL read
+    from stdin): a shell expansion or <placeholder> in the SQL from -c, a heredoc, a here-string or what a pipe
+    feeds in, or a psql variable in -c, which psql substitutes only in what it reads. Words are read as sh
+    reads them, so an expansion, a backtick or a <placeholder> shows as $, and a literal $ counts too."""
+    found = []
+    for script, tree, _ in scripts(text, shell):
+        parent = parents(tree)
+        for call in nodes(tree, "CallExpr"):
+            command = words(call)
+            at = next((i for i, w in enumerate(command) if os.path.basename(w) == "psql"), None)
+            if at is None:
+                continue
+            inline = [value for name, value in options(command[at + 1 :], PSQL_ARGS) if name in ("-c", "--command")]
+            sql = inline + fed(script, parent[id(call)]) + piped_into(script, parent[id(call)], parent)
+            if any("$" in s for s in sql) or any(PSQL_VARIABLE.search(s) for s in inline):
+                found.append(span(script, call))
+    return found
 
 
 # shortcut: a status reset by a later command (|| { …; false; }; true) is not seen; gate tests catch it in a gate, so check what follows a branch when a doc writes one outside.
@@ -430,6 +481,7 @@ def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, 
         ("curl --user-agent -f -X DELETE https://x", 1),
         ("curl -A -f -X DELETE https://x", 1),
         ("curl -x -f -X DELETE https://x", 1),
+        ("curl -4X DELETE https://x", 1),
         ("curl -sS -X <METHOD> https://x", 1),
         ("ssh h <<'EOF'\ncurl -X DELETE https://x\nEOF", 1),
         ("psql <<'SQL'\nselect 1 from (t);\nSQL\ncurl -f -X DELETE https://x", 0),
@@ -500,3 +552,50 @@ def test_the_branch_check_finds_failure_branches_that_exit_0(shell, found):
 @pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
 def test_every_failure_branch_ends_in_failure(path):
     assert [branch for shell, text in shell_in(path) for branch in open_failures(text, shell)] == []
+
+
+@pytest.mark.parametrize(
+    "shell,found",
+    [
+        ("pg psql -d hindsight -Atc \"select id from agent_keys.keys where email = '<email>'\"", 1),
+        ('pg psql -d hindsight -Atc "select status, count(*) from <schema>.async_operations group by 1"', 1),
+        ("psql -X -c \"select 1 where email = '$email'\"", 1),
+        ("pg psql -At -v email=\"$email\" -c \"select 1 where email = :'email'\"", 1),
+        ('psql --command="select count(*) from :\\"schema\\".async_operations"', 1),
+        ("echo \"select 1 where email = '<email>'\" | pg psql -d hindsight", 1),
+        ("printf '%s\\n' \"select 1 where email = '$email'\" | psql", 1),
+        ("pg psql -d hindsight <<'SQL'\nselect 1 where email = '<email>';\nSQL", 1),
+        ("cat <<'SQL' | pg psql -d hindsight\nselect id from agent_keys.keys where email = '<email>';\nSQL", 1),
+        ("cat <<EOF | psql\nselect 1 where email = '$email';\nEOF", 1),
+        ("pg psql -d hindsight <<SQL\nselect 1 where email = '`cat email.txt`';\nSQL", 1),
+        ("{ cat <<SQL\nselect 1 where email = '`cat email.txt`';\nSQL\n} | pg psql -d hindsight", 1),
+        ("pg psql -d hindsight -Atc \"select id from agent_keys.keys where email = '<owner@example.com>'\"", 1),
+        ("echo \"select 1 where email = '<first+tag@example.com>'\" | pg psql -d hindsight", 1),
+        ("bash <<'EOF'\npg psql -d hindsight -At <<< \"select 1 where email = '<email>'\"\nEOF", 1),
+        ("{ echo \"select 1 where email = '<email>'\"; } | pg psql -d hindsight", 1),
+        ("( echo \"select 1 where email = '$email'\" ) | psql", 1),
+        ("echo \"select 1 where email = '<email>'\" | tee /dev/stderr | pg psql -d hindsight", 1),
+        ("\"$d/bin/psql\" -d hindsight -Atc \"select 1 where email = '<email>'\"", 1),
+        ("psql -v id=\"$id\" -Atc 'select 1 where id = :id'", 1),
+        ("psql -Atc 'select :{?e}'", 1),
+        ("cat \"$file\" | pg psql -d hindsight\necho '' | psql -Atc 'select 1'", 0),
+        (
+            (
+                "read -r -p 'Email: ' email &&\n  echo \"select id from agent_keys.keys where email = :'email'\" |\n"
+                "  pg psql -X -d hindsight -At -v email=\"$email\""
+            ),
+            0,
+        ),
+        ("pg psql -d hindsight -Atc 'select role, email from agent_keys.allowlist order by 1, 2'", 0),
+        ('pg psql -X -d hindsight -v schema="$schema" -v operator="$operator" < /root/purge-schema.sql', 0),
+        ("pg psql -U \"$user\" -h <host> -Atc 'select x::text from t'", 0),
+        ("echo \"$x\" | grep y", 0),
+    ],
+)
+def test_the_sql_check_finds_values_pasted_into_sql(shell, found):
+    assert len(pasted_values(shell)) == found
+
+
+@pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
+def test_every_sql_value_is_a_psql_variable(path):
+    assert [sql for shell, text in shell_in(path) for sql in pasted_values(text, shell)] == []
