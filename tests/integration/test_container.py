@@ -11,13 +11,16 @@ import json
 import os
 import re
 import secrets
+import shlex
 import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
+from markdown_it import MarkdownIt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IMAGE = os.environ.get("IMAGE", "hindsight-agent-keys:test")
@@ -718,16 +721,20 @@ def test_revoke_identity_disables_every_key_the_person_holds(hindsight):
     ]
 
 
-# psql from pg0's own installation, as the operator runs it (docs/cutover.md).
-PSQL = 'd=$(ls -d /home/hindsight/.pg0/installation/*/ | tail -1); LD_LIBRARY_PATH="$d/lib" exec "$d/bin/psql" "$@"'
+# A tool named by $0 (psql) from pg0's own installation, as the operator runs it (docs/cutover.md).
+PG0 = 'd=$(ls -d /home/hindsight/.pg0/installation/*/ | tail -1); LD_LIBRARY_PATH="$d/lib" exec "$d/bin/$0" "$@"'
+
+
+def database_uri(container):
+    return in_container(container, "import json\nfrom pg0 import Pg0\nprint(json.dumps(Pg0(name='hindsight').info().uri))")
 
 
 def purge(container, **variables):
     """Run scripts/purge-schema.sql on stdin, with these psql variables."""
-    uri = in_container(container, "import json\nfrom pg0 import Pg0\nprint(json.dumps(Pg0(name='hindsight').info().uri))")
+    uri = database_uri(container)
     with open(os.path.join(ROOT, "scripts", "purge-schema.sql")) as script:
         return subprocess.run(
-            ["docker", "exec", "-i", container, "sh", "-c", PSQL, "psql", "-X", uri,
+            ["docker", "exec", "-i", container, "sh", "-c", PG0, "psql", "-X", uri,
              *(f"--set={k}={v}" for k, v in variables.items())],
             stdin=script, capture_output=True, text=True, timeout=300, check=False,
         )
@@ -797,6 +804,57 @@ def test_a_stale_personal_schema_is_reported_to_admins_and_purged_only_by_the_op
     # Gina's next personal key gets a new schema.
     personal_key(hindsight, gina)
     assert query(name, f"SELECT schema FROM agent_keys.people WHERE email = '{gina}'")[0]["schema"] not in (None, schema)
+
+
+def doc_block(path, containing):
+    """The one fenced block in a doc that contains this text, exactly as the doc writes it."""
+    with open(os.path.join(ROOT, path)) as fh:
+        found = [t.content for t in MarkdownIt("commonmark").parse(fh.read()) if t.type == "fence" and containing in t.content]
+    assert len(found) == 1, f"{path}: {len(found)} blocks contain {containing!r}"
+    return found[0]
+
+
+def run_doc(container, block, answers, **env):
+    """Run a doc's shell block on the host as an operator who types answers at its prompts, with these shell
+    variables set and the runbook's pg helper reaching this container's database."""
+    uri = urllib.parse.urlsplit(database_uri(container))
+    pg_env = {"PGHOST": uri.hostname, "PGPORT": str(uri.port), "PGUSER": uri.username, "PGPASSWORD": uri.password}
+    pg = f'pg() {{ docker exec -i -e PGHOST -e PGPORT -e PGUSER -e PGPASSWORD {container} sh -c {shlex.quote(PG0)} "$@"; }}'
+    return subprocess.run(
+        ["sh", "-c", f"{pg}\n{block}"], input=answers, env={**os.environ, **pg_env, **env},
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+
+
+def test_the_operating_guides_check_lists_every_key_of_a_revoked_identity_as_revoked(hindsight):
+    owner = "o'connor@example.test"  # a valid address that breaks SQL with the value pasted in
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": owner, "role": "member"})[0] == 204
+    for name in ("one", "two"):
+        personal_key(hindsight, owner, name=name)
+    status, text = key_page(hindsight, "POST", "/ext/admin/revoke-identity", ALICE, body={"email": owner})
+    assert status == 200, text
+    run = run_doc(hindsight["name"], doc_block("docs/operating.md", "where email = :'email'"), f"{owner}\n")
+    assert run.returncode == 0, run.stdout + run.stderr
+    rows = [line.split("|") for line in run.stdout.splitlines()]
+    assert len(rows) == 2 and all(revoked_at for *_, revoked_at in rows), run.stdout
+
+
+def test_the_readmes_purge_recovery_puts_the_schema_back_on_the_list_once(hindsight):
+    name, owner = hindsight["name"], "d'arcy@example.test"
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": owner, "role": "member"})[0] == 204
+    personal_key(hindsight, owner)
+    quoted = owner.replace("'", "''")
+    owned = f"SELECT schema FROM agent_keys.people WHERE email = '{quoted}'"
+    schema = query(name, owned)[0]["schema"]
+    # As a purge leaves it when it stops after step 1.
+    query(name, f"UPDATE agent_keys.people SET schema = NULL WHERE email = '{quoted}' RETURNING email")
+    block = doc_block("README.md", "read -r -p 'Owner email: ' owner")
+    run = run_doc(name, block, f"{owner}\n", schema=schema)
+    assert (run.returncode, run.stdout.splitlines()) == (0, [owner, "UPDATE 1"]), run.stderr
+    assert query(name, owned) == [{"schema": schema}]
+    # Once the owner holds a schema, it returns no row and changes nothing.
+    run = run_doc(name, block, f"{owner}\n", schema=schema)
+    assert (run.returncode, run.stdout.splitlines()) == (0, ["UPDATE 0"]), run.stderr
 
 
 def test_the_bundled_ui_is_not_listening(hindsight):

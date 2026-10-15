@@ -52,7 +52,14 @@ For someone who leaves, or whose keys must stop now:
 
 Their personal schema stays. It is listed as stale 90 days after their last key stopped working, and can then be purged (below).
 
-To check from the CT *(not verified)*: `pg psql -d hindsight -Atc "select id, kind, schema, revoked_at from agent_keys.keys where email = '<email>'"` shows a `revoked_at` on every key.
+To check from the CT, type their email; every key it lists shows a `revoked_at` *(not verified on Dev; runs in the integration tests)*:
+
+```sh
+# CT
+read -r -p 'Email: ' email &&
+  echo "select id, kind, schema, revoked_at from agent_keys.keys where email = :'email'" |
+  pg psql -X -d hindsight -At -v email="$email"
+```
 
 ## Teams
 
@@ -104,12 +111,14 @@ The README's "Troubleshooting" table maps each symptom to its cause. These are t
 - **An Agent Key** `hsk_<id>_<secret>`: this shows which rule refuses it *(not verified)*.
 
   ```sh
-  # CT
-  pg psql -d hindsight -Atc "select k.kind, k.schema, k.expires_at, k.revoked_at, a.role, s.last_seen,
-    k.kind = 'team' and k.schema <> 'public' and not exists (select 1 from agent_keys.members m
-      where m.team = k.schema and m.email = k.email) as left_team
-    from agent_keys.keys k left join agent_keys.allowlist a on a.email = k.email
-    left join agent_keys.sign_ins s on s.email = k.email where k.id = '<id>'"
+  # CT: type the <id> part of the key
+  read -r -p 'Key ID: ' id &&
+    echo "select k.kind, k.schema, k.expires_at, k.revoked_at, a.role, s.last_seen,
+      k.kind = 'team' and k.schema <> 'public' and not exists (select 1 from agent_keys.members m
+        where m.team = k.schema and m.email = k.email) as left_team
+      from agent_keys.keys k left join agent_keys.allowlist a on a.email = k.email
+      left join agent_keys.sign_ins s on s.email = k.email where k.id = :'id'" |
+    pg psql -X -d hindsight -At -v id="$id"
   ```
 
   | Result | Cause |
@@ -137,7 +146,16 @@ Background tasks, such as an async retain, stay `pending` in one person's or one
 
    A personal schema missing from it was purged, or a purge stopped after unlisting it (README, "Stale personal schemas").
 2. **Can the extension read its tables?** If the log shows `agent-keys: could not list tenants; using the last list`, the worker keeps the list it had, so schemas created since then are not processed. It picks them up once the database answers again.
-3. **What is waiting?** `pg psql -d hindsight -Atc "select status, count(*) from <schema>.async_operations group by 1"` *(not verified)*. A `failed` operation whose error names the LLM provider is a problem with the LLM credentials, not with this image.
+3. **What is waiting?** Type the schema *(not verified)*:
+
+   ```sh
+   # CT
+   read -r -p 'Schema: ' schema &&
+     echo 'select status, count(*) from :"schema".async_operations group by 1' |
+     pg psql -X -d hindsight -At -v schema="$schema"
+   ```
+
+   A `failed` operation whose error names the LLM provider is a problem with the LLM credentials, not with this image.
 4. **After a rollback to stock Hindsight**, only `public` is processed: stock does not list the other schemas. Their data stays until the image comes back.
 
 If `public` itself is not processed, check the startup log for its migration (README, "Troubleshooting").

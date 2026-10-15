@@ -130,7 +130,7 @@ read -r -p 'Schema ID to purge: ' schema && read -r -p 'Your email: ' operator &
 psql stops at the first error with a non-zero status. If the output ends at `Unlisted` followed by `no rows returned for \gset`, step 3 found the schema in use again and dropped nothing: it is back on the tenant list with its owner, so the worker processes it and their keys created since step 1 work, while the keys step 1 revoked stay revoked. Purge it only if `/ext/admin` lists it as stale again. If the output ends at `Unlisted` with any other error, step 3 failed: no key reaches the schema and its data is intact. Put it back on the list, passing both values as psql variables (psql substitutes them only in input it reads, never in `-c`), and run the script again:
 
 ```sh
-# CT (not verified)
+# CT (not verified on Dev; runs in the integration tests)
 read -r -p 'Owner email: ' owner &&
   echo "UPDATE agent_keys.people SET schema = :'schema' WHERE email = :'owner' AND schema IS NULL RETURNING email" |
   pg psql -X -d hindsight -At -v ON_ERROR_STOP=1 -v schema="$schema" -v owner="$owner"
@@ -161,20 +161,21 @@ Unit tests run inside the pinned upstream image, which ships `hindsight_api` and
 scripts/unit-tests.sh -v
 ```
 
-Integration tests start the real container on Hindsight's mock LLM, so they need no credentials. They need Docker and pytest on the host:
+Integration tests start the real container on Hindsight's mock LLM, so they need no credentials. They also run the README's purge recovery and the operating guide's check of a revoked identity's keys as written, with an owner whose email holds an apostrophe. They need Docker, pytest and markdown-it-py on the host:
 
 ```sh
 docker build -t hindsight-agent-keys:test .
-uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
+uv run --no-project --with pytest==9.0.3 --with markdown-it-py==4.2.0 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
 Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They also check the shell this README and `docs/` give operators (`tests/scripts/test_doc_shell.py`), in every fenced block tagged `sh`, `bash`, `shell` or `zsh`, or not tagged. Blocks are found with a CommonMark parser (markdown-it-py), and their shell is read from shfmt's syntax tree, as bash in a `bash` block and POSIX sh otherwise, with any heredoc body that reads as shell (a script fed to `ssh` or `sh`), read as bash, which takes all sh syntax too. Shell inside a quoted string (`sh -c '…'`) is not read. A placeholder such as `<port>` reads as a value not yet known, like `$port`. A block that is not shell needs a tag such as `text`, or the tests stop at it:
 
 - Each gate, a function that prints STOP when its check fails, runs under `bash` in a `bash` block and under `sh` otherwise, with the functions its block's shell has. A gate in a heredoc body runs under `bash` when the command it is fed to names bash (`ssh h bash`), else under `sh`, with only that body's functions. against fake `curl` and `cloudflared` answering 200, 302, 401, 403, 404, 500 and a refused connection. It must succeed only on the status it waits for. Every function a block defines, in a heredoc body too, is found, whatever its form.
 - A `curl` that sends PUT, PATCH or DELETE, or a method held in a variable or a placeholder, uses `-f`, in a shell block or an inline command. Options are read as curl reads them, so `-sSX DELETE` counts; the options that take an argument come from `curl --help all`.
+- SQL takes each value as a psql variable, in a shell block or an inline command: `-v name=…` with `:'name'` in SQL that psql reads from stdin. The SQL psql runs (its `-c`, a heredoc or here-string, or what `echo` or `printf` pipes in, also through a group or a longer pipeline) holds no shell expansion or `<placeholder>`, and its `-c` holds no psql variable (`:name`, `:'name'`, `:"name"`), since psql substitutes them only in what it reads. A `$` in that SQL counts as a value. psql's options come from `psql --help`.
 - A failure branch that prints (`|| echo …`, `|| { echo …; }`, `|| ( echo … )`, or the same with `printf`) ends in `false`, `return 1` or `exit 1` (not negated with `!` or sent to the background), and nothing around it discards its status: `!` or `&` on it, a later `|` or `||`, or an `if` or loop condition, also around a group, subshell or `time` that holds it. A compound command after `||` (`if`, `case`, a loop) is refused: write the branch as `{ …; }`.
 
-They need git, jq and curl on the host, pytest and markdown-it-py in the Python that runs them, and shfmt on PATH (shfmt-py installs it):
+They need git, jq, curl and psql on the host, pytest and markdown-it-py in the Python that runs them, and shfmt on PATH (shfmt-py installs it):
 
 ```sh
 uv run --no-project --with pytest==9.0.3 --with markdown-it-py==4.2.0 --with shfmt-py==4.2.0 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
