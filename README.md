@@ -40,6 +40,8 @@ The guard is the image's entrypoint, so it runs even when the command is overrid
 | `HINDSIGHT_API_AUDIT_LOG_ACTIONS` is not `(none)` (parsed as upstream parses it: split on commas, spaces trimmed, empty entries dropped) | Any other list, including the empty one that means every action, lets a bank's stored `audit_log_enabled` write unauthenticated requests into the Public Team's audit log. |
 | `HINDSIGHT_API_MCP_STATELESS` is not `true` (read exactly as upstream reads it) | A stateful MCP session can keep a revoked key's identity. |
 
+Of these settings, a bank's stored config or a tenant's config can override only `audit_log_enabled`, which the `(none)` allowlist makes inert (see "Safe defaults"). Upstream applies a bank's stored config, whether written by the bank config API, a bank import or a clone, and a tenant's config only to the fields it marks configurable, and reads every other setting here from the environment alone. A unit test fails if an upstream release makes another of them configurable.
+
 ## Configuration
 
 | Variable | Meaning |
