@@ -1,4 +1,4 @@
-"""Checks the shell the README and docs give operators (CODING_STANDARDS rules 7 and 8).
+"""Checks the shell the README and docs give operators (CODING_STANDARDS rules 6, 7 and 8).
 
 Fenced blocks are found with markdown-it (CommonMark), and shell is read from
 shfmt's syntax tree. A gate is a doc function that prints STOP when its check
@@ -230,6 +230,8 @@ def options(args, takes):
     return found
 
 
+# shortcut: any word curl but the last starts a call (sudo curl, ssh h curl), so apt-get install curl jq reads as
+# curl jq; read the command word when a doc names curl as an argument.
 def curl_calls(text, shell="sh"):
     """Each curl call in shell text, as (its text, its words from curl on, or from cloudflared for
     cloudflared access curl). A bare curl, with no arguments, names the tool in prose and is skipped."""
@@ -238,7 +240,9 @@ def curl_calls(text, shell="sh"):
             command = words(call)
             if "curl" in command[:-1]:
                 at = command.index("curl")
-                yield span(script, call), command[at - 2 if command[at - 2 : at] == ["cloudflared", "access"] else at :]
+                if command[max(at - 2, 0) : at] == ["cloudflared", "access"]:
+                    at -= 2
+                yield span(script, call), command[at:]
 
 
 # shortcut: the PUT that -T (upload a file) implies is not modelled; model it when a doc uploads with curl.
@@ -258,7 +262,8 @@ def unsafe_calls(text, shell="sh"):
 def refusals(fakes, cwd, text, shell="sh"):
     """The curl calls the -f check accepts that the fake curl or cloudflared refuses when answering 200, each
     with the fake's complaint: a form the check reads that the fake does not model."""
-    unsafe, env = unsafe_calls(text, shell), {**os.environ, "PATH": f"{fakes}:{os.environ['PATH']}", "FAKE_ANSWER": "200"}
+    unsafe = unsafe_calls(text, shell)
+    env = {**os.environ, "PATH": f"{fakes}:{os.environ['PATH']}", "FAKE_ANSWER": "200"}
     found = []
     for call, command in curl_calls(text, shell):
         if call not in unsafe:
@@ -528,12 +533,12 @@ def test_the_f_check_finds_state_changing_calls_without_it(shell, found):
 
 @pytest.mark.parametrize(
     "shell,refused",
-    [(shell, 0) for shell, _ in F_CHECK_CASES]
-    + [("curl --user-agent x -f -X DELETE https://x", 1), ("cloudflared access curl https://x --proxy http://p -sSf", 1)],
+    [(shell, []) for shell, _ in F_CHECK_CASES]
+    + [("curl --user-agent x -f -X DELETE https://x", ["--user-agent"]), ("cloudflared access curl https://x --proxy http://p -sSf", ["--proxy"])],
 )
 def test_the_fakes_run_every_curl_call_the_f_check_accepts(fakes, tmp_path, shell, refused):
-    found = refusals(fakes, tmp_path, shell)
-    assert len(found) == refused, found
+    complaints = [complaint for _, complaint in refusals(fakes, tmp_path, shell)]
+    assert complaints == [f"fake curl: unsupported option {option}\n" for option in refused]
 
 
 @pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
