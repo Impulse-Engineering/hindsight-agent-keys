@@ -23,7 +23,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 DOCS = [os.path.join(ROOT, "README.md"), *sorted(glob.glob(os.path.join(ROOT, "docs", "**", "*.md"), recursive=True))]
 MARKDOWN = MarkdownIt("commonmark")
 SHELLS = ("", "sh", "bash", "shell", "zsh")  # an untagged block may hold shell, so it is read too
-PLACEHOLDER = re.compile(r"<([A-Za-z](?:[\w ./:-]*\w)?)>")  # <port>, <key file>, <host:port>: the operator types a value there
+PLACEHOLDER = re.compile(r"<([A-Za-z](?:[\w ./:@+-]*\w)?)>")  # <port>, <key file>, <host:port>, <a@b.c>: a value typed there
 COMPOUND = ("IfClause", "CaseClause", "WhileClause", "ForClause")
 ANSWERS = ("200", "302", "401", "403", "404", "500", "refused")
 PRINTS = ("echo", "printf")
@@ -278,10 +278,8 @@ def fed(script, node):
     text = [w for command in map(words, nodes(node, "CallExpr")) if prints(command) for w in command]
     for stmt in nodes(node):
         for redirect in stmt.get("Redirs") or []:
-            if redirect.get("Hdoc"):
-                text.append(span(script, redirect["Hdoc"]))
-            elif redirect.get("Op") == "<<<":
-                text.append(word(redirect["Word"]))
+            if redirect.get("Hdoc") or redirect.get("Op") == "<<<":  # an expansion in either reads as $
+                text.append(word(redirect.get("Hdoc") or redirect["Word"]))
     return text
 
 
@@ -301,7 +299,8 @@ def piped_into(script, node, parent):
 def pasted_values(text, shell="sh"):
     """psql calls whose SQL takes a value other than as a psql variable (-v name=... and :'name' in SQL read
     from stdin): a shell expansion or <placeholder> in the SQL from -c, a heredoc, a here-string or what a pipe
-    feeds in, or a psql variable in -c, which psql substitutes only in what it reads. A $ in that SQL counts."""
+    feeds in, or a psql variable in -c, which psql substitutes only in what it reads. Words are read as sh
+    reads them, so an expansion, a backtick or a <placeholder> shows as $, and a literal $ counts too."""
     found = []
     for script, tree, _ in scripts(text, shell):
         parent = parents(tree)
@@ -312,7 +311,7 @@ def pasted_values(text, shell="sh"):
                 continue
             inline = [value for name, value in options(command[at + 1 :], PSQL_ARGS) if name in ("-c", "--command")]
             sql = inline + fed(script, parent[id(call)]) + piped_into(script, parent[id(call)], parent)
-            if any("$" in s or PLACEHOLDER.search(s) for s in sql) or any(PSQL_VARIABLE.search(s) for s in inline):
+            if any("$" in s for s in sql) or any(PSQL_VARIABLE.search(s) for s in inline):
                 found.append(span(script, call))
     return found
 
@@ -568,6 +567,10 @@ def test_every_failure_branch_ends_in_failure(path):
         ("pg psql -d hindsight <<'SQL'\nselect 1 where email = '<email>';\nSQL", 1),
         ("cat <<'SQL' | pg psql -d hindsight\nselect id from agent_keys.keys where email = '<email>';\nSQL", 1),
         ("cat <<EOF | psql\nselect 1 where email = '$email';\nEOF", 1),
+        ("pg psql -d hindsight <<SQL\nselect 1 where email = '`cat email.txt`';\nSQL", 1),
+        ("{ cat <<SQL\nselect 1 where email = '`cat email.txt`';\nSQL\n} | pg psql -d hindsight", 1),
+        ("pg psql -d hindsight -Atc \"select id from agent_keys.keys where email = '<owner@example.com>'\"", 1),
+        ("echo \"select 1 where email = '<first+tag@example.com>'\" | pg psql -d hindsight", 1),
         ("bash <<'EOF'\npg psql -d hindsight -At <<< \"select 1 where email = '<email>'\"\nEOF", 1),
         ("{ echo \"select 1 where email = '<email>'\"; } | pg psql -d hindsight", 1),
         ("( echo \"select 1 where email = '$email'\" ) | psql", 1),
