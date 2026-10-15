@@ -116,8 +116,28 @@ def test_accepts_the_audit_allowlist_as_upstream_parses_it():
     assert problems(env(HINDSIGHT_API_AUDIT_LOG_ACTIONS=" (none) ,")) == []
 
 
+class RecordingEnv(dict):
+    """An environment that records every variable the guard reads, set or not."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.read = set()
+
+    def get(self, key, default=None):
+        self.read.add(key)
+        return super().get(key, default)
+
+    def __contains__(self, key):
+        self.read.add(key)
+        return super().__contains__(key)
+
+    def __getitem__(self, key):
+        self.read.add(key)
+        return super().__getitem__(key)
+
+
 # A bank's stored config (banks.config, written by the bank config API at config_resolver.py:697,
-# and verbatim by transfer import and clone at engine/transfer/importer.py:1063-1069) and a tenant's
+# and verbatim by transfer import and clone at engine/transfer/importer.py:1065-1071) and a tenant's
 # get_tenant_config() override only the fields upstream marks configurable (config_resolver.py:204
 # and 456, apply_strategy at 1039); the rest come from the environment alone. Of the settings the
 # guard checks, only audit_log_enabled is configurable (config.py:3786), and the guard's (none)
@@ -125,14 +145,9 @@ def test_accepts_the_audit_allowlist_as_upstream_parses_it():
 def test_no_bank_or_tenant_can_override_a_guarded_setting_but_audit_log_enabled():
     from hindsight_api.config import HindsightConfig, normalize_config_key
 
-    unsafe = {
-        "HINDSIGHT_API_MCP_AUTH_TOKEN": "",
-        "HINDSIGHT_API_DATABASE_SCHEMA": "sentinel",
-        "HINDSIGHT_API_AUDIT_LOG_ENABLED": "true",
-    }
-    # Each refusal starts with the variable it names.
-    guarded = {normalize_config_key(message.split()[0]) for message in problems(unsafe)}
-    assert len(guarded) == 9
+    recorded = RecordingEnv(SAFE)
+    problems(recorded)
+    guarded = {normalize_config_key(name) for name in recorded.read}
     assert guarded & HindsightConfig.get_configurable_fields() == {"audit_log_enabled"}
 
 
