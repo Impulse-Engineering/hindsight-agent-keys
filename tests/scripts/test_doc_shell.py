@@ -33,7 +33,7 @@ FAILS = (["false"], ["return", "1"], ["exit", "1"])
 FAKE_CURL = f"""#!{sys.executable}
 import os, sys
 takes = {{"-o": "o", "-w": "w", "-X": "X", "-H": "H", "-d": "d", "--data": "d", "--data-binary": "d"}}
-switches = {{"-s": "s", "-S": "S", "-f": "f", "--fail": "f"}}
+switches = {{"-s": "s", "-S": "S", "-f": "f", "--fail": "f", "--fail-with-body": "F"}}
 args, flags, values, urls = sys.argv[1:], set(), {{}}, []
 while args:
     arg = args.pop(0)
@@ -55,15 +55,16 @@ if "%{{" in fmt.replace("%{{http_code}}", ""):
 answer, error, status = os.environ["FAKE_ANSWER"], None, 0
 if answer == "refused":
     answer, error, status = "000", "(7) Failed to connect to example.invalid port 443: Couldn't connect to server", 7
-elif "f" in flags and int(answer) >= 400:
-    error, status = f"(22) The requested URL returned error: {{answer}}", 22
 else:
-    body = f"answer {{answer}}\\n"
-    if "o" in values:
-        with open(values["o"], "w") as out:
-            out.write(body)
-    else:
-        sys.stdout.write(body)
+    if flags & {{"f", "F"}} and int(answer) >= 400:
+        error, status = f"(22) The requested URL returned error: {{answer}}", 22
+    if not status or "F" in flags:  # -f writes no body on an HTTP error; --fail-with-body does
+        body = f"answer {{answer}}\\n"
+        if "o" in values:
+            with open(values["o"], "w") as out:
+                out.write(body)
+        else:
+            sys.stdout.write(body)
 sys.stdout.write(fmt.replace("%{{http_code}}", answer).replace("\\\\n", "\\n"))
 if error and ("S" in flags or "s" not in flags):
     print(f"curl: {{error}}", file=sys.stderr)
@@ -165,11 +166,11 @@ def commands(text, shell="sh"):
 
 
 def functions(path):
-    """Each shell function a doc defines, as (name, source, bash for a bash block or else sh)."""
+    """Each shell function a doc defines, in a heredoc body too, as (name, source, bash for a bash block or else sh)."""
     found = []
     for language, text in blocks(path):
         shell = "bash" if language == "bash" else "sh"
-        found += [(decl["Name"]["Value"], span(text, decl), shell) for decl in nodes(syntax_tree(text, shell), "FuncDecl")]
+        found += [(decl["Name"]["Value"], span(script, decl), shell) for script, tree in scripts(text, shell) for decl in nodes(tree, "FuncDecl")]
     return found
 
 
@@ -225,18 +226,19 @@ def unsafe_calls(text, shell="sh"):
 # shortcut: a status reset by a later command (|| { …; false; }; true) is not seen; gate tests catch it in a gate, so check what follows a branch when a doc writes one outside.
 def open_failures(text, shell="sh"):
     """Failure branches that print (|| echo …, || { echo …; }, || ( echo … )) but exit 0: the branch
-    does not end in false, return 1 or exit 1 (not negated or in the background), or a later | or ||
-    takes over its status. A compound command after || (if, case, a loop) is refused: write the
+    does not end in false, return 1 or exit 1 (not negated or in the background), the list is sent to the
+    background, or a later | or || takes over its status. A compound command after || (if, case, a loop) is refused: write the
     branch as { …; }."""
     found = []
     for script, tree in scripts(text, shell):
         ors = [node for node in nodes(tree, "BinaryCmd") if node["Op"] == "||"]
-        recovered = set()
-        for node in ors:  # (a || b) && c || d: when b fails, d runs and sets the status
+        # Nobody waits for a list sent to the background, and in (a || b) && c || d, d sets the status.
+        overridden = {id(n) for stmt in nodes(tree) if stmt.get("Background") for n in nodes(stmt, "BinaryCmd")}
+        for node in ors:
             inner = node["X"]["Cmd"]
             while inner.get("Type") == "BinaryCmd" and inner["Op"] in ("&&", "||"):
                 if inner["Op"] == "||":
-                    recovered.add(id(inner))
+                    overridden.add(id(inner))
                 inner = inner["X"]["Cmd"]
         for node in ors:
             branch = node["Y"]["Cmd"]  # a | after a group binds to it, so a pipeline is the branch
@@ -248,7 +250,7 @@ def open_failures(text, shell="sh"):
                 and last.get("Cmd", {}).get("Type") == "CallExpr"
                 and words(last["Cmd"]) in FAILS
             )
-            if branch["Type"] in COMPOUND or (printed and (not fails or id(node) in recovered)):
+            if branch["Type"] in COMPOUND or (printed and (not fails or id(node) in overridden)):
                 found.append(span(script, node))
     return found
 
@@ -277,12 +279,24 @@ def test_the_runbook_gates_are_found():
 def test_functions_are_found_in_every_form_sh_and_bash_allow(tmp_path):
     doc = tmp_path / "doc.md"
     doc.write_text(
-        "```sh\na()\n{\n  echo STOP\n}\nb () { echo STOP; }\ne ( ) { echo STOP; }; f() ( echo STOP )\n```\n\n"
+        "```sh\na()\n{\n  echo STOP\n}\nb () { echo STOP; }\ne ( ) { echo STOP; }; f() ( echo STOP )\n"
+        "ssh h sh <<'EOF'\nk() {\n  echo STOP\n}\nEOF\n```\n\n"
         "```bash\nfunction c {\n  echo STOP\n}\nfunction d() { echo STOP; }\n```\n"
     )
-    assert [(name, shell) for name, _, shell in functions(str(doc))] == [
-        ("a", "sh"), ("b", "sh"), ("e", "sh"), ("f", "sh"), ("c", "bash"), ("d", "bash"),
+    assert [(name, source, shell) for name, source, shell in functions(str(doc))][-3:] == [
+        ("k", "k() {\n  echo STOP\n}", "sh"), ("c", "function c {\n  echo STOP\n}", "bash"), ("d", "function d() { echo STOP; }", "bash"),
     ]
+    assert [(name, shell) for name, _, shell in functions(str(doc))] == [
+        ("a", "sh"), ("b", "sh"), ("e", "sh"), ("f", "sh"), ("k", "sh"), ("c", "bash"), ("d", "bash"),
+    ]
+
+
+def test_the_fake_curl_fails_with_body_as_curl_does(fakes):
+    result = subprocess.run(
+        [fakes / "curl", "-sS", "--fail-with-body", "-X", "DELETE", "https://example.invalid"],
+        env={**os.environ, "FAKE_ANSWER": "500"}, capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode, result.stdout) == (22, "answer 500\n"), result.stderr
 
 
 def test_a_block_is_read_in_its_own_dialect(tmp_path):
@@ -389,6 +403,9 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ("check || command echo STOP", 1),
         ("check || { echo STOP; ! false; }", 1),
         ("check || { echo STOP; false & }", 1),
+        ("check || { echo STOP; false; } &", 1),
+        ("check || { echo STOP; false; } >/dev/null &", 1),
+        ("(check || { echo STOP; false; }) &\nwait", 1),
         ("check || ! { echo STOP; false; }", 1),
         ("ssh h <<'EOF'\ncheck || echo STOP\nEOF", 1),
         ("check 2>&1 || { echo STOP; false; }\ncheck || ( echo STOP; exit 1 )", 0),
