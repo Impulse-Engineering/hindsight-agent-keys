@@ -2,9 +2,10 @@
 
 Fenced blocks are found with markdown-it (CommonMark), and shell is read from
 shfmt's syntax tree. A gate is a doc function that prints STOP when its check
-fails. Each gate runs under bash in a bash block and under sh otherwise, against
-fake curl and cloudflared on PATH, which answer with one status and apply the
-flags the docs use as curl 8 does, and must succeed only on the status it waits for.
+fails. Each gate runs under bash in a bash block or a heredoc fed to bash, and
+under sh otherwise, against fake curl and cloudflared on PATH, which answer with
+one status and apply the flags the docs use as curl 8 does, and must succeed only
+on the status it waits for.
 """
 
 import functools
