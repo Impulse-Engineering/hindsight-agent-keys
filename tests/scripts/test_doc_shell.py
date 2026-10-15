@@ -32,7 +32,7 @@ FAILS = (["false"], ["return", "1"], ["exit", "1"])
 # turns the test red instead of being ignored.
 FAKE_CURL = f"""#!{sys.executable}
 import os, re, sys
-takes = {{"-o": "o", "-w": "w", "-X": "X", "--request": "X", "-H": "H", "-d": "d", "--data": "d", "--data-binary": "d"}}
+takes = {{"-o": "o", "--output": "o", "-w": "w", "--write-out": "w", "-X": "X", "--request": "X", "-H": "H", "--header": "H", "-d": "d", "--data": "d", "--data-binary": "d"}}
 switches = {{"-s": "s", "-S": "S", "-f": "f", "--fail": "f", "--fail-with-body": "F"}}
 args, flags, values, urls = sys.argv[1:], set(), {{}}, []
 while args:
@@ -132,8 +132,8 @@ def scripts(text, shell):
     found = [(text, tree := syntax_tree(text, shell))]
     for heredoc in (node["Hdoc"] for node in nodes(tree) if node.get("Hdoc")):
         body = span(text, heredoc).rpartition("\n")[0]  # the span ends with the closing delimiter
-        try:
-            found += scripts(body, shell)
+        try:  # read as bash, which takes all sh syntax too: the command it is fed to picks the shell
+            found += scripts(body, "bash")
         except ValueError:  # not shell: SQL, JSON or a file's content
             pass
     return found
@@ -243,16 +243,19 @@ def parents(tree):
 
 
 def status_lost(node, parent):
-    """Whether what encloses a command discards its failure: ! or & on it, or a | or || it is the left side
-    of, through any group, subshell or && around it. A later statement in the same list is the shortcut below."""
+    """Whether what encloses a command discards its failure: ! or & on it, a | or || it is the left side
+    of, or an if or loop condition, through any group, subshell, time or && around it. A later statement in
+    the same list is the shortcut below."""
     child = node
     while (up := parent.get(id(child))) is not None:
         if up.get("Negated") or up.get("Background") or (up.get("Type") == "BinaryCmd" and up["X"] is child and up["Op"] != "&&"):
             return True
+        if up.get("Type") in ("IfClause", "WhileClause") and any(child is stmt for stmt in up.get("Cond", [])):
+            return True
         if up.get("Type") in ("Block", "Subshell") and up["Stmts"][-1] is not child:
             return False
-        if up.get("Type") not in (None, "BinaryCmd", "Block", "Subshell"):
-            return False  # a function body, $(...), an if or a loop: its status goes to whoever reads it
+        if up.get("Type") not in (None, "BinaryCmd", "Block", "Subshell", "TimeClause"):
+            return False  # a function body, $(...), an if's or a loop's body: its status goes to whoever reads it
         child = up
     return False
 
@@ -330,6 +333,7 @@ def test_functions_are_found_in_every_form_sh_and_bash_allow(tmp_path):
     [
         ('g() { c || echo "STOP: failed"; }', True),
         ("g() {\n  ssh h sh <<'EOF'\nc || echo 'STOP: failed'\nEOF\n}", True),
+        ("g() {\n  ssh h bash <<'EOF'\n[[ -n $x ]] || echo 'STOP: failed'\nEOF\n}", True),
         ("g() { echo OK; }", False),
     ],
 )
@@ -346,6 +350,7 @@ def test_a_gate_is_a_function_that_prints_stop(source, gate):
         (["-sSXDELETE"], "500", (0, "answer 500\n")),
         (["--request", "DELETE", "--fail"], "500", (22, "")),
         (["--request=DELETE", "--fail"], "500", (22, "")),
+        (["--output", "/dev/null", "--write-out", "%{http_code}", "--header", "X: 1", "-X", "DELETE"], "500", (0, "500")),
     ],
 )
 def test_the_fake_curl_reads_options_as_curl_does(fakes, args, answer, result):
@@ -422,6 +427,7 @@ def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, 
         ("curl -sS -X <METHOD> https://x", 1),
         ("ssh h <<'EOF'\ncurl -X DELETE https://x\nEOF", 1),
         ("psql <<'SQL'\nselect 1 from (t);\nSQL\ncurl -f -X DELETE https://x", 0),
+        ("bash <<'EOF'\narr=(a b)\ncurl -X DELETE https://example.invalid\nEOF", 1),
         ("curl -sSfX DELETE https://x\ncurl -H 'X-f: 1' -fsS -X PUT https://x", 0),
         ("curl -sS -f -X PUT https://x/z\ncurl -fsS -X DELETE https://x\ncurl --fail -X PATCH https://x", 0),
         ('curl -sS -o /dev/null -w "%{http_code}" https://x/health', 0),
@@ -469,6 +475,11 @@ def test_every_state_changing_call_fails_on_an_http_error(path):
         ("(check || { echo STOP; false; }) && next || true", 1),
         ("(check || { echo STOP; false; }) || true", 1),
         ("cat | (check || { echo STOP; false; })\n{ check || { echo STOP; return 1; }; } && next", 0),
+        ("ssh h bash <<'EOF'\n[[ -n $x ]]\ncheck || echo STOP\nEOF", 1),
+        ("if check || { echo STOP; false; }; then :; fi", 1),
+        ("while check || { echo STOP; false; }; do :; done", 1),
+        ("bash <<'EOF'\ntime (check || { echo STOP; false; }) || true\nEOF", 1),
+        ("if check; then check || { echo STOP; false; }; fi", 0),
         ("check || ! { echo STOP; false; }", 1),
         ("ssh h <<'EOF'\ncheck || echo STOP\nEOF", 1),
         ("check 2>&1 || { echo STOP; false; }\ncheck || ( echo STOP; exit 1 )", 0),
