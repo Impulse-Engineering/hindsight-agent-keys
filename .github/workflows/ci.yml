@@ -36,7 +36,7 @@ jobs:
       - name: Lint (ruff, shellcheck, actionlint)
         run: PATH="/tmp/it/bin:$PATH" scripts/lint.sh
 
-      - name: Script tests (release watcher, fake GitHub)
+      - name: Script tests (release watcher, doc shell checks)
         run: /tmp/it/bin/pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 
       - name: Unit tests (inside the pinned upstream image)
