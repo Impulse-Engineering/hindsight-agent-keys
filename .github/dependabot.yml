@@ -7,7 +7,7 @@ updates:
     schedule:
       interval: weekly
 
-  # The hash-pinned integration-test runner (requirements-ci.txt).
+  # The hash-pinned CI runner (requirements-ci.txt): tests, Python lint and the doc shell parsers.
   - package-ecosystem: pip
     directory: /
     schedule:

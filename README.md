@@ -168,16 +168,16 @@ docker build -t hindsight-agent-keys:test .
 uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
-Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They also check the shell this README and `docs/` give operators (`tests/scripts/test_doc_shell.py`), in every fenced block tagged `sh`, `bash`, `shell` or `zsh`, or not tagged:
+Script tests run the release watcher in a scratch repository with fake `gh` and `docker`. They also check the shell this README and `docs/` give operators (`tests/scripts/test_doc_shell.py`), in every fenced block tagged `sh`, `bash`, `shell` or `zsh`, or not tagged. Blocks are found with a CommonMark parser (markdown-it-py), and their shell is read from shfmt's syntax tree, as bash in a `bash` block and POSIX sh otherwise, with any heredoc body that reads as shell (a script fed to `ssh` or `sh`). Shell inside a quoted string (`sh -c '…'`) is not read. A placeholder such as `<port>` reads as a value not yet known, like `$port`. A block that is not shell needs a tag such as `text`, or the tests stop at it:
 
-- Each gate, a function that prints STOP when its check fails, runs under `bash` in a `bash` block and under `sh` otherwise, against fake `curl` and `cloudflared` answering 200, 302, 401, 403, 404, 500 and a refused connection. It must succeed only on the status it waits for. Every function a doc defines must be found, whatever its form.
-- A `curl` that sends PUT, PATCH or DELETE, or a method held in a variable, uses `-f`, in a shell block or an inline command. Options are read as curl reads them, so `-sSX DELETE` counts; the options that take an argument come from `curl --help all`.
-- A failure branch that prints (`|| echo …`, `|| { echo …; }`, `|| ( echo … )`, or the same with `printf`) ends in `false`, `return 1` or `exit 1`, and no later `|` or `||` takes over its status. A compound command after `||` (`if`, `case`, a loop) is refused: write the branch as `{ …; }`.
+- Each gate, a function that prints STOP when its check fails, runs under `bash` in a `bash` block and under `sh` otherwise, against fake `curl` and `cloudflared` answering 200, 302, 401, 403, 404, 500 and a refused connection. It must succeed only on the status it waits for. Every function a block defines outside a heredoc is found, whatever its form.
+- A `curl` that sends PUT, PATCH or DELETE, or a method held in a variable or a placeholder, uses `-f`, in a shell block or an inline command. Options are read as curl reads them, so `-sSX DELETE` counts; the options that take an argument come from `curl --help all`.
+- A failure branch that prints (`|| echo …`, `|| { echo …; }`, `|| ( echo … )`, or the same with `printf`) ends in `false`, `return 1` or `exit 1` (not negated with `!` or sent to the background), and no later `|` or `||` takes over its status. A compound command after `||` (`if`, `case`, a loop) is refused: write the branch as `{ …; }`.
 
-They need git, jq, curl and pytest on the host:
+They need git, jq and curl on the host, pytest and markdown-it-py in the Python that runs them, and shfmt on PATH (shfmt-py installs it):
 
 ```sh
-uv run --no-project --with pytest==9.0.3 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
+uv run --no-project --with pytest==9.0.3 --with markdown-it-py==4.2.0 --with shfmt-py==4.2.0 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 ```
 
 Lint runs the same script as CI. It needs ruff on PATH, shellcheck and Docker:

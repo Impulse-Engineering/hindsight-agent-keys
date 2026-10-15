@@ -1,8 +1,14 @@
-# CI runner deps (integration tests, Python lint), hash-pinned. Regenerate with:
-#   printf "pytest==9.0.3\nruff==0.17.0\n" | uv pip compile - --generate-hashes --python-version 3.12 --no-header --no-annotate
+# CI runner deps (integration tests, Python lint, doc shell checks), hash-pinned. Regenerate with:
+#   printf "pytest==9.0.3\nruff==0.17.0\nmarkdown-it-py==4.2.0\nshfmt-py==4.2.0\n" | uv pip compile - --generate-hashes --python-version 3.12 --no-header --no-annotate
 iniconfig==2.3.1 \
     --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960 \
     --hash=sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7
+markdown-it-py==4.2.0 \
+    --hash=sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+mdurl==0.1.2 \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
+    --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
 packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
@@ -34,3 +40,10 @@ ruff==0.17.0 \
     --hash=sha256:cbf7149e0927dc3295d5d64679a4765576eef71b00782b2ae969ef82274d6bb9 \
     --hash=sha256:d66de796b726c4801e05fa99a2a8d7a780e107be222486c304ab61765561e866 \
     --hash=sha256:db4f74c533403ab70fe4007873f6ae0c9f94a8b03158cf48d78788e47cdbe399
+shfmt-py==4.2.0 \
+    --hash=sha256:566f46c036cb475ac84ac952d83122b67c9557418c24b04628c5782f9f57eccf \
+    --hash=sha256:7b7fa81b120fdccebbe60b9c3411ce1b549fa2828f2809e8fa5e231a9bac65dd \
+    --hash=sha256:867b55792952d4e4aa27a1b2d578e63b745a77e11b7742d2f6258ef123a9c8f2 \
+    --hash=sha256:aaf9e195c2e115309c32ef0d8d05b42afc4a23468b61230a09a8a4bdac95d027 \
+    --hash=sha256:cf7842d69e9f787ce97503c1280e65417f2c08014d594018dda245fcba96ff51 \
+    --hash=sha256:e615cfcfe3e184f59e3ac2574895542976995a46f7506b327c8af71ae02de84c

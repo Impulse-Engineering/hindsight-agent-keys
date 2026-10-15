@@ -28,7 +28,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install the CI runner (pytest, ruff)
+      - name: Install the CI runner (pytest, ruff, markdown-it-py, shfmt)
         run: |
           python3 -m venv /tmp/it
           /tmp/it/bin/pip install --quiet --require-hashes --no-deps -r requirements-ci.txt
@@ -37,7 +37,7 @@ jobs:
         run: PATH="/tmp/it/bin:$PATH" scripts/lint.sh
 
       - name: Script tests (release watcher, doc shell checks)
-        run: /tmp/it/bin/pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
+        run: PATH="/tmp/it/bin:$PATH" pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 
       - name: Unit tests (inside the pinned upstream image)
         run: scripts/unit-tests.sh -v
