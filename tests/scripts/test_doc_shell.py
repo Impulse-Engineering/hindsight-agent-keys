@@ -1,11 +1,12 @@
-"""Checks the shell the README and docs give operators (CODING_STANDARDS rules 7 and 8).
+"""Checks the shell the README and docs give operators (CODING_STANDARDS rules 6, 7 and 8).
 
 Fenced blocks are found with markdown-it (CommonMark), and shell is read from
 shfmt's syntax tree. A gate is a doc function that prints STOP when its check
 fails. Each gate runs under bash in a bash block or a heredoc fed to bash, and
 under sh otherwise, against fake curl and cloudflared on PATH, which answer with
 one status and apply the flags the docs use as curl 8 does, and must succeed only
-on the status it waits for.
+on the status it waits for. Every curl call the -f check accepts, in its test cases
+and the docs, runs through the fakes too, so the fake reads each form the check does.
 """
 
 import functools
@@ -45,6 +46,8 @@ while args:
         values["X"] = arg[len("--request="):]
     elif arg in switches:
         flags.add(switches[arg])
+    elif arg in ("-h", "--help"):  # curl prints its help and sends nothing
+        sys.exit(0)
     elif re.fullmatch(r"-[sSf]*(X.*)?", arg) and len(arg) > 2:  # a cluster: -sSf, -fX DELETE, -sSXDELETE
         cluster, x, method = arg[1:].partition("X")
         flags.update(cluster)
@@ -227,21 +230,47 @@ def options(args, takes):
     return found
 
 
+# shortcut: any word curl but the last starts a call (sudo curl, ssh h curl), so apt-get install curl jq reads as
+# curl jq; read the command word when a doc names curl as an argument.
+def curl_calls(text, shell="sh"):
+    """Each curl call in shell text, as (its text, its words from curl on, or from cloudflared for
+    cloudflared access curl). A bare curl, with no arguments, names the tool in prose and is skipped."""
+    for script, tree, _ in scripts(text, shell):
+        for call in nodes(tree, "CallExpr"):
+            command = words(call)
+            if "curl" in command[:-1]:
+                at = command.index("curl")
+                if command[max(at - 2, 0) : at] == ["cloudflared", "access"]:
+                    at -= 2
+                yield span(script, call), command[at:]
+
+
 # shortcut: the PUT that -T (upload a file) implies is not modelled; model it when a doc uploads with curl.
 def unsafe_calls(text, shell="sh"):
     """curl calls that may PUT, PATCH or DELETE (a method in a variable may) without -f, so an HTTP
     error still exits 0. Options are read as curl reads them: -sSX DELETE is -s -S -X DELETE."""
     unsafe = []
-    for script, tree, _ in scripts(text, shell):
-        for call in nodes(tree, "CallExpr"):
-            if "curl" not in (command := words(call)):
-                continue
-            given = options(command[command.index("curl") + 1 :], CURL_ARGS)
-            fails = any(name in ("-f", "--fail", "--fail-with-body") for name, _ in given)
-            method = next((value for name, value in reversed(given) if name in ("-X", "--request")), None)
-            if method and (method.upper() in ("PUT", "PATCH", "DELETE") or "$" in method) and not fails:
-                unsafe.append(span(script, call))
+    for call, command in curl_calls(text, shell):
+        given = options(command[command.index("curl") + 1 :], CURL_ARGS)
+        fails = any(name in ("-f", "--fail", "--fail-with-body") for name, _ in given)
+        method = next((value for name, value in reversed(given) if name in ("-X", "--request")), None)
+        if method and (method.upper() in ("PUT", "PATCH", "DELETE") or "$" in method) and not fails:
+            unsafe.append(call)
     return unsafe
+
+
+def refusals(fakes, cwd, text, shell="sh"):
+    """The curl calls the -f check accepts that the fake curl or cloudflared refuses when answering 200, each
+    with the fake's complaint: a form the check reads that the fake does not model."""
+    unsafe = unsafe_calls(text, shell)
+    env = {**os.environ, "PATH": f"{fakes}:{os.environ['PATH']}", "FAKE_ANSWER": "200"}
+    found = []
+    for call, command in curl_calls(text, shell):
+        if call not in unsafe:
+            run = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True, check=False, timeout=30)
+            if run.returncode or "fake " in run.stderr:
+                found.append((call, run.stderr))
+    return found
 
 
 def parents(tree):
@@ -466,38 +495,60 @@ def test_a_gate_succeeds_only_on_the_status_it_waits_for(fakes, tmp_path, path, 
     assert passed == status
 
 
-@pytest.mark.parametrize(
-    "shell,found",
-    [
-        ('cloudflared access curl "$capi/domains/1" -sS -X PATCH --data \'{"a": 1}\'', 1),
-        ("curl -sS -X DELETE https://x/y && curl -sSf -X PUT https://x/z", 1),
-        ('[ "$(curl -sS -o /dev/null -w \'%{http_code}\' -X DELETE "$u")" = 204 ]', 1),
-        ("curl -sS --request=PUT https://x/z", 1),
-        ("curl -sSX DELETE https://x", 1),
-        ("cloudflared access curl https://x -sSXPATCH", 1),
-        ("curl -sS -X DELETE --data '-f' https://x", 1),
-        ('curl -sS -X "$method" https://x', 1),
-        ("curl --cookie --fail -X DELETE https://x", 1),
-        ("curl --user-agent -f -X DELETE https://x", 1),
-        ("curl -A -f -X DELETE https://x", 1),
-        ("curl -x -f -X DELETE https://x", 1),
-        ("curl -4X DELETE https://x", 1),
-        ("curl -sS -X <METHOD> https://x", 1),
-        ("ssh h <<'EOF'\ncurl -X DELETE https://x\nEOF", 1),
-        ("psql <<'SQL'\nselect 1 from (t);\nSQL\ncurl -f -X DELETE https://x", 0),
-        ("bash <<'EOF'\narr=(a b)\ncurl -X DELETE https://example.invalid\nEOF", 1),
-        ("curl -sSfX DELETE https://x\ncurl -H 'X-f: 1' -fsS -X PUT https://x", 0),
-        ("curl -sS -f -X PUT https://x/z\ncurl -fsS -X DELETE https://x\ncurl --fail -X PATCH https://x", 0),
-        ('curl -sS -o /dev/null -w "%{http_code}" https://x/health', 0),
-    ],
-)
+F_CHECK_CASES = [
+    ('cloudflared access curl "$capi/domains/1" -sS -X PATCH --data \'{"a": 1}\'', 1),
+    ("curl -sS -X DELETE https://x/y && curl -sSf -X PUT https://x/z", 1),
+    ('[ "$(curl -sS -o /dev/null -w \'%{http_code}\' -X DELETE "$u")" = 204 ]', 1),
+    ("curl -sS --request=PUT https://x/z", 1),
+    ("curl -sSX DELETE https://x", 1),
+    ("cloudflared access curl https://x -sSXPATCH", 1),
+    ("curl -sS -X DELETE --data '-f' https://x", 1),
+    ('curl -sS -X "$method" https://x', 1),
+    ("curl --cookie --fail -X DELETE https://x", 1),
+    ("curl --user-agent -f -X DELETE https://x", 1),
+    ("curl -A -f -X DELETE https://x", 1),
+    ("curl -x -f -X DELETE https://x", 1),
+    ("curl -4X DELETE https://x", 1),
+    ("curl -sS -X <METHOD> https://x", 1),
+    ("ssh h <<'EOF'\ncurl -X DELETE https://x\nEOF", 1),
+    ("psql <<'SQL'\nselect 1 from (t);\nSQL\ncurl -f -X DELETE https://x", 0),
+    ("bash <<'EOF'\narr=(a b)\ncurl -X DELETE https://example.invalid\nEOF", 1),
+    ("curl -sSfX DELETE https://x\ncurl -H 'X-f: 1' -fsS -X PUT https://x", 0),
+    ("curl -sS -f -X PUT https://x/z\ncurl -fsS -X DELETE https://x\ncurl --fail -X PATCH https://x", 0),
+    ('curl -sS -o /dev/null -w "%{http_code}" https://x/health', 0),
+    (
+        (
+            "curl -sS --fail-with-body --request DELETE https://x\ncurl --request=PUT --fail --output /dev/null "
+            "--write-out '%{http_code}' --header 'X: 1' --data-binary @- https://x\ncurl -fXDELETE -d x --data y https://x"
+        ),
+        0,
+    ),
+]
+
+
+@pytest.mark.parametrize("shell,found", F_CHECK_CASES)
 def test_the_f_check_finds_state_changing_calls_without_it(shell, found):
     assert len(unsafe_calls(shell)) == found
+
+
+@pytest.mark.parametrize(
+    "shell,refused",
+    [(shell, []) for shell, _ in F_CHECK_CASES]
+    + [("curl --user-agent x -f -X DELETE https://x", ["--user-agent"]), ("cloudflared access curl https://x --proxy http://p -sSf", ["--proxy"])],
+)
+def test_the_fakes_run_every_curl_call_the_f_check_accepts(fakes, tmp_path, shell, refused):
+    complaints = [complaint for _, complaint in refusals(fakes, tmp_path, shell)]
+    assert complaints == [f"fake curl: unsupported option {option}\n" for option in refused]
 
 
 @pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
 def test_every_state_changing_call_fails_on_an_http_error(path):
     assert [call for shell, text in shell_in(path) for call in unsafe_calls(text, shell)] == []
+
+
+@pytest.mark.parametrize("path", DOCS, ids=lambda p: os.path.relpath(p, ROOT))
+def test_the_fakes_run_every_curl_call_in_the_docs(fakes, tmp_path, path):
+    assert [r for shell, text in shell_in(path) for r in refusals(fakes, tmp_path, text, shell)] == []
 
 
 @pytest.mark.parametrize(
