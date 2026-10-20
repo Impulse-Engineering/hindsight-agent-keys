@@ -5,7 +5,7 @@ A pin sits at a site: a `uses:` key, a Dockerfile `FROM`, an `image=` or `image:
 into commands at control operators; docker's options that take a value come from its own --help. An image
 word that is a variable is checked at its one assignment in the same file. A form the check does not read
 (docker's global options, a variable assigned twice, a command named by a variable, a workflow value folded
-over several lines, a flow mapping or a quoted key) fails, so a new form needs reading before it can pass.
+over several lines, a quoted inline `run:`, a flow mapping or a quoted key) fails, so a new form needs reading before it can pass.
 """
 
 import functools
@@ -163,7 +163,8 @@ def test_workflows_hold_only_forms_the_check_reads():
             where = f"{os.path.relpath(path, ROOT)}:{n + 1}: {text.strip()}"
             quoted_key = re.search(r"[\"']\s*(?:uses|run|image)\s*[\"']\s*:", text)
             flow_key = re.search(r"[{,]\s*(?:run|uses|image)\s*:", text)
-            if re.search(r"\buses\s*:", text) and not USES.match(text) or quoted_key or flow_key:
+            quoted_run = re.search(r"\brun\s*:\s*[\"']", text)  # one YAML scalar, which shlex reads as one word
+            if re.search(r"\buses\s*:", text) and not USES.match(text) or quoted_key or flow_key or quoted_run:
                 unread.append(where)
             if (m := re.match(r"^(\s*(?:-\s+)?)run:\s*(.*)$", text)) and not re.match(r"\|[-+]?\s*$", m.group(2)):
                 after = next((line for line in raw[n + 1 :] if line.strip()), "")
@@ -196,12 +197,13 @@ def test_every_image_is_pinned_by_digest_with_its_version():
 
 
 def test_docker_and_pip_are_named_literally():
-    """A command named by a variable ("$DOCKER" run, "$pip" install) is not read, so it fails. Found by its
-    tokens, since a line can sit inside a string that spans lines; one in a string over-matches and fails red."""
+    """A command named by a variable ("$DOCKER" --context c run, "$pip" --quiet install) is not read, so it fails.
+    Found by its tokens, a variable with run, pull, create or install later on its line, since a line can sit
+    inside a string that spans lines; one in a string over-matches and fails red."""
     named = [
         f"{where}: {text.strip()}"
         for _, where, text in every_line()
-        if re.search(r"[\"']?\$\{?\w+\}?[\"']?\s+(?:run|pull|create|install)\b", text)
+        if re.search(r"\$\{?\w+\}?[\"']?\s(?:.*\s)?(?:run|pull|create|install)(?:\s|$)", text)
     ]
     assert named == []
 
