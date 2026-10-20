@@ -6,11 +6,14 @@ LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hi
 
 # Fixed versions over upstream's lockfile, for advisories the scan blocks or reports as High:
 # GHSA-h4mw-j7qp-8mwm (claude-agent-sdk), GHSA-2g87-pp6c-29x5 and GHSA-5wr8-gcqf-gqf3 (aiohttp, which needs this yarl).
-# docker/pins.txt holds the versions and the hash of every artifact; --no-deps installs exactly those and
-# resolves nothing else, and the check fails the build if they no longer fit upstream's environment.
+# docker/pins.txt holds the versions and the hash of every wheel; a file whose bytes match none fails the build,
+# whichever index serves it. --no-deps installs exactly those and resolves nothing else, and the check fails the
+# build if they no longer fit upstream's environment.
 # shortcut: exact pins downgrade a newer upstream; drop each one the pinned release already meets.
-# Regenerate docker/pins.txt after editing a version: printf '<name>==<version>\n...' | uv pip compile - \
-#   --no-deps --generate-hashes --python-version 3.11 --no-header --no-annotate -q -o docker/pins.txt
+# Regenerate docker/pins.txt after editing a version, with the base image's Python version
+# (`docker run --rm --entrypoint /app/api/.venv/bin/python <FROM image> -V`):
+#   printf '<name>==<version>\n...' | uv pip compile - --no-deps --generate-hashes --only-binary :all: \
+#     --python-version <major.minor> --no-header --no-annotate -q -o docker/pins.txt
 RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
     uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
       --python /app/api/.venv/bin/python -r /tmp/pins.txt && \
