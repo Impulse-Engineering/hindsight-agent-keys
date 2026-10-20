@@ -163,7 +163,7 @@ Unit tests run inside the pinned upstream image, which ships `hindsight_api` and
 scripts/unit-tests.sh -v
 ```
 
-Integration tests start the real container on Hindsight's mock LLM, so they need no credentials. They also run the README's purge recovery and the operating guide's check of a revoked identity's keys as written, with an owner whose email holds an apostrophe. They need Docker, pytest and markdown-it-py on the host:
+Integration tests start the real container on Hindsight's mock LLM, so they need no credentials. They also run the README's purge recovery and the operating guide's check of a revoked identity's keys as written, with an owner whose email holds an apostrophe. They need Docker, pytest and markdown-it-py on the host. The build needs BuildKit (Docker's default builder since 23.0) for the Dockerfile's `RUN --mount`:
 
 ```sh
 docker build -t hindsight-agent-keys:test .
