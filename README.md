@@ -119,7 +119,7 @@ A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer
 **Purging.** Take a backup first (docs/cutover.md, step 1); the purge cannot be undone otherwise. Copy `scripts/purge-schema.sql` to the CT (`scp` it to the node, then `pct push <vmid> purge-schema.sql /root/purge-schema.sql`). Then, with the `pg` helper from docs/cutover.md, type the schema ID from `/ext/admin` and your email:
 
 ```sh
-# CT (not verified on Dev; the script itself runs in the stale-schema integration test)
+# CT
 read -r -p 'Schema ID to purge: ' schema && read -r -p 'Your email: ' operator &&
   pg psql -X -d hindsight -v schema="$schema" -v operator="$operator" < /root/purge-schema.sql &&
   echo "purge OK" || { echo "PURGE FAILED: read the output above"; false; }
@@ -129,16 +129,16 @@ read -r -p 'Schema ID to purge: ' schema && read -r -p 'Your email: ' operator &
 2. **Wait** 60 seconds, so tasks the worker had already claimed there finish.
 3. **Drop** (one transaction). It stops, changing nothing, if a row in `agent_keys.people` names the schema again. Otherwise it revokes again any key that names the schema (one created in the instant before step 1), drops the schema, and records a `schema_purged` event naming the owner, the operator and the schema.
 
-psql stops at the first error with a non-zero status. If the output ends at `Unlisted` followed by `no rows returned for \gset`, step 3 found the schema in use again and dropped nothing: it is back on the tenant list with its owner, so the worker processes it and their keys created since step 1 work, while the keys step 1 revoked stay revoked. Purge it only if `/ext/admin` lists it as stale again. If the output ends at `Unlisted` with any other error, step 3 failed: no key reaches the schema and its data is intact. Put it back on the list, passing both values as psql variables (psql substitutes them only in input it reads, never in `-c`), and run the script again:
+psql stops at the first error with a non-zero status. If the output ends at `Unlisted` followed by `no rows returned for \gset`, step 3 found the schema in use again and dropped nothing: it is back on the tenant list with its owner, so the worker processes it and their keys created since step 1 work, while the keys step 1 revoked stay revoked. Purge it only if `/ext/admin` lists it as stale again. If the output ends at `Unlisted` with any other error, the run stopped in the wait or in step 3: no key reaches the schema, and its data is intact unless step 3 committed just before the connection failed. Put it back on the list if it still exists, passing both values as psql variables (psql substitutes them only in input it reads, never in `-c`), and run the script again:
 
 ```sh
 # CT (not verified on Dev; runs in the integration tests)
 read -r -p 'Owner email: ' owner &&
-  echo "UPDATE agent_keys.people SET schema = :'schema' WHERE email = :'owner' AND schema IS NULL RETURNING email" |
+  echo "UPDATE agent_keys.people SET schema = :'schema' WHERE email = :'owner' AND schema IS NULL AND EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = :'schema') RETURNING email" |
   pg psql -X -d hindsight -At -v ON_ERROR_STOP=1 -v schema="$schema" -v owner="$owner"
 ```
 
-Its keys stay revoked, so this reopens nothing. If that returns no row, the owner already has a new schema, and the old one stays unlisted and unreachable until it is dropped by hand.
+Its keys stay revoked, so this reopens nothing. If that returns no row, either the schema is gone, so step 3 committed and the purge is done (its `schema_purged` event is in `agent_keys.events`), or the owner already has a new schema, and the old one stays unlisted and unreachable until it is dropped by hand.
 
 ## The event log
 
