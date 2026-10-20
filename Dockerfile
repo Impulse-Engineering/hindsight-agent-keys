@@ -4,6 +4,12 @@ LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hi
       org.opencontainers.image.description="Hindsight with a tenant extension for self-issued Agent Keys" \
       org.opencontainers.image.licenses="MIT"
 
+# Fixed versions over upstream's lockfile, for advisories the scan blocks or reports as High:
+# GHSA-h4mw-j7qp-8mwm (claude-agent-sdk), GHSA-2g87-pp6c-29x5 and GHSA-5wr8-gcqf-gqf3 (aiohttp, which needs this yarl).
+# shortcut: exact pins downgrade a newer upstream; drop each one the pinned release already meets.
+RUN ["uv", "pip", "install", "--no-cache", "--python", "/app/api/.venv/bin/python", \
+     "claude-agent-sdk==0.2.121", "aiohttp==3.14.4", "yarl==1.25.1"]
+
 COPY hindsight_agent_keys /app/extensions/hindsight_agent_keys
 # The script's executable bit comes from git; COPY keeps it.
 COPY docker/agent-keys-start.sh /app/agent-keys-start.sh
