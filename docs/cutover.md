@@ -2,7 +2,7 @@
 
 This runbook takes a Conductor Image App running stock Hindsight with embedded pg0 onto this image, and back. Dev ran it first (Impulse-Engineering/aseva-foundation-hosting#703) and runs the image now. Prod follows the same steps in the same order (#712). The **Prod** notes under a step record what the Dev run showed about Prod (#697, comment "Dev cut-over (#703)"). Confirm each change with the app owner before running it. Running the app afterwards is in [operating.md](operating.md).
 
-Every command here ran on Dev in #703 unless it is marked *(not verified)*. Record what an unverified command printed on the cut-over ticket.
+Every command here ran on Dev in #703, step 1's block and `banks` in #710, and step 5's `platform_update_app`, `platform_approve_image` and deploy-status check again in #711, unless it is marked *(not verified)*. Record what an unverified command printed on the cut-over ticket.
 
 Each step that restarts or redeploys the app names its **auth state**: what a caller can reach during and after it. The bypass hostname reopens only after a request with no key has returned 401 from the container that is running at that moment.
 
@@ -97,10 +97,10 @@ Then check `/version`, and `banks` against the snapshot taken with the dump. If 
 
 The target is the upstream digest this image is built on: `scripts/upstream-ref.sh` prints its tag and digest. Skip the upgrade if the app already runs it.
 
-1. `platform_resolve_image_version tag=<tag>` must return that digest.
+1. `platform_resolve_image_version tag=<tag>` *(not verified)* must return that digest.
 2. `platform_update_app container_image=ghcr.io/vectorize-io/hindsight@sha256:<digest>`.
 3. `platform_approve_image` (platform admin). On a live app this queues the deploy itself and returns its `job_id`. Its health checks fail with HTTP 0 for about 30 seconds while pg0 starts and migrates. That is expected.
-4. `platform_get_deploy_status` shows the job `completed`, with `Applied image ref recorded:` naming the digest from 2.
+4. `platform_get_deploy_status` shows the job `completed`, with `Applied image ref recorded:` naming the digest from 2 *(not verified for the stock image; the same check ran for step 5's deploy in #711)*.
 
 **Auth state:** unchanged. Stock Hindsight keeps the app's tenant secrets across the deploy; on Prod that is stock's ApiKey extension with the shared key.
 
@@ -118,7 +118,7 @@ cloudflared access curl "$capi/domains/<id>" -sS -f -X PATCH -H 'Content-Type: a
 
 The change takes a few seconds to reach Cloudflare. If `closed` prints STOP right after a PATCH that succeeded, wait and run `closed <bypass>` again; go on only once it prints `bypass closed OK` *(not verified)*.
 
-If the app has no bypass hostname yet, create it closed: `platform_request_domain domain_type=managed domain=<bypass label> managed_domain_id=<zone> access_exempt=false`, where `<bypass label>` is `<bypass>` without the zone suffix and `<zone>` is that zone's id from `platform_list_managed_domains`. Its certificate takes a few minutes. Until then, TLS handshakes fail.
+If the app has no bypass hostname yet, create it closed: `platform_request_domain domain_type=managed domain=<bypass label> managed_domain_id=<zone> access_exempt=false`, where `<bypass label>` is `<bypass>` without the zone suffix and `<zone>` is that zone's id from `platform_list_managed_domains` *(not verified)*. Its certificate takes a few minutes. Until then, TLS handshakes fail.
 
 **Auth state:** from `bypass closed OK` on, both hostnames are behind Access. Agents on the bypass hostname get 302 until step 8.
 
@@ -189,7 +189,7 @@ pg psql -d hindsight -Atc 'select * from agent_keys.events order by 1 desc limit
 
 The check runs on the CT because both hostnames are behind Access now. **Prod:** the `banks` diff must be empty: #712 requires the two banks unchanged.
 
-Then delete the secrets the image no longer reads: `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)* for each of `HINDSIGHT_API_TENANT_API_KEY`, `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_API_TENANT_EXTENSION` that `platform_get_secret_keys` lists; `-f` fails on a secret that is not there (Dev has no `HINDSIGHT_API_TENANT_EXTENSION`). Each deletion restarts the app.
+Then delete the secrets the image no longer reads: `cloudflared access curl "$capi/secrets/<KEY>" -sS -f -X DELETE` (platform admin) *(not verified)* for each of `HINDSIGHT_API_TENANT_API_KEY`, `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_API_TENANT_EXTENSION` that `platform_get_secret_keys` *(not verified)* lists; `-f` fails on a secret that is not there (Dev has no `HINDSIGHT_API_TENANT_EXTENSION`). Each deletion restarts the app.
 
 **Auth state:** down during each restart. After it, this image again; once the `HINDSIGHT_API_TENANT_EXTENSION` secret is gone, the image's own value applies, which is ours. After the last deletion, run the keyless check again:
 
