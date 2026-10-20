@@ -72,7 +72,7 @@ read -r -p 'Email: ' email &&
 
 ## Stale personal schemas
 
-`/ext/admin` lists each personal schema that no valid key has reached for 90 days. Nothing is deleted on its own. To purge one, follow the README, ["Stale personal schemas"](../README.md#stale-personal-schemas): take a backup first ([cutover.md](cutover.md), step 1), copy `scripts/purge-schema.sql` onto the CT, and run it for one schema at a time. If its drop step stops, read its last error: `no rows returned for \gset` means the schema is in use again and nothing was dropped; any other error means put the schema back on the list as the README shows and run the script again.
+`/ext/admin` lists each personal schema that no valid key has reached for 90 days. Nothing is deleted on its own. To purge one, follow the README, ["Stale personal schemas"](../README.md#stale-personal-schemas): take a backup first ([cutover.md](cutover.md), step 1), copy `scripts/purge-schema.sql` onto the CT, and run it for one schema at a time. If it stops after `Unlisted`, read its last error: `no rows returned for \gset` means the schema is in use again and nothing was dropped; any other error means follow the README's recovery, which puts the schema back on the list only if it still exists, then run the script again. If the recovery returns no row because the schema is gone, the purge is done.
 
 ## The Public Team stays in `public`
 
