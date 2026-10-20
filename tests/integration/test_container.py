@@ -855,6 +855,12 @@ def test_the_readmes_purge_recovery_puts_the_schema_back_on_the_list_once(hindsi
     # Once the owner holds a schema, it returns no row and changes nothing.
     run = run_doc(name, block, f"{owner}\n", schema=schema)
     assert (run.returncode, run.stdout.splitlines()) == (0, ["UPDATE 0"]), run.stderr
+    # Nor does it list a schema that step 3 dropped before the connection failed.
+    query(name, f"UPDATE agent_keys.people SET schema = NULL WHERE email = '{quoted}' RETURNING email")
+    query(name, f"DROP SCHEMA {schema} CASCADE")
+    run = run_doc(name, block, f"{owner}\n", schema=schema)
+    assert (run.returncode, run.stdout.splitlines()) == (0, ["UPDATE 0"]), run.stderr
+    assert query(name, owned) == [{"schema": None}]
 
 
 def test_the_bundled_ui_is_not_listening(hindsight):
