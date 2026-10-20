@@ -4,8 +4,8 @@ A pin sits at a site: a `uses:` key, a Dockerfile `FROM`, an `image=` or `image:
 `docker run`, `pull` or `create`, or a `pip install`. Shell words are read with shlex (POSIX quoting) and split
 into commands at control operators; docker's options that take a value come from its own --help. An image
 word that is a variable is checked at its one assignment in the same file. A form the check does not read
-(docker's global options, a variable assigned twice, a workflow value folded over several lines, a flow
-mapping) fails, so a new form needs reading before it can pass.
+(docker's global options, a variable assigned twice, a command named by a variable, a workflow value folded
+over several lines, a flow mapping or a quoted key) fails, so a new form needs reading before it can pass.
 """
 
 import functools
@@ -24,7 +24,7 @@ FILES = sorted(
 USES = re.compile(r"^\s*(?:-\s+)?uses:\s*(\S+)")
 DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 VERSION = re.compile(r"#\s*v?\d+(?:\.\d+)+\b")  # the trailing comment a digest or SHA pin carries: # v0.34.0
-TAGGED = re.compile(r"^[^@/]+(?:/[^@/]+)*:[\w][\w.-]*@")  # name:tag@sha256:…, which carries its version itself
+TAGGED = re.compile(r"^[^@]*:v?\d+(?:\.\d+)+@")  # name:0.10.3@sha256:…, which carries its version itself
 DOCKER_RUNS = ("run", "pull", "create")
 PIP = re.compile(r"pip[\d.]*")  # pip, pip3, pip3.12
 
@@ -91,11 +91,13 @@ def docker_image(words):
 
 
 def assignments(path, name):
-    """(value, line) for each place a file assigns a variable, as shell (NAME=…) or a workflow env key (NAME: …)."""
+    """(value, line) for each place a file assigns a variable: NAME=… anywhere in a line, so a second one on the
+    same line counts (one in a string or a trailing comment over-matches, which fails red), or a workflow env
+    key NAME: …. The value is read from the line, which keeps a $(…) whole."""
     return [
         (m.group(1).strip("'\""), text)
         for _, text in lines(path)
-        if (m := re.match(rf"^\s*(?:export\s+)?{name}(?:=|:\s+)(\S+)", text))
+        for m in [*re.finditer(rf"(?:^|[\s;&|(`]){name}=(\S+)", text), *re.finditer(rf"^\s*{name}:\s+(\S+)", text)]
     ]
 
 
@@ -159,7 +161,9 @@ def test_workflows_hold_only_forms_the_check_reads():
             raw = f.read().splitlines()
         for n, text in enumerate(raw):
             where = f"{os.path.relpath(path, ROOT)}:{n + 1}: {text.strip()}"
-            if re.search(r"\buses\s*:", text) and not USES.match(text) or re.search(r"[{,]\s*(?:run|uses)\s*:", text):
+            quoted_key = re.search(r"[\"']\s*(?:uses|run|image)\s*[\"']\s*:", text)
+            flow_key = re.search(r"[{,]\s*(?:run|uses|image)\s*:", text)
+            if re.search(r"\buses\s*:", text) and not USES.match(text) or quoted_key or flow_key:
                 unread.append(where)
             if (m := re.match(r"^(\s*(?:-\s+)?)run:\s*(.*)$", text)) and not re.match(r"\|[-+]?\s*$", m.group(2)):
                 after = next((line for line in raw[n + 1 :] if line.strip()), "")
@@ -189,6 +193,17 @@ def test_every_image_is_pinned_by_digest_with_its_version():
         if not DIGEST.search(image.removeprefix("docker://")) or not (TAGGED.match(image) or VERSION.search(line))
     ]
     assert unpinned == []
+
+
+def test_docker_and_pip_are_named_literally():
+    """A command named by a variable ("$DOCKER" run, "$pip" install) is not read, so it fails. Found by its
+    tokens, since a line can sit inside a string that spans lines; one in a string over-matches and fails red."""
+    named = [
+        f"{where}: {text.strip()}"
+        for _, where, text in every_line()
+        if re.search(r"[\"']?\$\{?\w+\}?[\"']?\s+(?:run|pull|create|install)\b", text)
+    ]
+    assert named == []
 
 
 def test_every_python_install_checks_hashes():
