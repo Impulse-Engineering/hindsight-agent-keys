@@ -6,9 +6,11 @@ LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hi
 
 # Fixed versions over upstream's lockfile, for advisories the scan blocks or reports as High:
 # GHSA-h4mw-j7qp-8mwm (claude-agent-sdk), GHSA-2g87-pp6c-29x5 and GHSA-5wr8-gcqf-gqf3 (aiohttp, which needs this yarl).
+# --no-deps installs exactly these and resolves nothing else; the check fails the build if they no longer fit.
 # shortcut: exact pins downgrade a newer upstream; drop each one the pinned release already meets.
-RUN ["uv", "pip", "install", "--no-cache", "--python", "/app/api/.venv/bin/python", \
-     "claude-agent-sdk==0.2.121", "aiohttp==3.14.4", "yarl==1.25.1"]
+RUN uv pip install --no-cache --no-deps --python /app/api/.venv/bin/python \
+      claude-agent-sdk==0.2.121 aiohttp==3.14.4 yarl==1.25.1 && \
+    uv pip check --python /app/api/.venv/bin/python
 
 COPY hindsight_agent_keys /app/extensions/hindsight_agent_keys
 # The script's executable bit comes from git; COPY keeps it.
