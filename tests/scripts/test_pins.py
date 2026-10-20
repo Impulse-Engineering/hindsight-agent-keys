@@ -3,13 +3,16 @@
 A pin sits at a site: a `uses:` key, a Dockerfile `FROM`, an `image=` or `image:` value, the image word of a
 `docker run`, `pull` or `create`, or a `pip install`. Shell words are read with shlex (POSIX quoting) and split
 into commands at control operators; docker's options that take a value come from its own --help. An image
-word that is a variable is checked at its one assignment in the same file. A form the check does not read
-(docker's global options, a variable assigned twice, a command named by a variable, a workflow value folded
-over several lines, a quoted inline `run:`, a flow mapping or a quoted key) fails, so a new form needs reading before it can pass.
+word that is a variable is checked at its one assignment in the same file. These forms, which it does not
+read, fail rather than pass: docker's global options; an image variable written more than once (a second
+NAME=, `for NAME in`, `read NAME`); a command named by a variable; a workflow `run:` value that is folded,
+continued, quoted, anchored, aliased or tagged; a flow mapping or a quoted key. It is a guardrail for the forms
+this repo writes, not a shell or YAML interpreter: a form outside this list is caught at review, under rule 5.
 """
 
 import functools
 import glob
+import json
 import os
 import re
 import shlex
@@ -64,6 +67,13 @@ def commands(text):
     return [w for w in found + [words] if w]
 
 
+def commands_or_exec_form(text):
+    """The commands in a line, or the words of a Dockerfile exec-form RUN ["pip", "install", …], a JSON array."""
+    if m := re.match(r"(?i)^\s*RUN\s+(?:--\S+\s+)*(\[.*\])\s*$", text):
+        return [json.loads(m.group(1))]
+    return commands(text)
+
+
 @functools.cache
 def docker_options_with_a_value(subcommand):
     """The options of `docker <subcommand>` that read the next word, from docker's own --help."""
@@ -97,7 +107,12 @@ def assignments(path, name):
     return [
         (m.group(1).strip("'\""), text)
         for _, text in lines(path)
-        for m in [*re.finditer(rf"(?:^|[\s;&|(`]){name}=(\S+)", text), *re.finditer(rf"^\s*{name}:\s+(\S+)", text)]
+        for m in [
+            *re.finditer(rf"(?:^|[\s;&|(`]){name}=(\S+)", text),
+            *re.finditer(rf"^\s*{name}:\s+(\S+)", text),
+            *re.finditer(rf"\bfor\s+{name}\s+in\s+(\S*)", text),
+            *re.finditer(rf"\bread\b[^;&|]*\s{name}\b()", text),
+        ]
     ]
 
 
@@ -163,7 +178,7 @@ def test_workflows_hold_only_forms_the_check_reads():
             where = f"{os.path.relpath(path, ROOT)}:{n + 1}: {text.strip()}"
             quoted_key = re.search(r"[\"']\s*(?:uses|run|image)\s*[\"']\s*:", text)
             flow_key = re.search(r"[{,]\s*(?:run|uses|image)\s*:", text)
-            quoted_run = re.search(r"\brun\s*:\s*[\"']", text)  # one YAML scalar, which shlex reads as one word
+            quoted_run = re.search(r"\brun\s*:\s*[\"'&*!]", text)  # quoted, anchored, aliased or tagged scalar
             if re.search(r"\buses\s*:", text) and not USES.match(text) or quoted_key or flow_key or quoted_run:
                 unread.append(where)
             if (m := re.match(r"^(\s*(?:-\s+)?)run:\s*(.*)$", text)) and not re.match(r"\|[-+]?\s*$", m.group(2)):
@@ -203,7 +218,7 @@ def test_docker_and_pip_are_named_literally():
     named = [
         f"{where}: {text.strip()}"
         for _, where, text in every_line()
-        if re.search(r"\$\{?\w+\}?[\"']?\s(?:.*\s)?(?:run|pull|create|install)(?:\s|$)", text)
+        if re.search(r"\$(?:\w+|\{[^}]*\})[\"']?\s(?:.*\s)?(?:run|pull|create|install)(?:\s|$)", text)
     ]
     assert named == []
 
@@ -213,7 +228,7 @@ def test_every_python_install_checks_hashes():
         (where, words)
         for _, where, text in every_line()
         if re.search(r"\bpip", text)
-        for words in commands(text)
+        for words in commands_or_exec_form(text)
         if (i := next((i for i, w in enumerate(words) if PIP.fullmatch(os.path.basename(w))), None)) is not None
         if "install" in words[i + 1 :]
     ]
