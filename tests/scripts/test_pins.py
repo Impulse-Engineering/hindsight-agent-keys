@@ -3,7 +3,9 @@
 A pin sits at a site: a `uses:` key, a Dockerfile `FROM`, an `image=` or `image:` value, the image word of a
 `docker run`, `pull` or `create`, or a `pip install`. Shell words are read with shlex (POSIX quoting) and split
 into commands at control operators; docker's options that take a value come from its own --help. An image
-word that is a variable is checked at its assignment in the same file.
+word that is a variable is checked at its one assignment in the same file. A form the check does not read
+(docker's global options, a variable assigned twice, a workflow value folded over several lines, a flow
+mapping) fails, so a new form needs reading before it can pass.
 """
 
 import functools
@@ -24,6 +26,7 @@ DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 VERSION = re.compile(r"#\s*v?\d+(?:\.\d+)+\b")  # the trailing comment a digest or SHA pin carries: # v0.34.0
 TAGGED = re.compile(r"^[^@/]+(?:/[^@/]+)*:[\w][\w.-]*@")  # name:tag@sha256:…, which carries its version itself
 DOCKER_RUNS = ("run", "pull", "create")
+PIP = re.compile(r"pip[\d.]*")  # pip, pip3, pip3.12
 
 
 def lines(path):
@@ -72,6 +75,8 @@ def docker_image(words):
     """The image word of a docker run, pull or create, or None for any other command."""
     i = next((i for i, w in enumerate(words) if os.path.basename(w) == "docker"), None)
     rest = words[i + 1 :] if i is not None else []
+    if rest[:1] and rest[0].startswith("-"):
+        return f"(docker global option {rest[0]}: not read)"
     if rest[:1] in (["container"], ["image"]):
         rest = rest[1:]
     if not rest or rest[0] not in DOCKER_RUNS:
@@ -85,18 +90,26 @@ def docker_image(words):
     return ""
 
 
-def assignment(path, name):
-    """The value and line a file assigns a variable, as shell (NAME=…) or a workflow env key (NAME: …)."""
-    for _, text in lines(path):
-        if m := re.match(rf"^\s*(?:export\s+)?{name}(?:=|:\s+)(\S+)", text):
-            return m.group(1).strip("'\""), text
-    return None, ""
+def assignments(path, name):
+    """(value, line) for each place a file assigns a variable, as shell (NAME=…) or a workflow env key (NAME: …)."""
+    return [
+        (m.group(1).strip("'\""), text)
+        for _, text in lines(path)
+        if (m := re.match(rf"^\s*(?:export\s+)?{name}(?:=|:\s+)(\S+)", text))
+    ]
+
+
+@functools.cache
+def upstream_ref():
+    """What scripts/upstream-ref.sh prints: the image the unit tests and the source copy run."""
+    script = os.path.join(ROOT, "scripts", "upstream-ref.sh")
+    return subprocess.run([script], capture_output=True, text=True, check=True).stdout.strip()
 
 
 def image_sites():
     """(where, image, the line that pins it) for every image a file runs."""
     for path, where, text in every_line():
-        if m := re.match(r"^FROM\s+(?:--\S+\s+)*(\S+)", text):
+        if os.path.basename(path) == "Dockerfile" and (m := re.match(r"(?i)^\s*FROM\s+(?:--\S+\s+)*(\S+)", text)):
             yield where, m.group(1), text
         for m in re.finditer(r"(?:\bimage=|^\s*image:\s+)(\S+)", text):
             yield where, m.group(1).strip("'\""), text
@@ -109,10 +122,13 @@ def image_sites():
             if image is None or re.search(r"@\$\{?\w+\}?$", image):  # None: not a run; @$DIGEST: a build output's digest
                 continue
             if var := re.fullmatch(r"\$\{?(\w+)\}?", image):
-                value, line = assignment(path, var.group(1))
-                if value and "upstream-ref.sh" in value:  # that script refuses a FROM without a digest
-                    continue
-                yield where, value or image, line
+                found = assignments(path, var.group(1))
+                if len(found) != 1:
+                    yield where, f"({image} assigned {len(found)} times: not read)", text
+                elif "upstream-ref.sh" in found[0][0]:
+                    yield where, upstream_ref(), ""  # name:tag@digest, which carries its version
+                else:
+                    yield where, *found[0]
             else:
                 yield where, image, text
 
@@ -131,6 +147,25 @@ def test_shell_words_are_split_into_commands():
     ]
     assert docker_image(["docker", "run", "--rm", "-v", "a:/b", "-w", "/r", "--entrypoint", "/x", "img:1", "arg"]) == "img:1"
     assert docker_image(["docker", "build", "-t", "x", "."]) is None
+    assert docker_image(["docker", "--context", "c", "run", "img"]) == "(docker global option --context: not read)"
+
+
+def test_workflows_hold_only_forms_the_check_reads():
+    """A value folded over several lines (run: >, or a plain or quoted value continued on deeper lines) and a
+    flow mapping ({uses: …}) are not read line by line, so they fail rather than pass unread."""
+    unread = []
+    for path in glob.glob(os.path.join(ROOT, ".github", "workflows", "*.yml")):
+        with open(path) as f:
+            raw = f.read().splitlines()
+        for n, text in enumerate(raw):
+            where = f"{os.path.relpath(path, ROOT)}:{n + 1}: {text.strip()}"
+            if re.search(r"\buses\s*:", text) and not USES.match(text) or re.search(r"[{,]\s*(?:run|uses)\s*:", text):
+                unread.append(where)
+            if (m := re.match(r"^(\s*(?:-\s+)?)run:\s*(.*)$", text)) and not re.match(r"\|[-+]?\s*$", m.group(2)):
+                after = next((line for line in raw[n + 1 :] if line.strip()), "")
+                if len(after) - len(after.lstrip()) > len(m.group(1)):
+                    unread.append(where)
+    assert unread == []
 
 
 def test_every_action_is_pinned_to_a_commit_sha_with_its_version():
@@ -160,9 +195,9 @@ def test_every_python_install_checks_hashes():
     installs = [
         (where, words)
         for _, where, text in every_line()
-        if re.search(r"\bpip3?\b", text)
+        if re.search(r"\bpip", text)
         for words in commands(text)
-        if (i := next((i for i, w in enumerate(words) if os.path.basename(w) in ("pip", "pip3")), None)) is not None
+        if (i := next((i for i, w in enumerate(words) if PIP.fullmatch(os.path.basename(w))), None)) is not None
         if "install" in words[i + 1 :]
     ]
     assert any(where.startswith("Dockerfile:") for where, _ in installs), "the check no longer sees the image's install"

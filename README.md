@@ -178,7 +178,7 @@ Script tests run the release watcher in a scratch repository with fake `gh` and 
 - SQL takes each value as a psql variable, in a shell block or an inline command: `-v name=…` with `:'name'` in SQL that psql reads from stdin. The SQL psql runs (its `-c`, a heredoc or here-string, or what `echo` or `printf` pipes in, also through a group or a longer pipeline) holds no shell expansion or `<placeholder>`, and its `-c` holds no psql variable (`:name`, `:'name'`, `:"name"`), since psql substitutes them only in what it reads. A `$` in that SQL counts as a value. psql's options come from `psql --help`.
 - A failure branch that prints (`|| echo …`, `|| { echo …; }`, `|| ( echo … )`, or the same with `printf`) ends in `false`, `return 1` or `exit 1` (not negated with `!` or sent to the background), and nothing around it discards its status: `!` or `&` on it, a later `|` or `||`, or an `if` or loop condition, also around a group, subshell or `time` that holds it. A compound command after `||` (`if`, `case`, a loop) is refused: write the branch as `{ …; }`.
 
-They need git, jq, curl and psql on the host, pytest and markdown-it-py in the Python that runs them, and shfmt on PATH (shfmt-py installs it):
+They need git, jq, curl, psql and the Docker CLI on the host, pytest and markdown-it-py in the Python that runs them, and shfmt on PATH (shfmt-py installs it):
 
 ```sh
 uv run --no-project --with pytest==9.0.3 --with markdown-it-py==4.2.0 --with shfmt-py==4.2.0 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
