@@ -4,13 +4,17 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Daily scan of main, so an advisory published after the last merge shows before a PR or a deploy meets it.
+  schedule:
+    - cron: "23 7 * * *"
 
 # Every job starts read-only; only publish widens its token.
 permissions:
   contents: read
 
+# Per event: a queued scheduled run must never replace a queued push run on main, which publishes.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -21,6 +25,7 @@ env:
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -36,7 +41,7 @@ jobs:
       - name: Lint (ruff, shellcheck, actionlint)
         run: PATH="/tmp/it/bin:$PATH" scripts/lint.sh
 
-      - name: Script tests (release watcher, doc shell checks)
+      - name: Script tests (release watcher, doc shell checks, pins)
         run: PATH="/tmp/it/bin:$PATH" pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 
       - name: Unit tests (inside the pinned upstream image)
@@ -182,3 +187,4 @@ jobs:
             echo "- Integration tests and the vulnerability scan passed on this exact digest."
             echo "- Approve this digest in the deployment platform before deploying it."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=Published and verified::${REPOSITORY}:${TAG} ${DIGEST}"
