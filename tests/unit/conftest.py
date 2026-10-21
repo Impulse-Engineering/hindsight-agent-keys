@@ -44,12 +44,19 @@ class RecordedEvents:
     async def record(self, kind, key_id, client_ip, email=None, actor=None, team=None, *, channel=None, delegate=None):
         if self.fail:
             raise RuntimeError("event store unavailable")
-        row = {"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor, "team": team}
-        # A row recorded on no channel (a refused key, a direct call) keeps its old shape, so whole-row
-        # asserts written before channels existed still hold; new tests assert projected fields.
-        if channel is not None:
-            row |= {"channel": channel, "delegate": delegate}
-        self.rows.append(row)
+        # Every column PostgresEventLog writes, so a path that loses its channel shows in a test.
+        self.rows.append(
+            {
+                "kind": kind,
+                "key_id": key_id,
+                "client_ip": client_ip,
+                "email": email,
+                "actor": actor,
+                "team": team,
+                "channel": channel,
+                "delegate": delegate,
+            }
+        )
 
 
 class MemoryStore:

@@ -122,6 +122,14 @@ def client_ip(headers: Mapping[str, str] | None) -> str | None:
     return str(address)
 
 
+def host_and_json(headers: Mapping[str, str]) -> tuple[str, bool]:
+    """What the /ext gates check first: the hostname asked for (lower-cased, without its port),
+    and whether the body is declared as JSON."""
+    host = (headers.get("host") or "").partition(":")[0].lower()
+    content_type = (headers.get("content-type") or "").partition(";")[0].strip().lower()
+    return host, content_type == "application/json"
+
+
 def _client_bucket(client_ip: str | None) -> str | None:
     """The unit one client is throttled by: an IPv4 address, or an IPv6 /64
     (one subscriber typically holds a whole /64 and can rotate within it)."""
@@ -178,15 +186,16 @@ class AgentKeysTenantExtension(TenantExtension):
         self.bootstrap_admins = frozenset(
             e.strip().lower() for e in os.environ.get("AGENT_KEYS_ADMIN_EMAILS", "").split(",") if e.strip()
         )
-        team, audience, host = (config.get(k) or "" for k in ("access_team_domain", "access_aud", "access_host"))
+        # Stripped before anything decides on them, so a blank setting is an unset one.
+        team, audience, host = ((config.get(k) or "").strip() for k in ("access_team_domain", "access_aud", "access_host"))
         # The key pages answer only when all three are set.
-        self.access_host = host.strip().lower() if team and audience and host else None
+        self.access_host = host.lower() if team and audience and host else None
         self._access = AccessVerifier(team, audience) if self.access_host else None
         names = ("delegation_host", "delegation_aud", "workplane_aud", "delegate_client_id")
-        delegation_host, delegation_aud, workplane_aud, client_id = (config.get(k) or "" for k in names)
+        delegation_host, delegation_aud, workplane_aud, client_id = ((config.get(k) or "").strip() for k in names)
         # Delegated Requests answer only when the team and all four delegation settings are set.
         delegation = team and delegation_host and delegation_aud and workplane_aud and client_id
-        self.delegation_host = delegation_host.strip().lower() if delegation else None
+        self.delegation_host = delegation_host.lower() if delegation else None
         self._delegate_client_id = client_id if delegation else None
         # The Delegate's service token is for the delegation application; the person's JWT for WorkPlane's.
         self._delegation = AccessVerifier(team, delegation_aud) if delegation else None
@@ -239,11 +248,12 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def delegate(self, token: str | None) -> str | None:
         """The Delegate's client ID if `token` is a valid service-token JWT for the delegation
-        application issued to the configured client ID, else None. A JWT naming a person never is."""
+        application issued to the configured client ID, else None. A JWT with an email claim, even an
+        empty one, never is."""
         if self._delegation is None or not token:
             return None
         claims = await self._delegation.claims(token)
-        if claims is None or claims.get("email") or claims.get("common_name") != self._delegate_client_id:
+        if claims is None or "email" in claims or claims.get("common_name") != self._delegate_client_id:
             return None
         return self._delegate_client_id
 
@@ -300,7 +310,7 @@ class AgentKeysTenantExtension(TenantExtension):
         key_id = secrets.token_hex(8)
         key = f"hsk_{key_id}_{secrets.token_urlsafe(32)}"
         await self._store.add_key(key_id, self._hmac(key), name, email, schema, kind, self._clock() + KEY_LIFETIME)
-        await self._record("key_created", key_id, client_ip, email, team=schema if kind == "team" else None)
+        await self._record("key_created", key_id, client_ip, email, email, team=schema if kind == "team" else None)
         return key_id, key
 
     async def list_keys(self, email: str) -> list[dict]:
@@ -317,14 +327,14 @@ class AgentKeysTenantExtension(TenantExtension):
         expires_at = now + KEY_LIFETIME
         if not await self._store.renew_key(email, key_id, now, expires_at):
             raise Refused(404, "You hold no active key with that ID.")
-        await self._record("key_renewed", key_id, client_ip, email)
+        await self._record("key_renewed", key_id, client_ip, email, email)
         return expires_at
 
     async def revoke_key(self, email: str, key_id: str, client_ip: str | None) -> None:
         """Revoke one of the person's own keys; it is refused from its next request."""
         if not await self._store.revoke_keys(email, self._clock(), key_id):
             raise Refused(404, "You hold no unrevoked key with that ID.")
-        await self._record("key_revoked", key_id, client_ip, email)
+        await self._record("key_revoked", key_id, client_ip, email, email)
 
     async def revoke_identity(self, admin: str, email: str, client_ip: str | None) -> int:
         """Revoke every key the person holds; returns how many. Admins only."""
@@ -474,7 +484,8 @@ class AgentKeysTenantExtension(TenantExtension):
             # Make the suppression itself visible, once a minute.
             if self._refusal_budget.first_saturation(now):
                 logger.warning("agent-keys: refusal log budget used up; more refusals this minute are not recorded")
-                await self._record("refusal_log_saturated", NO_KEY_ID, None)
+                # Every channel's refusals share the budget, so this row belongs to none of them.
+                await self._record("refusal_log_saturated", NO_KEY_ID, None, tagged=False)
             return
         await self._record(kind, key_id, ip)
 
@@ -486,8 +497,10 @@ class AgentKeysTenantExtension(TenantExtension):
         email: str | None = None,
         actor: str | None = None,
         team: str | None = None,
+        *,
+        tagged: bool = True,
     ) -> None:
-        via = _via.get()
+        via = _via.get() if tagged else None
         channel, delegate = (via.channel, via.delegate) if via else (None, None)
         try:
             await self._events.record(kind, key_id, client_ip, email, actor, team, channel=channel, delegate=delegate)

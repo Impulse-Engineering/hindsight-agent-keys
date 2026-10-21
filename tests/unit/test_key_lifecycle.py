@@ -174,7 +174,10 @@ async def test_an_admin_revoking_an_identity_disables_every_key_the_person_holds
     assert not await works(keys, laptop)
     assert not await works(keys, desktop)
     assert await works(keys, alices)
-    logged = {"kind": "identity_revoked", "key_id": "(none)", "client_ip": "203.0.113.9", "email": BOB, "actor": ALICE, "team": None}
+    logged = {
+        "kind": "identity_revoked", "key_id": "(none)", "client_ip": "203.0.113.9", "email": BOB, "actor": ALICE, "team": None,
+        "channel": None, "delegate": None,
+    }
     assert logged in keys.events.rows
 
 

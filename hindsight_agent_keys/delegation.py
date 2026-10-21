@@ -10,8 +10,8 @@ only, never the store, so every rule and limit the key pages meet applies here t
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from hindsight_agent_keys.extension import acting_via, client_ip
-from hindsight_agent_keys.web import ACCESS_JWT_HEADER
+from hindsight_agent_keys.access import ACCESS_JWT_HEADER
+from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
 
 DELEGATED_JWT_HEADER = "x-delegated-access-jwt"
 
@@ -20,11 +20,10 @@ def delegated_router(memory) -> APIRouter:
     async def delegated_person(request: Request) -> str:
         """The email of the person the Delegate acts for; refuses everything else."""
         keys = memory.tenant_extension
-        host = (request.headers.get("host") or "").partition(":")[0].lower()
+        host, json_body = host_and_json(request.headers)
         if keys.delegation_host is None or host != keys.delegation_host:
             raise HTTPException(404)
-        content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
-        if request.method != "GET" and content_type != "application/json":
+        if request.method != "GET" and not json_body:
             raise HTTPException(403, "State changes need JSON.")
         delegate = await keys.delegate(request.headers.get(ACCESS_JWT_HEADER))
         acting_via("delegated", delegate)

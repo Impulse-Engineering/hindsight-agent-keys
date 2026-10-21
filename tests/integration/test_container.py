@@ -46,7 +46,7 @@ DELEGATION_HOST = "delegation.example.test"
 DELEGATION_AUD = "ci-delegation-aud"
 WORKPLANE_AUD = "ci-workplane-aud"
 DELEGATE_ID = "ci-workplane.access"
-ADMINS =["alice@example.test", "bob@example.test", "carol@example.test", "dave@example.test", "erin@example.test"]
+ADMINS = ["alice@example.test", "bob@example.test", "carol@example.test", "dave@example.test", "erin@example.test"]
 ALICE, BOB, CAROL, DAVE, ERIN = ADMINS
 
 # Routines that only a migration of `public` installs; upstream #5400 leaves them missing.
@@ -201,14 +201,15 @@ def key_page(hindsight, method, path, email, host=ACCESS_HOST, body=None, header
     return http(hindsight["port"], method, path, body=body, headers={**sent, **(headers or {})})
 
 
-def delegated(hindsight, method, path, email, body=None, delegate=None):
+def delegated(hindsight, method, path, email, body=None, delegate=None, person=None):
     """A Delegated Request: WorkPlane's service-token JWT, as Access forwards it, and the person's own JWT.
-    `delegate` overrides the service token's claims; None drops one."""
+    `delegate` and `person` override that credential's claims; None drops one."""
     service = {"common_name": DELEGATE_ID, "sub": "", "aud": [DELEGATION_AUD], **(delegate or {})}
+    signed_in = {"email": email, "aud": [WORKPLANE_AUD], **(person or {})}
     sent = {
         "Host": DELEGATION_HOST,
         "Cf-Access-Jwt-Assertion": access_token(hindsight["name"], **service),
-        "X-Delegated-Access-Jwt": access_token(hindsight["name"], email=email, aud=[WORKPLANE_AUD]),
+        "X-Delegated-Access-Jwt": access_token(hindsight["name"], **signed_in),
     }
     return http(hindsight["port"], method, path, body=body, headers=sent)
 
@@ -480,6 +481,20 @@ def test_a_delegate_files_a_key_allowlist_request_for_the_person_signed_in_to_it
         assert (status, json.loads(text) if status == 200 else text) == (200, {"email": hana, "role": "requested"})
     rows = query(hindsight["name"], f"SELECT kind, actor, channel, delegate FROM agent_keys.events WHERE email = '{hana}'")
     assert rows == [{"kind": "access_requested", "actor": hana, "channel": "delegated", "delegate": DELEGATE_ID}]
+
+
+def test_an_older_person_jwt_on_a_delegated_request_does_not_move_the_sign_in(hindsight):
+    iris, path = "iris@example.test", "/ext/delegated/access-requests"
+    hour_ago = int(time.time()) - 3600
+
+    def last_seen():
+        sql = f"SELECT extract(epoch FROM last_seen)::bigint AS at FROM agent_keys.sign_ins WHERE email = '{iris}'"
+        return [r["at"] for r in query(hindsight["name"], sql)]
+
+    assert delegated(hindsight, "POST", path, iris, body={}, person={"iat": hour_ago})[0] == 200
+    assert last_seen() == [hour_ago]
+    assert delegated(hindsight, "POST", path, iris, body={}, person={"iat": hour_ago - 600})[0] == 200
+    assert last_seen() == [hour_ago]
 
 
 @pytest.fixture(scope="module")

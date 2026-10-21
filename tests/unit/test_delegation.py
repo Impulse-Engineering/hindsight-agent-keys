@@ -10,6 +10,8 @@ from conftest import (
     AUD,
     DELEGATE_ID,
     DELEGATION_AUD,
+    DELEGATION_HOST,
+    WORKPLANE_AUD,
     MemoryStore,
     delegated_app,
     delegated_headers,
@@ -68,14 +70,17 @@ def refused(client, events, headers, delegate):
     [
         {"aud": ["another-application"]},
         {"aud": [AUD]},
+        # The audience must be exactly the delegation application's.
+        {"aud": [DELEGATION_AUD, "another-application"]},
         {"iss": "https://other-team.cloudflareaccess.com"},
         {"exp": int(time.time()) - 60},
         # A person's JWT for the delegation application in place of the service token.
         {"email": ALICE, "common_name": None, "sub": "0f6a1c2e-person"},
         {"common_name": "someone-else.access"},
         {"common_name": None},
-        # Access never issues this, but a token naming a person is never the Delegate.
+        # Access never issues these, but a token with an email claim, even an empty one, is never the Delegate.
         {"email": ALICE},
+        {"email": ""},
     ],
 )
 def test_a_delegate_credential_that_fails_any_check_is_refused(team, claims):
@@ -101,10 +106,13 @@ def test_a_missing_delegate_credential_is_refused(team):
         # The /ext application's JWT, and the Delegate's own audience, are not WorkPlane's.
         {"aud": [AUD]},
         {"aud": [DELEGATION_AUD]},
+        {"aud": [WORKPLANE_AUD, "another-application"]},
         {"iss": "https://other-team.cloudflareaccess.com"},
         {"exp": int(time.time()) - 60},
         {"email": None},
         {"email": ""},
+        {"email": "  "},
+        {"email": 42},
         {"email": None, "common_name": DELEGATE_ID},
         {"iat": None},
         {"iat": str(int(time.time()))},
@@ -133,6 +141,17 @@ def test_refusals_are_throttled_per_client_like_refused_keys(team):
     assert [(r["kind"], r["client_ip"]) for r in events.rows] == [("delegation_refused", "203.0.113.7")]
 
 
+def test_the_row_marking_a_used_up_refusal_budget_names_no_channel_or_delegate(team):
+    client, _, events = delegated_app(team)
+    headers = delegated_headers(team, person={"email": None})
+    for n in range(61):
+        assert client.post(REQUESTS, headers={**headers, "X-Real-IP": f"203.0.113.{n}"}).status_code == 403
+    # The budget is shared by every channel's refusals, so its row belongs to none of them.
+    assert [(r["kind"], r["channel"], r["delegate"]) for r in events.rows[60:]] == [
+        ("refusal_log_saturated", None, None)
+    ]
+
+
 def test_the_person_jwt_dates_the_sign_in_and_an_older_one_does_not_move_it(team):
     store = MemoryStore()
     client, _, _ = delegated_app(team, store)
@@ -157,6 +176,16 @@ def test_delegated_requests_answer_only_on_the_delegation_host(team, host):
 def test_without_full_delegation_configuration_delegated_requests_are_refused(team, missing):
     client, _, _ = delegated_app(team, **{missing: None})
     assert client.post(REQUESTS, headers=delegated_headers(team)).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "blank", ["access_team_domain", "delegation_host", "delegation_aud", "workplane_aud", "delegate_client_id"]
+)
+def test_a_blank_delegation_setting_turns_delegated_requests_off(team, blank):
+    client, _, events = delegated_app(team, **{blank: "   "})
+    for host in (DELEGATION_HOST, ""):
+        assert client.post(REQUESTS, headers={**delegated_headers(team), "Host": host}).status_code == 404
+    assert events.rows == []
 
 
 def test_the_key_pages_do_not_answer_on_the_delegation_host(team):
