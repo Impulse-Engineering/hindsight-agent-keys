@@ -642,7 +642,7 @@ def test_agents_manage_teams_over_both_mcp_endpoints_but_only_an_owner_lets_anyo
         ("owner_requested", CAROL, ALICE),
         ("owner_declined", CAROL, ALICE),
         ("member_confirmed", ERIN, ALICE),
-        ("key_created", ERIN, None),
+        ("key_created", ERIN, ERIN),
         ("member_removed", ERIN, ALICE),
     ]
 
