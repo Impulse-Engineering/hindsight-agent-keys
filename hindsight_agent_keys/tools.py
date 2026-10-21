@@ -12,7 +12,7 @@ from typing import Literal
 from hindsight_api.api.mcp import get_current_api_key, get_current_extra_headers
 from hindsight_api.extensions.mcp import MCPExtension
 
-from hindsight_agent_keys.extension import client_ip
+from hindsight_agent_keys.extension import acting_via, client_ip
 from hindsight_agent_keys.store import Refused
 from hindsight_agent_keys.web import Email, Name
 
@@ -21,6 +21,7 @@ class AgentKeysMcpExtension(MCPExtension):
     def register_tools(self, mcp, memory) -> None:
         async def person() -> str:
             """The email of the person whose personal key made this call; refuses every other key."""
+            acting_via("mcp")
             principal = await memory.tenant_extension.principal(get_current_api_key())
             if principal is None or principal.kind != "personal":
                 raise Refused(403, "Teams can be managed only with a personal Agent Key.")

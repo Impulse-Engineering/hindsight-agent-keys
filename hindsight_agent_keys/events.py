@@ -26,6 +26,8 @@ CREATE INDEX IF NOT EXISTS events_at_idx ON {SCHEMA}.events (at);
 ALTER TABLE {SCHEMA}.events ADD COLUMN IF NOT EXISTS email text;
 ALTER TABLE {SCHEMA}.events ADD COLUMN IF NOT EXISTS actor text;
 ALTER TABLE {SCHEMA}.events ADD COLUMN IF NOT EXISTS team text;
+ALTER TABLE {SCHEMA}.events ADD COLUMN IF NOT EXISTS channel text;
+ALTER TABLE {SCHEMA}.events ADD COLUMN IF NOT EXISTS delegate text;
 """
 
 
@@ -42,6 +44,9 @@ class EventLog(Protocol):
         email: str | None = None,
         actor: str | None = None,
         team: str | None = None,
+        *,
+        channel: str | None = None,
+        delegate: str | None = None,
     ) -> None: ...
 
 
@@ -140,16 +145,21 @@ class PostgresEventLog:
         email: str | None = None,
         actor: str | None = None,
         team: str | None = None,
+        *,
+        channel: str | None = None,
+        delegate: str | None = None,
     ) -> None:
         if self._pool is None:
             return
         await self._pool.execute(
-            f"INSERT INTO {SCHEMA}.events (kind, key_id, client_ip, email, actor, team)"
-            " VALUES ($1, $2, $3, $4, $5, $6)",
+            f"INSERT INTO {SCHEMA}.events (kind, key_id, client_ip, email, actor, team, channel, delegate)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             kind,
             key_id,
             client_ip,
             email,
             actor,
             team,
+            channel,
+            delegate,
         )

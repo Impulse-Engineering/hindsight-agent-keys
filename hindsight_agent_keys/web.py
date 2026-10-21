@@ -3,7 +3,8 @@
 Upstream mounts this router with no authentication of its own, so one gate on the
 router covers every route: the Access-protected hostname only (agents' bypass
 hostname gets 404), a valid Access JWT, and for state changes JSON, a custom header
-and a same-origin Origin. The state lives on the tenant extension.
+and a same-origin Origin. The state lives on the tenant extension. Delegated Requests,
+under /ext/delegated, have their own router and gate (delegation.py).
 """
 
 import html
@@ -16,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from hindsight_api.extensions.http import HttpExtension
 from pydantic import BaseModel, StringConstraints
 
-from hindsight_agent_keys.extension import client_ip
+from hindsight_agent_keys.extension import acting_via, client_ip
 from hindsight_agent_keys.store import Refused
 
 ACCESS_JWT_HEADER = "cf-access-jwt-assertion"
@@ -101,6 +102,7 @@ class AgentKeysHttpExtension(HttpExtension):
             host = (request.headers.get("host") or "").partition(":")[0].lower()
             if keys.access_host is None or host != keys.access_host:
                 raise HTTPException(404)
+            acting_via("ext")
             if request.method != "GET" and not (
                 request.headers.get("content-type", "").partition(";")[0].strip().lower() == "application/json"
                 and request.headers.get(STATE_CHANGE_HEADER) == "1"
@@ -211,7 +213,14 @@ class AgentKeysHttpExtension(HttpExtension):
             return {"team": team, "email": body.email}
 
         router.include_router(admin_router)
-        return router
+        # Imported here: delegation.py builds on this module.
+        from hindsight_agent_keys.delegation import delegated_router
+
+        # The pages' gate stays on their own router; Delegated Requests have their own gate.
+        outer = APIRouter(include_in_schema=False)
+        outer.include_router(router)
+        outer.include_router(delegated_router(memory), prefix="/delegated")
+        return outer
 
 
 PAGE = Template("""<!doctype html>

@@ -195,6 +195,14 @@ async def test_an_admin_revokes_every_key_a_person_holds(team, monkeypatch):
     ]
 
 
+def test_a_change_on_the_key_pages_is_recorded_on_the_ext_channel(team):
+    client, _, events = pages(team)
+    assert client.post("/ext/access-requests", headers=as_person(team, "bob@example.com")).status_code == 204
+    assert [(r["kind"], r["actor"], r["channel"], r["delegate"]) for r in events.rows] == [
+        ("access_requested", "bob@example.com", "ext", None)
+    ]
+
+
 def test_only_an_admin_can_revoke_an_identity_or_sees_how(team):
     client, _, events = pages(team)
     mallory = as_person(team, "mallory@example.com")

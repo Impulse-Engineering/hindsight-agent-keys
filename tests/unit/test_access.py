@@ -24,6 +24,9 @@ async def test_a_valid_token_identifies_the_person_by_lowercase_email_and_when_t
         {"exp": int(time.time()) - 60},
         {"exp": None},
         {"iat": None},
+        # PyJWT accepts any iat that int() can read; a sign-in date must be a number.
+        {"iat": "1700000000"},
+        {"iat": True},
         {"aud": None},
         # A service token carries common_name, not email.
         {"email": None, "common_name": "ci-service-token.access"},

@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -74,6 +75,25 @@ class Principal:
     schema: str
     key_id: str
     email: str | None = None
+
+
+@dataclass(frozen=True)
+class Via:
+    """The channel a request came in on, which every event it records names."""
+
+    channel: str  # "ext" (the key pages), "delegated" (a Delegated Request) or "mcp"
+    delegate: str | None = None  # the Delegate's service-token client ID, on "delegated"
+
+
+# Set once per request by its channel's gate. Each request runs in its own task, and a
+# FastAPI dependency or an MCP tool runs in the task of the handler it serves, so the
+# value reaches every event that request records and no other request's.
+_via: ContextVar[Via | None] = ContextVar("agent_keys_via", default=None)
+
+
+def acting_via(channel: str, delegate: str | None = None) -> None:
+    """Tag every event the current request records with its channel and Delegate."""
+    _via.set(Via(channel, delegate))
 
 
 def _now() -> datetime:
@@ -162,6 +182,15 @@ class AgentKeysTenantExtension(TenantExtension):
         # The key pages answer only when all three are set.
         self.access_host = host.strip().lower() if team and audience and host else None
         self._access = AccessVerifier(team, audience) if self.access_host else None
+        names = ("delegation_host", "delegation_aud", "workplane_aud", "delegate_client_id")
+        delegation_host, delegation_aud, workplane_aud, client_id = (config.get(k) or "" for k in names)
+        # Delegated Requests answer only when the team and all four delegation settings are set.
+        delegation = team and delegation_host and delegation_aud and workplane_aud and client_id
+        self.delegation_host = delegation_host.strip().lower() if delegation else None
+        self._delegate_client_id = client_id if delegation else None
+        # The Delegate's service token is for the delegation application; the person's JWT for WorkPlane's.
+        self._delegation = AccessVerifier(team, delegation_aud) if delegation else None
+        self._workplane = AccessVerifier(team, workplane_aud) if delegation else None
         self._clock = clock or _now
         self._events = events if events is not None else PostgresEventLog()
         self._store = store if store is not None else PostgresKeyStore(self._db_url)
@@ -190,14 +219,33 @@ class AgentKeysTenantExtension(TenantExtension):
         Records the sign-in: agents never pass through Access, so this is the only
         evidence that a key's owner is still with us.
         """
-        if self._access is None or not token:
+        return await self._signed_in(self._access, token)
+
+    async def delegated_email(self, token: str | None) -> str | None:
+        """The person a Delegated Request acts for: the lowercase email of their own Access JWT for
+        WorkPlane's application, or None. Records the sign-in as access_email does, dated by the token."""
+        return await self._signed_in(self._workplane, token)
+
+    async def _signed_in(self, verifier: AccessVerifier | None, token: str | None) -> str | None:
+        if verifier is None or not token:
             return None
-        person = await self._access.email(token)
+        person = await verifier.email(token)
         if person is None:
             return None
         email, signed_in_at = person
+        # The token's iat, never the request time, and never older than the stored sign-in.
         await self._store.signed_in(email, signed_in_at)
         return email
+
+    async def delegate(self, token: str | None) -> str | None:
+        """The Delegate's client ID if `token` is a valid service-token JWT for the delegation
+        application issued to the configured client ID, else None. A JWT naming a person never is."""
+        if self._delegation is None or not token:
+            return None
+        claims = await self._delegation.claims(token)
+        if claims is None or claims.get("email") or claims.get("common_name") != self._delegate_client_id:
+            return None
+        return self._delegate_client_id
 
     async def role(self, email: str) -> str | None:
         """The person's place on the Key Allowlist: 'admin', 'member', 'requested' (asked to join) or None."""
@@ -410,14 +458,15 @@ class AgentKeysTenantExtension(TenantExtension):
         if principal is not None:
             context.api_key_id = principal.key_id
             return TenantContext(schema_name=principal.schema)
+        ip = client_ip(context.extra_headers)
         if self._is_legacy(key):
-            await self._refused(context, "legacy_key_expired", LEGACY_KEY_ID)
+            await self.refused(ip, "legacy_key_expired", LEGACY_KEY_ID)
             raise AuthenticationError("API key expired")
-        await self._refused(context, "key_refused", _key_id(key))
+        await self.refused(ip, "key_refused", _key_id(key))
         raise AuthenticationError("Invalid or missing API key")
 
-    async def _refused(self, context: RequestContext, kind: str, key_id: str) -> None:
-        ip = client_ip(context.extra_headers)
+    async def refused(self, ip: str | None, kind: str, key_id: str = NO_KEY_ID) -> None:
+        """Record a refused request from an unauthenticated client, throttled per client and in total."""
         now = self._clock()
         if not self._throttle.allow(_client_bucket(ip), now):
             return
@@ -438,8 +487,10 @@ class AgentKeysTenantExtension(TenantExtension):
         actor: str | None = None,
         team: str | None = None,
     ) -> None:
+        via = _via.get()
+        channel, delegate = (via.channel, via.delegate) if via else (None, None)
         try:
-            await self._events.record(kind, key_id, client_ip, email, actor, team)
+            await self._events.record(kind, key_id, client_ip, email, actor, team, channel=channel, delegate=delegate)
         except Exception as exc:  # noqa: BLE001 - the decision stands even if it cannot be logged
             logger.warning("agent-keys: could not record %s event: %s", kind, exc)
 

@@ -41,7 +41,12 @@ TEAM = f"http://127.0.0.1:{ACCESS_PORT}"
 AUD = "ci-access-aud"
 ACCESS_HOST = "keys.example.test"
 BYPASS_HOST = "hindsight-api.example.test"
-ADMINS = ["alice@example.test", "bob@example.test", "carol@example.test", "dave@example.test", "erin@example.test"]
+# Delegated Requests: the delegation application and WorkPlane's application, on the same team.
+DELEGATION_HOST = "delegation.example.test"
+DELEGATION_AUD = "ci-delegation-aud"
+WORKPLANE_AUD = "ci-workplane-aud"
+DELEGATE_ID = "ci-workplane.access"
+ADMINS =["alice@example.test", "bob@example.test", "carol@example.test", "dave@example.test", "erin@example.test"]
 ALICE, BOB, CAROL, DAVE, ERIN = ADMINS
 
 # Routines that only a migration of `public` installs; upstream #5400 leaves them missing.
@@ -196,6 +201,18 @@ def key_page(hindsight, method, path, email, host=ACCESS_HOST, body=None, header
     return http(hindsight["port"], method, path, body=body, headers={**sent, **(headers or {})})
 
 
+def delegated(hindsight, method, path, email, body=None, delegate=None):
+    """A Delegated Request: WorkPlane's service-token JWT, as Access forwards it, and the person's own JWT.
+    `delegate` overrides the service token's claims; None drops one."""
+    service = {"common_name": DELEGATE_ID, "sub": "", "aud": [DELEGATION_AUD], **(delegate or {})}
+    sent = {
+        "Host": DELEGATION_HOST,
+        "Cf-Access-Jwt-Assertion": access_token(hindsight["name"], **service),
+        "X-Delegated-Access-Jwt": access_token(hindsight["name"], email=email, aud=[WORKPLANE_AUD]),
+    }
+    return http(hindsight["port"], method, path, body=body, headers=sent)
+
+
 def personal_key(hindsight, email, name="ci"):
     status, text = key_page(hindsight, "POST", "/ext/keys", email, body={"name": name})
     assert status == 200, text
@@ -240,6 +257,10 @@ def hindsight(volume):
         "HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN": TEAM,
         "HINDSIGHT_API_TENANT_ACCESS_AUD": AUD,
         "HINDSIGHT_API_TENANT_ACCESS_HOST": ACCESS_HOST,
+        "HINDSIGHT_API_TENANT_DELEGATION_HOST": DELEGATION_HOST,
+        "HINDSIGHT_API_TENANT_DELEGATION_AUD": DELEGATION_AUD,
+        "HINDSIGHT_API_TENANT_WORKPLANE_AUD": WORKPLANE_AUD,
+        "HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID": DELEGATE_ID,
         # Mixed case and spaces, as an operator might type them.
         "AGENT_KEYS_ADMIN_EMAILS": " , ".join(e.capitalize() for e in ADMINS),
     }
@@ -448,6 +469,17 @@ def test_an_admin_manages_the_key_allowlist(hindsight):
         ("access_approved", ALICE),
         ("allowlist_removed", ALICE),
     ]
+
+
+def test_a_delegate_files_a_key_allowlist_request_for_the_person_signed_in_to_it(hindsight):
+    hana, path = "hana@example.test", "/ext/delegated/access-requests"
+    # A person's JWT in place of WorkPlane's service token is refused.
+    assert delegated(hindsight, "POST", path, hana, body={}, delegate={"email": hana, "common_name": None})[0] == 403
+    for _ in range(2):
+        status, text = delegated(hindsight, "POST", path, hana, body={})
+        assert (status, json.loads(text) if status == 200 else text) == (200, {"email": hana, "role": "requested"})
+    rows = query(hindsight["name"], f"SELECT kind, actor, channel, delegate FROM agent_keys.events WHERE email = '{hana}'")
+    assert rows == [{"kind": "access_requested", "actor": hana, "channel": "delegated", "delegate": DELEGATE_ID}]
 
 
 @pytest.fixture(scope="module")
