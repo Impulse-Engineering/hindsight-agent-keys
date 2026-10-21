@@ -353,7 +353,9 @@ class AgentKeysTenantExtension(TenantExtension):
             key_id, self._hmac(key), name, email, schema, kind, expires_at, via=via, idempotency=idempotency, **limits
         )
         if stored != key_id:
-            # A repeat: the key it created, whose secret was shown once and never again.
+            # A repeat: the key it created, whose secret was shown once and never again. It records no event,
+            # so a key stored just before the process stopped (or the event log failed) keeps no key_created
+            # row; the key is listed and works as any other (README, "Delegated Requests").
             return stored, None
         await self._record("key_created", key_id, client_ip, email, email, team=schema if kind == "team" else None)
         return key_id, key
@@ -361,13 +363,16 @@ class AgentKeysTenantExtension(TenantExtension):
     # With `via_workplane`, the next three reach only the person's keys created via WorkPlane.
 
     async def list_keys(self, email: str, *, via_workplane: bool = False) -> list[dict]:
-        """The person's own keys, oldest first, each with its state and whole days to expiry (rounded up)."""
+        """The person's own keys, oldest first, each with its state and whole days to expiry (rounded up;
+        0 once expired, None once revoked, so a revoked key never looks due for renewal)."""
         now = self._clock()
         return [
             {
                 **row,
                 "state": "revoked" if row["revoked_at"] else "expired" if now >= row["expires_at"] else "active",
-                "days_to_expiry": max(0, math.ceil((row["expires_at"] - now) / timedelta(days=1))),
+                "days_to_expiry": None
+                if row["revoked_at"]
+                else max(0, math.ceil((row["expires_at"] - now) / timedelta(days=1))),
             }
             for row in await self._store.list_keys(email, via_workplane=via_workplane)
         ]
@@ -386,10 +391,16 @@ class AgentKeysTenantExtension(TenantExtension):
         return expires_at
 
     async def revoke_key(self, email: str, key_id: str, client_ip: str | None, *, via_workplane: bool = False) -> None:
-        """Revoke one of the person's own keys; it is refused from its next request."""
-        if not await self._store.revoke_keys(email, self._clock(), key_id, via_workplane=via_workplane):
-            raise Refused(404, "You hold no unrevoked key with that ID.")
-        await self._record("key_revoked", key_id, client_ip, email, email)
+        """Revoke one of the person's own keys; it is refused from its next request. With `via_workplane`
+        (a Delegated Request), a repeat for one of those keys already revoked changes and records nothing."""
+        if await self._store.revoke_keys(email, self._clock(), key_id, via_workplane=via_workplane):
+            await self._record("key_revoked", key_id, client_ip, email, email)
+            return
+        if via_workplane and any(
+            k["id"] == key_id and k["revoked_at"] for k in await self._store.list_keys(email, via_workplane=True)
+        ):
+            return
+        raise Refused(404, "You hold no unrevoked key with that ID.")
 
     async def revoke_identity(self, admin: str, email: str, client_ip: str | None) -> int:
         """Revoke every key the person holds; returns how many. Admins only."""

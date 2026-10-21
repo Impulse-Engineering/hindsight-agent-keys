@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from conftest import ACCESS_HOST, DELEGATE_ID, delegated_app, delegated_headers
 
+from hindsight_agent_keys.store import Refused
+
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
 KEYS = "/ext/delegated/keys"
@@ -229,3 +231,57 @@ async def test_a_repeated_revoke_answers_the_current_state_and_is_recorded_once(
         assert (resp.status_code, resp.json()) == (200, {"id": key["id"], "state": "revoked"})
     assert await ext.principal(key["key"]) is None
     assert [r["kind"] for r in events.rows] == ["key_created", "key_revoked"]
+
+
+def test_a_revoke_refused_for_another_reason_answers_that_refusal(team, monkeypatch):
+    client, ext, _ = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    key_id = create(client, team).json()["id"]
+
+    async def unavailable(*args, **kwargs):
+        raise Refused(503, "Try again later.")
+
+    monkeypatch.setattr(ext._store, "revoke_keys", unavailable)
+    resp = client.post(f"{KEYS}/{key_id}/revoke", headers=delegated_headers(team))
+    assert (resp.status_code, resp.json()) == (503, {"detail": "Try again later."})
+    assert ext._store.keys[key_id]["revoked_at"] is None
+
+
+def test_every_delegated_key_change_names_the_channel_the_delegate_and_the_person(team):
+    client, ext, events = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    key_id = create(client, team).json()["id"]
+    for action in ("renew", "revoke"):
+        assert client.post(f"{KEYS}/{key_id}/{action}", headers=delegated_headers(team)).status_code == 200
+    assert [(r["kind"], r["key_id"], r["email"], r["actor"], r["channel"], r["delegate"]) for r in events.rows] == [
+        (kind, key_id, ALICE, ALICE, "delegated", DELEGATE_ID) for kind in ("key_created", "key_renewed", "key_revoked")
+    ]
+
+
+def test_a_revoked_key_has_no_days_to_expiry_and_an_expired_one_has_none_left(team):
+    clock = Clock()
+    client, ext, _ = delegated_app(team, clock=clock)
+    ext._store.roles[ALICE] = "member"
+    revoked, expired = (create(client, team, idempotency_key=n, person=issued(START)).json()["id"] for n in "ab")
+    assert client.post(f"{KEYS}/{revoked}/revoke", headers=delegated_headers(team)).status_code == 200
+    clock.now = START + 90 * DAY
+    # WorkPlane renews keys near expiry, so a revoked key must not look like one; the key page shows the same.
+    on_the_page = client.get("/ext/keys", headers=on_the_key_page(team)).json()
+    delegated = client.get(KEYS, headers=delegated_headers(team)).json()
+    for listed in (on_the_page, delegated):
+        assert {k["id"]: (k["state"], k["days_to_expiry"]) for k in listed} == {
+            revoked: ("revoked", None),
+            expired: ("expired", 0),
+        }
+
+
+def test_a_retry_after_an_unrecorded_creation_returns_the_key_and_records_nothing(team):
+    client, ext, events = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    # The key is stored but its key_created event is not (the event log failed, or the process stopped between them).
+    events.fail = True
+    key_id = create(client, team).json()["id"]
+    events.fail = False
+    assert create(client, team).json() == {"id": key_id, "name": "workplane"}
+    assert events.rows == []
+    assert [k["id"] for k in client.get(KEYS, headers=delegated_headers(team)).json()] == [key_id]

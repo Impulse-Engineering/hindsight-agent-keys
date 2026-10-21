@@ -16,7 +16,6 @@ from fastapi.responses import JSONResponse
 from hindsight_agent_keys.access import ACCESS_JWT_HEADER
 from hindsight_agent_keys.bodies import NewKey, _or_refused
 from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
-from hindsight_agent_keys.store import Refused
 
 DELEGATED_JWT_HEADER = "x-delegated-access-jwt"
 
@@ -84,13 +83,8 @@ def delegated_router(memory) -> APIRouter:
     @router.post("/keys/{key_id}/revoke")
     async def revoke_key(key_id: str, request: Request, email: str = Depends(delegated_person)):
         """A repeat answers the same: the key is revoked."""
-        keys = memory.tenant_extension
-        try:
-            await keys.revoke_key(email, key_id, client_ip(request.headers), via_workplane=True)
-        except Refused:
-            # Nothing left to revoke: fine if the key is one of these and so already revoked.
-            if key_id not in {k["id"] for k in await keys.list_keys(email, via_workplane=True)}:
-                raise HTTPException(404, "You hold no key with that ID created via WorkPlane.") from None
+        revocation = memory.tenant_extension.revoke_key(email, key_id, client_ip(request.headers), via_workplane=True)
+        await _or_refused(revocation)
         return {"id": key_id, "state": "revoked"}
 
     # Admin (#1003)
