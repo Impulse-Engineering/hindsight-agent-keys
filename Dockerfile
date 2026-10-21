@@ -1,8 +1,6 @@
-FROM ghcr.io/vectorize-io/hindsight:0.10.3@sha256:b5da1a9aece1f53a15f12821fb1470f358ed6c74dfaa0c4b1a39c3f3ae93e002
-
-LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hindsight-agent-keys" \
-      org.opencontainers.image.description="Hindsight with a tenant extension for self-issued Agent Keys" \
-      org.opencontainers.image.licenses="MIT"
+# Two images from one pin: the API image (the default, last stage) and the UI image (--target ui).
+# scripts/upstream-ref.sh reads this pin, and the upstream-release workflow bumps it for both.
+FROM ghcr.io/vectorize-io/hindsight:0.10.3@sha256:b5da1a9aece1f53a15f12821fb1470f358ed6c74dfaa0c4b1a39c3f3ae93e002 AS base
 
 # Fixed versions over upstream's lockfile, for advisories the scan blocks or reports as High:
 # GHSA-h4mw-j7qp-8mwm (claude-agent-sdk), GHSA-2g87-pp6c-29x5 and GHSA-5wr8-gcqf-gqf3 (aiohttp, which needs this yarl).
@@ -18,6 +16,21 @@ RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
     uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
       --python /app/api/.venv/bin/python -r /tmp/pins.txt && \
     uv pip check --python /app/api/.venv/bin/python
+
+# The UI image: upstream's web UI, one process per Team, never the API (README, "The UI image").
+# It keeps the pinned Python fixes above, so the same scan passes on both images.
+FROM base AS ui
+LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hindsight-agent-keys" \
+      org.opencontainers.image.description="Hindsight's web UI, one process per Team" \
+      org.opencontainers.image.licenses="MIT"
+COPY docker/ui-start.sh /app/ui-start.sh
+ENTRYPOINT ["/app/ui-start.sh"]
+CMD []
+
+FROM base
+LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hindsight-agent-keys" \
+      org.opencontainers.image.description="Hindsight with a tenant extension for self-issued Agent Keys" \
+      org.opencontainers.image.licenses="MIT"
 
 COPY hindsight_agent_keys /app/extensions/hindsight_agent_keys
 # The script's executable bit comes from git; COPY keeps it.

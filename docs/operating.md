@@ -1,6 +1,6 @@
 # Operating multi-user Hindsight
 
-How to run the `hindsight` app on this image day to day: the Key Allowlist, Agent Keys, Teams, revoking an identity, upstream upgrades and troubleshooting. The [README](../README.md) states the rules each part enforces; this page says who does what and how to check it. The cut-over and its rollback are in [cutover.md](cutover.md).
+How to run the `hindsight` app on this image day to day: the Key Allowlist, Agent Keys, Teams, the `hindsight-ui` app, revoking an identity, upstream upgrades and troubleshooting. The [README](../README.md) states the rules each part enforces; this page says who does what and how to check it. The cut-over and its rollback are in [cutover.md](cutover.md).
 
 Commands marked *(not verified)* have not been run on Dev. Commands marked **CT** run on the app's container, after the setup block in [cutover.md](cutover.md) (the one that defines `pg` and `api`).
 
@@ -70,6 +70,32 @@ read -r -p 'Email: ' email &&
 - **Over MCP**, the Team tools need a personal Agent Key; a Team key, a Public Team key or the legacy key gets an error. A bank whose config sets `mcp_enabled_tools` hides them on that bank's endpoint unless it names them.
 - **The Public Team** has no owners or members: everyone on the Key Allowlist can create a Public Team key.
 
+## The UI app
+
+The `hindsight-ui` app runs the UI image (README, "The UI image"): one upstream UI per Team, each on its own port and hostname, all behind the app's Access policy (on Prod, platform admins). A UI shows its Team's banks to everyone that policy admits.
+
+- **Its keys** are Agent Keys like any other, held by whoever created them: a Team key, created on `/ext/teams` by a member of the Team, or a Public Team key for `public`. A UI stops showing banks when its key stops, so the holder opens `/ext/` at least once every 30 days and renews the key on `/ext/` before its 90 days run out. A renewed key keeps its value, so the secret stays as it is. A replaced key needs its secret set again, which restarts the app.
+- **Memory.** Each UI takes roughly 150 to 200 MB. An app is capped at 8 GB, about 36 Teams, so raise the CT's memory as Teams are added.
+- **A refused start** leaves every Team's UI down, never open: the log's `ui-start: refusing to start:` lines name each problem. Fix the secret they name; setting it restarts the app.
+
+### Adding a Team *(not verified)*
+
+Do the steps in this order. Each step leaves the Teams already listed serving, and each interruption leaves a state the next step picks up from: after step 1 nothing serves the new key; after step 2 the new UI runs inside the CT where nothing routes to it; after step 3 its port is published but no hostname reaches it; step 4 adds its hostname behind Access.
+
+1. **Its key.** Create a Team key for the Team on `/ext/teams`. Register the secret `HINDSIGHT_UI_KEY_<TEAM>` (the Team's name upper-cased, `-` as `_`) with `platform_request_secret` and set it with `platform_set_secret`. The app restarts; nothing reads the new key yet.
+2. **The Team list.** Set `HINDSIGHT_UI_TEAMS` to the current list plus `<team>:<port>`, with a port no listed Team uses (the next after the highest, such as `10000` after `9999`). The app restarts with the new UI. If it refuses to start, fix what its log names (above).
+3. **The port.** With `platform_update_app`, append `{"port": <port>, "label": "<team>"}` to `image_ports`, keeping every existing entry as it is and in order (they are append-only), then deploy with `platform_deploy_lxc`. The deploy publishes the port; wait until `platform_get_app` lists it under `applied_image_ports`.
+4. **The hostname.** `platform_request_domain` for `<team>.hindsight.aseva.ai` with `container_port_label` set to `<team>`. On this internal app the hostname is behind the app's Access application before it routes.
+5. **Check.** Open the hostname: it lists the Team's banks and no other Team's.
+
+### Moving `hindsight-ui` onto the image *(not verified)*
+
+The app ran stock upstream with one key in `HINDSIGHT_CP_DATAPLANE_API_KEY`. Keep that secret until the new image is checked: stock upstream reads it, so going back is a rollback to the stock digest.
+
+1. Set `HINDSIGHT_UI_KEY_PUBLIC` to the same key, and `HINDSIGHT_UI_TEAMS` to `public:9999`, the port the app already publishes. Stock upstream ignores both; each set restarts it unchanged.
+2. Set `container_image` to the `hindsight-ui` digest that `verify-published` passed, approve it (`platform_approve_image`, platform admin) and deploy. The hostnames keep the same Access application throughout, so nothing opens during the swap.
+3. Check that each hostname lists the Public Team's banks, then add the other Teams as above. `HINDSIGHT_CP_DATAPLANE_API_KEY` and `HINDSIGHT_ENABLE_API` are no longer read; delete them once the image has run without a rollback.
+
 ## Stale personal schemas
 
 `/ext/admin` lists each personal schema that no valid key has reached for 90 days. Nothing is deleted on its own. To purge one, follow the README, ["Stale personal schemas"](../README.md#stale-personal-schemas): take a backup first ([cutover.md](cutover.md), step 1), copy `scripts/purge-schema.sql` onto the CT, and run it for one schema at a time. If it stops after `Unlisted`, read its last error: `no rows returned for \gset` means the schema is in use again and nothing was dropped; any other error means follow the README's recovery, which puts the schema back on the list only if it still exists, then run the script again. If the recovery returns no row because the schema is gone, the purge is done.
@@ -93,7 +119,7 @@ Each upstream release reaches Prod through a PR, a published digest and a platfo
 
 1. **PR.** The daily `upstream-release` workflow opens a PR that pins the new release and links its notes. A maintainer selects **Approve workflows to run**. Read the notes for changes to the tenant, HTTP or MCP extension interfaces, new routes that skip authentication, and new settings that would weaken isolation; each such setting needs a startup guard row. The unit tests fail if the release lets a bank or tenant override another setting the guard checks. Drop each pin in `docker/pins.txt` that the release already meets, since an exact pin would downgrade it, and regenerate the file as the Dockerfile's comment shows. Once no pin is left, delete the file and the Dockerfile's whole pin block: its comments and the `RUN` line that installs it.
 2. **Merge.** A code owner merges once the `test` and `scan` checks pass. CI on `main` publishes the image, then the `verify-published` job runs the integration tests and the scan on that exact digest. Its summary and a notice on the run name the tag and digest. Approve no other digest. To check its signature, see the README, "CI and publishing".
-3. **Dev.** `platform_update_app container_image=ghcr.io/impulse-engineering/hindsight-agent-keys@sha256:<digest>`, then `platform_approve_image` (platform admin), then `platform_get_deploy_status` until the job is `completed` with `Applied image ref recorded:` naming the digest. Check on the bypass hostname that a request with no key gets 401 and that a key reaches its banks ([cutover.md](cutover.md), step 8).
+3. **Dev.** `platform_update_app container_image=ghcr.io/impulse-engineering/hindsight-agent-keys@sha256:<digest>`, then `platform_approve_image` (platform admin), then `platform_get_deploy_status` until the job is `completed` with `Applied image ref recorded:` naming the digest. Check on the bypass hostname that a request with no key gets 401 and that a key reaches its banks ([cutover.md](cutover.md), step 8). Deploy the run's `hindsight-ui` digest to a UI app the same way, after the API it calls.
 4. **Prod.** Back up first ([cutover.md](cutover.md), step 1): the new release migrates `public` and every listed schema when it starts. Then deploy as on Dev.
 
 **Auth state:** the bypass hostname can stay open. Every digest of this image runs the startup guard, so no container of it serves without our extension; the old container answers until the deploy completes, then the new one does. If the keyless check does not return 401, close the bypass hostname at once ([cutover.md](cutover.md), step 3).

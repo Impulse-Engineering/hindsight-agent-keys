@@ -1,6 +1,7 @@
 """CODING_STANDARDS.md rule 5, "Pin what runs", over every file CI or the image runs.
 
-A pin sits at a site: a `uses:` key, a Dockerfile `FROM`, an `image=` or `image:` value, the image word of a
+A pin sits at a site: a `uses:` key, a Dockerfile `FROM` (one that names an earlier `AS` stage builds on that
+stage's pin), an `image=` or `image:` value, the image word of a
 `docker run`, `pull` or `create`, or a `pip install`. Shell words are read with shlex (POSIX quoting) and split
 into commands at control operators; docker's options that take a value come from its own --help. An image
 word that is a variable is checked at its one assignment in the same file. These forms, which it does not
@@ -125,9 +126,13 @@ def upstream_ref():
 
 def image_sites():
     """(where, image, the line that pins it) for every image a file runs."""
+    stages = set()
     for path, where, text in every_line():
-        if os.path.basename(path) == "Dockerfile" and (m := re.match(r"(?i)^\s*FROM\s+(?:--\S+\s+)*(\S+)", text)):
-            yield where, m.group(1), text
+        from_line = r"(?i)^\s*FROM\s+(?:--\S+\s+)*(\S+)(?:\s+AS\s+(\S+))?"
+        if os.path.basename(path) == "Dockerfile" and (m := re.match(from_line, text)):
+            if m.group(1) not in stages:
+                yield where, m.group(1), text
+            stages.add(m.group(2))
         for m in re.finditer(r"(?:\bimage=|^\s*image:\s+)(\S+)", text):
             yield where, m.group(1).strip("'\""), text
         if (m := USES.match(text)) and m.group(1).startswith("docker://"):
