@@ -327,7 +327,8 @@ async def test_team_key_creation_is_logged_with_the_team():
     team = await ext.create_team(ALICE, "Platform", None)
     key_id, _ = await ext.create_team_key(ALICE, team, "ci", "203.0.113.7")
     assert events.rows[-1] == {
-        "kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "actor": None, "team": team
+        "kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "actor": ALICE, "team": team,
+        "channel": None, "delegate": None,
     }
 
 

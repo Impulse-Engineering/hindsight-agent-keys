@@ -100,7 +100,10 @@ async def test_a_refused_key_is_recorded_with_the_client_ip():
     ext, events = watched()
     await refuse(ext, request("not-a-key"))
     assert events.rows == [
-        {"kind": "key_refused", "key_id": "(unrecognized)", "client_ip": "203.0.113.7", "email": None, "actor": None, "team": None}
+        {
+            "kind": "key_refused", "key_id": "(unrecognized)", "client_ip": "203.0.113.7", "email": None, "actor": None,
+            "team": None, "channel": None, "delegate": None,
+        }
     ]
 
 

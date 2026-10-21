@@ -3,7 +3,8 @@
 Upstream mounts this router with no authentication of its own, so one gate on the
 router covers every route: the Access-protected hostname only (agents' bypass
 hostname gets 404), a valid Access JWT, and for state changes JSON, a custom header
-and a same-origin Origin. The state lives on the tenant extension.
+and a same-origin Origin. The state lives on the tenant extension. Delegated Requests,
+under /ext/delegated, have their own router and gate (delegation.py).
 """
 
 import html
@@ -16,10 +17,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from hindsight_api.extensions.http import HttpExtension
 from pydantic import BaseModel, StringConstraints
 
-from hindsight_agent_keys.extension import client_ip
+from hindsight_agent_keys.access import ACCESS_JWT_HEADER
+from hindsight_agent_keys.delegation import delegated_router
+from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
 from hindsight_agent_keys.store import Refused
 
-ACCESS_JWT_HEADER = "cf-access-jwt-assertion"
 STATE_CHANGE_HEADER = "x-agent-keys"
 # No page may be framed, so nobody can trick a signed-in admin into clicking Approve or Grant.
 NO_FRAMING = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'"}
@@ -98,11 +100,12 @@ class AgentKeysHttpExtension(HttpExtension):
         async def person(request: Request) -> str:
             """The signed-in person's email; refuses everything else."""
             keys = memory.tenant_extension
-            host = (request.headers.get("host") or "").partition(":")[0].lower()
+            host, json_body = host_and_json(request.headers)
             if keys.access_host is None or host != keys.access_host:
                 raise HTTPException(404)
+            acting_via("ext")
             if request.method != "GET" and not (
-                request.headers.get("content-type", "").partition(";")[0].strip().lower() == "application/json"
+                json_body
                 and request.headers.get(STATE_CHANGE_HEADER) == "1"
                 and request.headers.get("origin") == f"https://{keys.access_host}"
             ):
@@ -211,7 +214,11 @@ class AgentKeysHttpExtension(HttpExtension):
             return {"team": team, "email": body.email}
 
         router.include_router(admin_router)
-        return router
+        # The pages' gate stays on their own router; Delegated Requests have their own gate.
+        outer = APIRouter(include_in_schema=False)
+        outer.include_router(router)
+        outer.include_router(delegated_router(memory), prefix="/delegated")
+        return outer
 
 
 PAGE = Template("""<!doctype html>

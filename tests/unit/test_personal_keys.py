@@ -138,7 +138,10 @@ async def test_key_creation_is_recorded_with_the_key_id_person_and_client_ip():
     ext, _, _, events = extension()
     key_id, key = await ext.create_personal_key(ALICE, "laptop", "203.0.113.7")
     assert events.rows == [
-        {"kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "actor": None, "team": None}
+        {
+            "kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "actor": ALICE,
+            "team": None, "channel": None, "delegate": None,
+        }
     ]
     assert key.split("_", 2)[2] not in repr(events.rows)
 

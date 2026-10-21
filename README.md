@@ -17,8 +17,8 @@ Upstream serves these routes without a key, and they carry no memory data: `/hea
 - **The tenant extension** `hindsight_agent_keys.extension:AgentKeysTenantExtension`.
   - It lists `public` first, then every personal and Team schema, so startup migrates them all and the worker processes them (`public` also because of upstream issue #5400). If the database cannot be read when Hindsight starts, startup fails rather than skip a schema; later, the worker keeps the last list it had.
   - Banks cannot switch on upstream audit logging from now on. A bank that stored the setting under stock Hindsight, or brought it in through a bank import or clone, keeps it, but it has no effect: see "Safe defaults".
-  - It writes its own event log (see "The event log"): refused keys, and every key, Key Allowlist and Team change. A refusal row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one refusal row a minute, whatever the refusal. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process. The other rows also name the people (`email`, `actor`) and the Team (`team`) they concern, and are not throttled.
-- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist", "Teams" and "Stale personal schemas").
+  - It writes its own event log (see "The event log"): refused keys and refused Delegated Requests, and every key, Key Allowlist and Team change. A refusal row holds the key ID (never the secret), the client IP and the time. Each client (an IPv4 address, or an IPv6 /64) gets at most one refusal row a minute, whatever the refusal. All clients together get at most 60 refusal rows a minute, plus one `refusal_log_saturated` row when that budget runs out. The limits apply per API process. The other rows also name the people (`email`, `actor`) and the Team (`team`) they concern, and are not throttled. A row also names the channel the request came in on and the Delegate, if any (`channel`, `delegate`).
+- **The key pages** `hindsight_agent_keys.web:AgentKeysHttpExtension`, under `/ext` (see "Personal Agent Keys", "The Key Allowlist", "Teams" and "Stale personal schemas"), and Delegated Requests under `/ext/delegated` (see "Delegated Requests").
 - **Team tools for agents** `hindsight_agent_keys.tools:AgentKeysMcpExtension`, on both MCP endpoints (see "Teams over MCP").
 - **A startup guard**, described in its own section below.
 - **Safe defaults:** the UI is off, MCP is stateless, upstream audit logging is off, and the `X-Real-IP` header is passed through to the extension. Audit logging stays off for every bank because the audit action allowlist, `HINDSIGHT_API_AUDIT_LOG_ACTIONS`, is `(none)`, which names no action. Upstream checks that deployment-wide list before a bank's stored `audit_log_enabled`, and no bank can change it.
@@ -49,12 +49,16 @@ Of these settings, a bank's stored config or a tenant's config can override only
 | `HINDSIGHT_API_TENANT_LEGACY_KEY` | The legacy key, which reaches the Public Team. Without it only Agent Keys work. Supply it as a secret. |
 | `HINDSIGHT_API_TENANT_LEGACY_KEY_EXPIRES` | Optional ISO date or datetime (a bare date means midnight UTC). From then on the legacy key is refused. An unreadable value stops startup. |
 | `HINDSIGHT_API_TENANT_KEY_PEPPER` | The server-side secret Agent Keys are hashed with, at least 32 bytes; a shorter value stops startup. Without it no key can be created and every Agent Key is refused; the legacy key still works. Changing it invalidates every Agent Key. Supply it as a secret. |
-| `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` | The Cloudflare Access team URL, such as `https://<team>.cloudflareaccess.com` (Conductor's `CF_ACCESS_TEAM_DOMAIN`). It is the JWT issuer and serves the signing keys. |
+| `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN` | The Cloudflare Access team URL, such as `https://<team>.cloudflareaccess.com` (Conductor's `CF_ACCESS_TEAM_DOMAIN`). It is the JWT issuer and serves the signing keys, for the key pages and Delegated Requests alike. |
 | `HINDSIGHT_API_TENANT_ACCESS_AUD` | The Access application's AUD tag (Conductor's `CF_ACCESS_AUD`). It changes if the Access application is recreated. |
 | `HINDSIGHT_API_TENANT_ACCESS_HOST` | The app's Access-protected hostname, such as `hindsight.example.com`. The key pages answer only on it. |
 | `AGENT_KEYS_ADMIN_EMAILS` | Comma-separated emails of the bootstrap admins; case and spaces are ignored. They are always admins, so always on the Key Allowlist, and the admin page cannot change them. |
+| `HINDSIGHT_API_TENANT_DELEGATION_HOST` | The delegation application's hostname, such as `hindsight-delegation.example.com`. Delegated Requests answer only on it (see "Delegated Requests"). |
+| `HINDSIGHT_API_TENANT_DELEGATION_AUD` | The delegation application's AUD tag. The Delegate's service-token JWT must carry it. |
+| `HINDSIGHT_API_TENANT_WORKPLANE_AUD` | The AUD tag of WorkPlane's own Access application. The person's JWT on a Delegated Request must carry it. |
+| `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID` | The client ID of WorkPlane's Access service token (it ends in `.access`; not a secret). The Delegate's JWT must name it in `common_name`. |
 
-Without all three `ACCESS` settings the key pages refuse every request. Keep the Access application's session duration under 30 days, including any policy session duration; Cloudflare's default is 24 hours. A key page request is a sign-in dated by its token's `iat`, and Access keeps the same token for the whole session, so a session of 30 days or more can stop the keys of someone who opens the page every day (see "Sign-in" under "Personal Agent Keys"). Everything else is upstream Hindsight configuration, such as the LLM provider and its key.
+`.env.example` lists every setting in this table. An `ACCESS` or delegation setting that is only spaces counts as unset. Without all three `ACCESS` settings the key pages refuse every request. Without all four delegation settings and `HINDSIGHT_API_TENANT_ACCESS_TEAM_DOMAIN`, Delegated Requests get 404. Keep the Access application's session duration under 30 days, including any policy session duration; Cloudflare's default is 24 hours. A key page request is a sign-in dated by its token's `iat`, and Access keeps the same token for the whole session, so a session of 30 days or more can stop the keys of someone who opens the page every day (see "Sign-in" under "Personal Agent Keys"). Everything else is upstream Hindsight configuration, such as the LLM provider and its key.
 
 Behind a proxy, set `X-Real-IP` to the real client address and overwrite any value the client sent. Otherwise the event log records whatever the client claims.
 
@@ -62,7 +66,7 @@ Behind a proxy, set `X-Real-IP` to the real client address and overwrite any val
 
 A person on the Key Allowlist opens `https://<access host>/ext/`, names a key and creates it. Agents then send it as `Authorization: Bearer hsk_<id>_<secret>` on the bypass hostname, over the API and MCP.
 
-- **Who:** the key pages trust only the Access JWT in `Cf-Access-Jwt-Assertion`. It must be RS256, signed by a key the team publishes, issued by the team URL, carry the AUD tag, and have `exp` and `iat`. The person is its `email`, lower-cased; no other claim is read. A token without `email` (a service token) is refused. Signing keys are fetched from the team and fetched again when a token names an unknown key ID, at most every 30 seconds.
+- **Who:** the key pages trust only the Access JWT in `Cf-Access-Jwt-Assertion`. It must be RS256, signed by a key the team publishes, issued by the team URL, carry the AUD tag and no other audience, and have `exp` and a numeric `iat`. The person is its `email`, trimmed and lower-cased; no other claim is read. A token without an `email` string that is more than spaces (a service token has none) is refused. Signing keys are fetched from the team and fetched again when a token names an unknown key ID, at most every 30 seconds.
 - **Where:** only on `HINDSIGHT_API_TENANT_ACCESS_HOST`. Any other `Host`, including the bypass hostname, gets 404.
 - **State changes** (anything but `GET`) also need `Content-Type: application/json`, the header `X-Agent-Keys: 1`, and `Origin: https://<access host>`; otherwise 403.
 - **Framing:** `/ext/`, `/ext/admin` and `/ext/teams` send `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`, so no other site can frame them and trick a signed-in person into pressing their buttons.
@@ -108,6 +112,24 @@ Agents manage Teams with these tools, on the multi-bank endpoint `/mcp/` and on 
 
 A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer. Only owners on the Key Allowlist and admins can file requests and remove people. A bank whose config sets `mcp_enabled_tools` hides every tool not named there, these included.
 
+## Delegated Requests
+
+A Delegate (WorkPlane, the organization's agent) acts for a person signed in to it, with that person's rights, through routes under `https://<delegation host>/ext/delegated/`. It calls them server to server.
+
+- **Two credentials,** each verified on its own; failing either gets 403. Both are RS256 JWTs signed by a key the Access team publishes and issued by the team URL, with `exp`, a numeric `iat`, and their application's AUD tag and no other audience.
+  - **The Delegate:** the service-token JWT that Access forwards in `Cf-Access-Jwt-Assertion`. It must carry the delegation application's AUD tag, name `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID` in `common_name`, and have no `email` claim at all, not even an empty one, so a person's JWT in its place is refused.
+  - **The person:** their own Access JWT for WorkPlane's application, which WorkPlane forwards in `X-Delegated-Access-Jwt`. It must carry WorkPlane's AUD tag, so a JWT for the key pages or the delegation application is refused, and an `email` string that is more than spaces. It is read only after the Delegate's credential has passed.
+- **Who:** the person is that JWT's `email`, trimmed and lower-cased. `Cf-Access-Authenticated-User-Email` and every other identity header are ignored, and a request about the person takes no email from its body.
+- **Where:** only on `HINDSIGHT_API_TENANT_DELEGATION_HOST`; any other `Host` gets 404.
+- **State changes** (anything but `GET`) also need `Content-Type: application/json`; otherwise 403.
+- **Sign-in:** the person's JWT records a sign-in as a key page request does, dated by its `iat`, and an older `iat` never moves the stored one back. Making the request does not count by itself, so replaying an old JWT cannot extend the 30-day window.
+- **Replay:** a captured pair of credentials works until the person's JWT expires, and only alongside WorkPlane's service token.
+- **Refusals** are `delegation_refused` events, under the same per-client and total limits as refused keys.
+
+| Route | What it does |
+| --- | --- |
+| `POST /ext/delegated/access-requests` | Asks the admins to add the person to the Key Allowlist, as the button on `/ext/` does (the new-hire path). Answers `{"email": …, "role": …}` with the person's role now: `requested`, `member` or `admin`. A repeat files nothing new. |
+
 ## Stale personal schemas
 
 `/ext/admin` lists each personal schema that no valid key has reached for 90 days, with its owner's email and last key activity. Nothing is deleted automatically: an operator purges a schema with `scripts/purge-schema.sql`, one schema per run.
@@ -146,12 +168,41 @@ Events go to `agent_keys.events` in Hindsight's own database. That schema sits o
 
 | Column | Meaning |
 | --- | --- |
-| `kind` | `key_refused`, `legacy_key_expired`, `refusal_log_saturated` (the 60-a-minute budget ran out; further refusals that minute were not recorded), `key_created`, `key_renewed`, `key_revoked`, `identity_revoked`, a Key Allowlist change: `access_requested`, `access_approved`, `access_declined`, `allowlist_added`, `allowlist_removed`, `admin_granted`, `admin_removed`, or a Team change: `team_created`, `owner_added` or `member_added` (the person was made an owner or a member, whether new to the Team or not), `owner_requested` or `member_requested` (an agent asked over MCP to make the person an owner or a member; nothing changed yet), `owner_confirmed` or `member_confirmed` (an owner on the Key Allowlist, or an admin, confirmed that request, so the person now has that role), `owner_declined` or `member_declined` (an owner on the Key Allowlist, or an admin, dropped that request), `member_removed`, or `schema_purged` (written by `scripts/purge-schema.sql`) |
-| `key_id` | `(missing)`, `(unrecognized)`, `(legacy)`, `(none)` (also `identity_revoked`, `schema_purged` and every Key Allowlist and Team change), or the `<id>` part of a presented, created, renewed or revoked `hsk_<id>_<secret>` key. Parenthesised values are reserved; a key's ID is never parenthesised. |
+| `kind` | What happened; the kinds are listed below the table |
+| `key_id` | For `key_refused`, `(missing)` (no key), `(unrecognized)` (not shaped like an Agent Key) or the presented key's ID; for `legacy_key_expired`, `(legacy)`; for `key_created`, `key_renewed` and `key_revoked`, the key's ID; for every other kind (`refusal_log_saturated`, `delegation_refused`, `identity_revoked`, `schema_purged` and every Key Allowlist and Team change), `(none)`. A key's ID is the `<id>` part of `hsk_<id>_<secret>`. Parenthesised values are reserved; a key's ID is never parenthesised. |
 | `client_ip` | The `X-Real-IP` address in canonical form (an IPv4-mapped IPv6 address is stored as IPv4), or `NULL` if the header is missing or not an IP address |
 | `email` | For `key_created`, `key_renewed` and `key_revoked`, the key's owner; for `identity_revoked`, the person whose keys were revoked; for a Key Allowlist or Team change, the person it concerns (for `team_created`, the creator); for `schema_purged`, the schema's owner; otherwise `NULL` |
-| `actor` | For `identity_revoked`, the admin who revoked it; for a Key Allowlist or Team change, who made it: the admin or owner (for `*_requested`, the person whose personal key the agent used), or for `access_requested` the person asking; for `schema_purged`, the email the operator typed; otherwise `NULL` |
+| `actor` | The signed-in person who made the change, on every kind a person causes: for `key_created`, `key_renewed` and `key_revoked`, the key's owner (only they do these); for `identity_revoked`, the admin; for `access_requested`, the person asking; for any other Key Allowlist or Team change, the admin or owner (for `*_requested`, the person whose personal key the agent used); for `schema_purged`, the email the operator typed. On a Delegated Request it is the person the Delegate acted for, never the Delegate. `NULL` only where no person is known: `key_refused`, `legacy_key_expired`, `refusal_log_saturated` and `delegation_refused`. |
 | `team` | For a Team change and for a Team key's `key_created`, the Team's schema (`public` for the Public Team); for `schema_purged`, the purged personal schema; otherwise `NULL` |
+| `channel` | Where the request came in, on every kind a request causes: `ext` (the key pages), `delegated` (a Delegated Request, `delegation_refused` included) or `mcp` (a Team tool). `NULL` only for `key_refused` and `legacy_key_expired` (upstream checks keys before any channel), `refusal_log_saturated` (every channel's refusals share its budget) and `schema_purged` (the operator's script). |
+| `delegate` | On the `delegated` channel, the Delegate's service-token client ID once its credential has passed; otherwise `NULL`. A `delegation_refused` row without one means the Delegate's own credential failed. |
+
+Kinds:
+
+- `key_refused`
+- `legacy_key_expired`
+- `refusal_log_saturated`: the 60-a-minute budget ran out; further refusals that minute were not recorded
+- `delegation_refused`: a Delegated Request failed either credential
+- `key_created`
+- `key_renewed`
+- `key_revoked`
+- `identity_revoked`
+- Key Allowlist changes:
+  - `access_requested`
+  - `access_approved`
+  - `access_declined`
+  - `allowlist_added`
+  - `allowlist_removed`
+  - `admin_granted`
+  - `admin_removed`
+- Team changes:
+  - `team_created`
+  - `owner_added`, `member_added`: the person was made an owner or a member, whether new to the Team or not
+  - `owner_requested`, `member_requested`: an agent asked over MCP to make the person an owner or a member; nothing changed yet
+  - `owner_confirmed`, `member_confirmed`: an owner on the Key Allowlist, or an admin, confirmed that request, so the person now has that role
+  - `owner_declined`, `member_declined`: an owner on the Key Allowlist, or an admin, dropped that request
+  - `member_removed`
+- `schema_purged`: written by `scripts/purge-schema.sql`
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
 

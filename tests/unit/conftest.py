@@ -6,16 +6,28 @@ import threading
 import time
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from hindsight_api.extensions.context import ExtensionContext
 from jwt.algorithms import RSAAlgorithm
 
+from hindsight_agent_keys.extension import AgentKeysTenantExtension
 from hindsight_agent_keys.store import TEAMS_PER_PERSON, Refused
+from hindsight_agent_keys.web import AgentKeysHttpExtension
 
 AUD = "aud-tag-0123456789"
+PEPPER = "pepper-0123456789abcdef0123456789abcdef"
+ACCESS_HOST = "keys.example.test"
+# The delegation application and WorkPlane's own Access application, on the same Access team.
+DELEGATION_HOST = "delegation.example.test"
+DELEGATION_AUD = "delegation-aud-0123"
+WORKPLANE_AUD = "workplane-aud-0123"
+DELEGATE_ID = "workplane-0123.access"
 
 
 class RecordedEvents:
@@ -29,11 +41,21 @@ class RecordedEvents:
     async def stop(self):
         pass
 
-    async def record(self, kind, key_id, client_ip, email=None, actor=None, team=None):
+    async def record(self, kind, key_id, client_ip, email=None, actor=None, team=None, *, channel=None, delegate=None):
         if self.fail:
             raise RuntimeError("event store unavailable")
+        # Every column PostgresEventLog writes, so a path that loses its channel shows in a test.
         self.rows.append(
-            {"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor, "team": team}
+            {
+                "kind": kind,
+                "key_id": key_id,
+                "client_ip": client_ip,
+                "email": email,
+                "actor": actor,
+                "team": team,
+                "channel": channel,
+                "delegate": delegate,
+            }
         )
 
 
@@ -269,3 +291,43 @@ def team():
     yield t
     t.server.shutdown()
     t.server.server_close()
+
+
+def delegated_headers(team, email="alice@example.com", *, delegate=None, person=None):
+    """A Delegated Request's headers: the Delegate's service-token JWT, as Access forwards it, and the
+    person's own JWT for WorkPlane's application. Each dict overrides that credential's claims; an
+    override of None drops the claim (as Team.token does)."""
+    service = {"email": None, "sub": "", "common_name": DELEGATE_ID, "aud": [DELEGATION_AUD], **(delegate or {})}
+    signed_in = {"email": email, "aud": [WORKPLANE_AUD], **(person or {})}
+    return {
+        "Host": DELEGATION_HOST,
+        "Cf-Access-Jwt-Assertion": team.token(**service),
+        "X-Delegated-Access-Jwt": team.token(**signed_in),
+        "Content-Type": "application/json",
+    }
+
+
+def delegated_app(team, store=None, **config):
+    """The /ext router (key pages and Delegated Requests), mounted as upstream mounts it
+    (api/http.py:5301-5316). Returns (client, extension, events); a config value of None drops it."""
+    config = {
+        "key_pepper": PEPPER,
+        "access_team_domain": team.url,
+        "access_aud": team.aud,
+        "access_host": ACCESS_HOST,
+        "delegation_host": DELEGATION_HOST,
+        "delegation_aud": DELEGATION_AUD,
+        "workplane_aud": WORKPLANE_AUD,
+        "delegate_client_id": DELEGATE_ID,
+        **config,
+    }
+    events = RecordedEvents()
+    ext = AgentKeysTenantExtension(
+        {k: v for k, v in config.items() if v is not None},
+        store=store if store is not None else MemoryStore(),
+        events=events,
+    )
+    ext.set_context(Migrations())
+    app = FastAPI()
+    app.include_router(AgentKeysHttpExtension({}).get_router(SimpleNamespace(tenant_extension=ext)), prefix="/ext")
+    return TestClient(app), ext, events

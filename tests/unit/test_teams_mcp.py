@@ -45,6 +45,19 @@ async def call(mcp, key, tool, **arguments):
         upstream_mcp._current_api_key.reset(token)
 
 
+async def test_every_change_over_mcp_records_who_made_it_on_the_mcp_channel():
+    mcp, ext, events = server()
+    _, key = await ext.create_personal_key(ALICE, "agent", None)
+    team = (await call(mcp, key, "create_team", name="Platform"))["team"]
+    await call(mcp, key, "add_team_member", team=team, email=CAROL)
+    await call(mcp, key, "remove_team_member", team=team, email=CAROL)
+    assert [(r["kind"], r["actor"], r["channel"], r["delegate"]) for r in events.rows[1:]] == [
+        ("team_created", ALICE, "mcp", None),
+        ("member_requested", ALICE, "mcp", None),
+        ("member_removed", ALICE, "mcp", None),
+    ]
+
+
 async def test_with_a_personal_key_an_agent_creates_lists_and_removes_members_of_teams():
     mcp, ext, _ = server()
     _, key = await ext.create_personal_key(ALICE, "agent", None)
