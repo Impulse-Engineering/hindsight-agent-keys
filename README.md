@@ -82,7 +82,7 @@ Only people on the Key Allowlist can create Agent Keys. The bootstrap admins in 
 
 - **Asking to join:** a signed-in person who is not on the list sees a button on `/ext/` that files a request. Asking again changes nothing.
 - **Admins** (bootstrap admins and anyone granted admin rights) manage the list at `https://<access host>/ext/admin`: add people by email, approve or decline requests, grant and remove admin rights, and remove people. The same page revokes an identity (see "Personal Agent Keys") and lists stale personal schemas (see "Stale personal schemas"). Everyone else gets 403 on every `/ext/admin` route. The bootstrap admins cannot be changed there (409); edit the secret instead.
-- **Removing someone** stops them creating keys and disables the keys they hold: every request with a key checks its owner is still on the list. Their keys are not deleted, so adding them back makes the keys work again.
+- **Removing someone** stops them creating keys and disables the keys they hold: every request with a key checks its owner is still on the list. Their keys are not deleted, so adding them back makes the keys work again. It also stops them acting as a Team owner (adding or removing members, asking for people to join, confirming or declining requests, creating Team keys) until they are added back. Their Teams, ownership and memberships are kept, and they can still list and revoke their own keys and ask to be added back.
 - **Logging:** every change is an event (see "The event log").
 
 ## Teams
@@ -90,8 +90,8 @@ Only people on the Key Allowlist can create Agent Keys. The bootstrap admins in 
 A Team is a named set of people who share one schema. A person on the Key Allowlist opens `https://<access host>/ext/teams`, the Teams page, which follows the same hostname, sign-in and state-change rules as the key page.
 
 - **Creating:** the creator becomes the Team's first owner. The Team gets its own schema, `t_` plus 16 random hex digits, migrated before the Team is shown; the worker processes it like any other. Names are unique whatever their case, and `public` is reserved for the Public Team. Each person can create 10 Teams, counted in the database (429 after that).
-- **Members:** owners add people by email, as a member or an owner, including people who have not signed in yet; they change roles and remove people. A change that would leave a Team without an owner is refused. Admins manage every Team and see every Team on the page, whether or not they are in it.
-- **Pending requests:** people an agent asked to add over MCP are listed under their Team, with the role asked for and who asked. An owner or admin presses **Confirm** to give them that role, or **Decline** to drop the request and leave their place in the Team as it was. Confirm sends the role the page showed: if an agent has asked for another role since, nothing is granted and the page answers 409, so the owner reloads it and sees the new request.
+- **Members:** owners on the Key Allowlist add people by email, as a member or an owner, including people who have not signed in yet; they change roles and remove people. A change that would leave a Team without an owner is refused. Admins manage every Team and see every Team on the page, whether or not they are in it.
+- **Pending requests:** people an agent asked to add over MCP are listed under their Team, with the role asked for and who asked. An owner on the Key Allowlist, or an admin, presses **Confirm** to give them that role, or **Decline** to drop the request and leave their place in the Team as it was. Confirm sends the role the page showed: if an agent has asked for another role since, nothing is granted and the page answers 409, so the owner reloads it and sees the new request.
 - **Team keys:** a member on the Key Allowlist creates a Team key the same way as a personal key, with the same limits, which count personal and Team keys together. Membership is checked on every request, so removing a member stops their Team keys on their next request.
 - **Public Team:** everyone on the Key Allowlist can create a Public Team key, which reaches the banks in `public`. The Public Team has no owners or members.
 
@@ -106,7 +106,7 @@ Agents manage Teams with these tools, on the multi-bank endpoint `/mcp/` and on 
 | `add_team_member(team, email, role)` | Files a pending request to make the person a `member` (the default) or an `owner`. Nobody gains access until an owner or admin confirms it on the Teams page. |
 | `remove_team_member(team, email)` | Takes the person out of the Team; their Team keys stop on their next request. |
 
-A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer. Only owners and admins can file requests and remove people. A bank whose config sets `mcp_enabled_tools` hides every tool not named there, these included.
+A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer. Only owners on the Key Allowlist and admins can file requests and remove people. A bank whose config sets `mcp_enabled_tools` hides every tool not named there, these included.
 
 ## Stale personal schemas
 
@@ -230,6 +230,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 | Every Agent Key gets 401 | The pepper was changed or removed. Agent Keys must be created again. |
 | One person's Agent Key gets 401 | The key was revoked, it expired (90 days after its creation or last renewal), or its owner has not opened the key page for 30 days. The owner sees each key's state on the key page; opening the page revives keys held back by the 30-day rule. |
 | A Team key gets 401 | Its holder is no longer in the Team. An owner can add them again; the key works again on its next request. |
+| A Team owner is refused with "You are not on the Key Allowlist." when changing members | They were removed from the Key Allowlist. They keep the Team and an admin can answer its requests meanwhile; adding them back restores their actions. |
 | An agent added someone to a Team but they still have no access | Adding over MCP only files a request. An owner or admin must press **Confirm** under the Team on `/ext/teams`. |
 | Upstream's `public.audit_log` gains rows | The app runs an image older than the `HINDSIGHT_API_AUDIT_LOG_ACTIONS=(none)` default, or not this image: the guard refuses any other value. Check the digest the app runs. |
 | The Team tools are missing from an MCP endpoint | The bank's `mcp_enabled_tools` config does not list them. |

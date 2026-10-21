@@ -333,8 +333,12 @@ class AgentKeysTenantExtension(TenantExtension):
         ]
 
     async def _require_manager(self, email: str, team: str) -> None:
-        if await self.role(email) != "admin" and await self._store.team_role(team, email) != "owner":
+        if await self.role(email) == "admin":
+            return
+        if await self._store.team_role(team, email) != "owner":
             raise Refused(403, "Only the Team's owners and admins can change its members.")
+        # An owner cut off from the Key Allowlist keeps the Team and returns to managing it when added back.
+        await self._require_allowlisted(email)
 
     async def set_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
         """As an owner or admin, add `member` to the Team as "owner" or "member", or change their role."""

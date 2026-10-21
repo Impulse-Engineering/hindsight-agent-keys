@@ -294,7 +294,8 @@ ADMIN_PAGE = Template("""<!doctype html>
 <head><meta charset="utf-8"><title>Key Allowlist</title></head>
 <body>
 <h1>Key Allowlist</h1>
-<p>Only people on the Key Allowlist can create Agent Keys. Removing someone disables the keys they hold.
+<p>Only people on the Key Allowlist can create Agent Keys or act as a Team owner. Removing someone disables the keys they hold and
+their owner actions; they keep their Teams, and adding them again restores both.
 <a href="/ext/">Your keys</a></p>
 <form id="add">
   <label for="email">Email</label>

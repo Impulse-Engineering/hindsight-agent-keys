@@ -40,6 +40,8 @@ def test_owners_add_change_and_remove_members_by_email(team):
     client, _, _ = pages(team)
     created = create_team(client, team)
     url = f"/ext/teams/{created}/members"
+    # Owners manage a Team only while they are on the Key Allowlist.
+    assert client.post("/ext/admin/people", json={"email": CAROL, "role": "member"}, headers=as_person(team, ALICE)).status_code == 204
     assert client.post(url, json={"email": " Carol@Example.com ", "role": "owner"}, headers=as_person(team, ALICE)).status_code == 200
     assert client.post(url, json={"email": BOB, "role": "member"}, headers=as_person(team, CAROL)).status_code == 200
     resp = client.request("DELETE", url, json={"email": BOB}, headers=as_person(team, CAROL))
