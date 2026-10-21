@@ -173,7 +173,7 @@ Every UI shows its Team's banks to whoever reaches its port, so put each hostnam
 
 ## Tests
 
-Unit tests run inside the pinned upstream image, which ships `hindsight_api` and pytest:
+Unit tests run inside the pinned upstream image, which ships `hindsight_api` and pytest. CI runs them inside the image it built (`UNIT_TEST_IMAGE`), so they also see the image's pinned packages:
 
 ```sh
 scripts/unit-tests.sh -v
