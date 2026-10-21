@@ -52,7 +52,8 @@ class AgentKeysMcpExtension(MCPExtension):
 
         @mcp.tool()
         async def add_team_member(team: str, email: Email, role: Literal["member", "owner"] = "member") -> dict:
-            """Ask for someone to join a Team you own, as a member or an owner, by email.
+            """Ask for someone to join a Team you own while on the Key Allowlist (or any Team, as an admin),
+            as a member or an owner, by email.
             Nobody gains access until an owner of the Team on the Key Allowlist, or an admin, confirms it on the Teams page (/ext/teams)."""
             try:
                 await memory.tenant_extension.request_member(await person(), team, email, role, ip())
@@ -62,7 +63,8 @@ class AgentKeysMcpExtension(MCPExtension):
 
         @mcp.tool()
         async def remove_team_member(team: str, email: Email) -> dict:
-            """Take someone out of a Team you own, by email; their Team keys stop working at once."""
+            """Take someone out of a Team you own while on the Key Allowlist (or any Team, as an admin), by email;
+            their Team keys stop working at once."""
             try:
                 await memory.tenant_extension.remove_member(await person(), team, email, ip())
             except Refused as refusal:
