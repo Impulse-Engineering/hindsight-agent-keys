@@ -341,32 +341,32 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._require_allowlisted(email)
 
     async def set_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
-        """As an owner or admin, add `member` to the Team as "owner" or "member", or change their role."""
+        """As an admin, or an owner on the Key Allowlist, add `member` to the Team as "owner" or "member", or change their role."""
         await self._require_manager(email, team)
         await self._store.set_member(team, member, role)
         await self._record(f"{role}_added", NO_KEY_ID, client_ip, member, email, team=team)
 
     async def remove_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
-        """As an owner or admin, take `member` out of the Team."""
+        """As an admin, or an owner on the Key Allowlist, take `member` out of the Team."""
         await self._require_manager(email, team)
         await self._store.remove_member(team, member)
         await self._record("member_removed", NO_KEY_ID, client_ip, member, email, team=team)
 
     async def request_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
-        """As an owner or admin, ask for `member` to become an "owner" or "member" of the Team.
-        Agents add people this way: nothing changes until an owner or admin confirms it on the Teams page."""
+        """As an admin, or an owner on the Key Allowlist, ask for `member` to become an "owner" or "member" of the Team.
+        Agents add people this way: nothing changes until an owner on the Key Allowlist, or an admin, confirms it on the Teams page."""
         await self._require_manager(email, team)
         await self._store.request_member(team, member, role, email)
         await self._record(f"{role}_requested", NO_KEY_ID, client_ip, member, email, team=team)
 
     async def confirm_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
-        """As an owner or admin, give `member` the role a pending request asked for. `role` is the one
+        """As an admin, or an owner on the Key Allowlist, give `member` the role a pending request asked for. `role` is the one
         the page showed: if the request asks for another now, nothing is granted (Refused 409)."""
         confirm = partial(self._store.confirm_member, role=role)
         await self._answer_request(email, team, member, client_ip, confirm, "confirmed", role)
 
     async def decline_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
-        """As an owner or admin, drop a pending request for `member`; their place in the Team stays as it was."""
+        """As an admin, or an owner on the Key Allowlist, drop a pending request for `member`; their place in the Team stays as it was."""
         await self._answer_request(email, team, member, client_ip, self._store.decline_member, "declined")
 
     async def _answer_request(self, email, team, member, client_ip, answer, outcome, shown=None) -> None:

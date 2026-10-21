@@ -15,7 +15,7 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 | --- | --- | --- |
 | Anyone who signs in through Access | `/ext/` | Asks to join the Key Allowlist |
 | People on the Key Allowlist | `/ext/`, `/ext/teams` | Create, renew and revoke their own keys; create Teams; create Team and Public Team keys |
-| Team owners | `/ext/teams` | Add and remove members and owners; confirm or decline the people agents asked to add |
+| Team owners on the Key Allowlist | `/ext/teams` | Add and remove members and owners; confirm or decline the people agents asked to add |
 | Admins | `/ext/admin`, `/ext/teams` | Manage the Key Allowlist, revoke identities, see stale personal schemas, manage every Team |
 | Platform admins | Conductor and the CT | Set secrets (the first admins among them), approve digests, deploy, run CT commands |
 | Agents | The bypass hostname | Use memory with an Agent Key over the API and MCP; with a personal key, manage Teams over MCP |
@@ -65,7 +65,7 @@ read -r -p 'Email: ' email &&
 
 - **Creating.** A person on the Key Allowlist creates a Team on `/ext/teams`, or an agent does with the MCP tool `create_team`; the creator is its first owner. A Team's ID (`t_…`), which the other MCP tools take, comes from `list_teams`.
 - **Members.** Owners add people by email, as a member or an owner, including people who have not signed in yet, and remove them. An owner acts only while on the Key Allowlist; admins can manage every Team, and handle the requests of a Team with no owner on the list.
-- **Agents cannot add people on their own.** `add_team_member` over MCP only files a pending request, shown under the Team on `/ext/teams`. Nobody gains access until an owner or admin presses **Confirm** there, so a poisoned memory cannot add someone to a Team. Tell owners to expect these requests.
+- **Agents cannot add people on their own.** `add_team_member` over MCP only files a pending request, shown under the Team on `/ext/teams`. Nobody gains access until an owner on the Key Allowlist, or an admin, presses **Confirm** there, so a poisoned memory cannot add someone to a Team. Tell owners to expect these requests.
 - **Removing a member** stops their Team keys on their next request. A Team's data stays whoever leaves, and Team schemas are never listed for purging.
 - **Over MCP**, the Team tools need a personal Agent Key; a Team key, a Public Team key or the legacy key gets an error. A bank whose config sets `mcp_enabled_tools` hides them on that bank's endpoint unless it names them.
 - **The Public Team** has no owners or members: everyone on the Key Allowlist can create a Public Team key.
