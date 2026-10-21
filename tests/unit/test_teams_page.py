@@ -10,6 +10,7 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 CAROL = "carol@example.com"
 DAVE = "dave@example.com"
+ERIN = "erin@example.com"
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +41,8 @@ def test_owners_add_change_and_remove_members_by_email(team):
     client, _, _ = pages(team)
     created = create_team(client, team)
     url = f"/ext/teams/{created}/members"
+    # Owners manage a Team only while they are on the Key Allowlist.
+    assert client.post("/ext/admin/people", json={"email": CAROL, "role": "member"}, headers=as_person(team, ALICE)).status_code == 204
     assert client.post(url, json={"email": " Carol@Example.com ", "role": "owner"}, headers=as_person(team, ALICE)).status_code == 200
     assert client.post(url, json={"email": BOB, "role": "member"}, headers=as_person(team, CAROL)).status_code == 200
     resp = client.request("DELETE", url, json={"email": BOB}, headers=as_person(team, CAROL))
@@ -154,3 +157,38 @@ def test_the_teams_page_refuses_the_bypass_hostname(team):
     client, _, _ = pages(team)
     assert client.get("/ext/teams", headers=signed_in(team, BYPASS)).status_code == 404
     assert client.post("/ext/teams", json={"name": "x"}, headers=as_person(team, ALICE, BYPASS)).status_code == 404
+
+
+OWNER_REQUESTS = [
+    pytest.param("POST", "members", {"email": ERIN, "role": "member"}, id="add a member"),
+    pytest.param("DELETE", "members", {"email": DAVE}, id="remove a member"),
+    pytest.param("POST", "confirmations", {"email": ERIN, "role": "member"}, id="approve a request"),
+    pytest.param("DELETE", "requests", {"email": ERIN}, id="decline a request"),
+    pytest.param("POST", "keys", {"name": "ci"}, id="create a Team key"),
+]
+
+
+@pytest.mark.parametrize(("method", "path", "body"), OWNER_REQUESTS)
+async def test_an_owner_off_the_key_allowlist_is_refused_on_the_teams_page_until_added_back(team, method, path, body):
+    client, ext, _ = pages(team)
+    created = create_team(client, team)
+    admin = as_person(team, ALICE)
+    members = f"/ext/teams/{created}/members"
+
+    def allowlist(role):
+        return client.post("/ext/admin/people", json={"email": CAROL, "role": role}, headers=admin).status_code
+
+    assert allowlist("member") == 204
+    assert client.post(members, json={"email": CAROL, "role": "owner"}, headers=admin).status_code == 200
+    assert client.post(members, json={"email": DAVE, "role": "member"}, headers=admin).status_code == 200
+    await ext.request_member(ALICE, created, ERIN, "member", None)
+    before = await ext.teams(ALICE)
+    assert allowlist(None) == 204
+    resp = client.request(method, f"/ext/teams/{created}/{path}", json=body, headers=as_person(team, CAROL))
+    assert resp.status_code == 403 and "Key Allowlist" in resp.json()["detail"]
+    assert await ext.teams(ALICE) == before
+    assert await ext.list_keys(CAROL) == []
+    # The same request is well formed: added back, the owner's call goes through.
+    assert allowlist("member") == 204
+    resp = client.request(method, f"/ext/teams/{created}/{path}", json=body, headers=as_person(team, CAROL))
+    assert resp.status_code == 200, resp.text

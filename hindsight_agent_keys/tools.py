@@ -3,7 +3,7 @@
 Upstream registers these on both MCP servers, multi-bank (/mcp/) and single-bank
 (/mcp/<bank>/), each with its own instance and no context, so this class holds no
 state and reaches everything through the tenant extension. Only a personal Agent Key
-may use them, and adding someone only files a request that an owner or admin confirms
+may use them, and adding someone only files a request that an owner on the Key Allowlist, or an admin, confirms
 on the Access-protected Teams page: an agent never grants anyone access on its own.
 """
 
@@ -44,7 +44,7 @@ class AgentKeysMcpExtension(MCPExtension):
         @mcp.tool()
         async def list_teams() -> dict:
             """Your Teams: each with its ID, your role, its members and the requests to add
-            people that wait for an owner."""
+            people that wait for an owner on the Key Allowlist or an admin."""
             try:
                 # Only Teams the caller is in, admins included; admins manage any Team on the page.
                 return {"teams": [t for t in await memory.tenant_extension.teams(await person()) if t["role"]]}
@@ -53,8 +53,9 @@ class AgentKeysMcpExtension(MCPExtension):
 
         @mcp.tool()
         async def add_team_member(team: str, email: Email, role: Literal["member", "owner"] = "member") -> dict:
-            """Ask for someone to join a Team you own, as a member or an owner, by email.
-            Nobody gains access until an owner of the Team confirms it on the Teams page (/ext/teams)."""
+            """Ask for someone to join a Team you own while on the Key Allowlist (or any Team, as an admin),
+            as a member or an owner, by email.
+            Nobody gains access until an owner of the Team on the Key Allowlist, or an admin, confirms it on the Teams page (/ext/teams)."""
             try:
                 await memory.tenant_extension.request_member(await person(), team, email, role, ip())
             except Refused as refusal:
@@ -63,7 +64,8 @@ class AgentKeysMcpExtension(MCPExtension):
 
         @mcp.tool()
         async def remove_team_member(team: str, email: Email) -> dict:
-            """Take someone out of a Team you own, by email; their Team keys stop working at once."""
+            """Take someone out of a Team you own while on the Key Allowlist (or any Team, as an admin), by email;
+            their Team keys stop working at once."""
             try:
                 await memory.tenant_extension.remove_member(await person(), team, email, ip())
             except Refused as refusal:

@@ -301,7 +301,8 @@ ADMIN_PAGE = Template("""<!doctype html>
 <head><meta charset="utf-8"><title>Key Allowlist</title></head>
 <body>
 <h1>Key Allowlist</h1>
-<p>Only people on the Key Allowlist can create Agent Keys. Removing someone disables the keys they hold.
+<p>Only people on the Key Allowlist can create Agent Keys or act as a Team owner. Removing someone disables the keys they hold and
+their owner actions; they keep their Teams, and adding them again restores both.
 <a href="/ext/">Your keys</a></p>
 <form id="add">
   <label for="email">Email</label>
@@ -402,7 +403,7 @@ def teams_html(email: str, teams: list[dict]) -> str:
 KEY_FORM = """<form data-url="{url}/keys" data-method="POST">
 <label>Key name <input name="name" required maxlength="100"></label> <button>{label}</button></form>"""
 
-# Shown to members too; the server refuses changes from anyone but owners and admins.
+# Shown to members too; the server refuses changes from anyone but admins and owners on the Key Allowlist.
 MEMBER_FORMS = """<form data-url="{url}/members" data-method="POST">
 <label>Email <input name="email" type="email" required></label>
 <label>Role <select name="role"><option>member</option><option>owner</option></select></label>
@@ -410,7 +411,7 @@ MEMBER_FORMS = """<form data-url="{url}/members" data-method="POST">
 <form data-url="{url}/members" data-method="DELETE">
 <label>Email <input name="email" type="email" required></label> <button>Remove</button></form>"""
 
-# A request an agent filed over MCP lets nobody in until an owner or admin presses Confirm,
+# A request an agent filed over MCP lets nobody in until an owner on the Key Allowlist, or an admin, presses Confirm,
 # which sends the role shown, so a request changed since is refused rather than granted.
 REQUEST_FORMS = """<form data-url="{url}/confirmations" data-method="POST">
 <input type="hidden" name="email" value="{email}"><input type="hidden" name="role" value="{role}"><button>Confirm</button></form>

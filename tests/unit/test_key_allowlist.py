@@ -61,6 +61,19 @@ async def test_removing_someone_stops_them_creating_keys_and_disables_the_keys_t
     assert await works(ext, key)
 
 
+async def test_someone_removed_still_lists_and_revokes_their_keys_and_asks_to_be_added_back():
+    ext, events = extension()
+    await ext.set_role(ADMIN, CAROL, "member", None)
+    key_id, _ = await ext.create_personal_key(CAROL, "laptop", None)
+    await ext.set_role(ADMIN, CAROL, None, None)
+    assert [(k["id"], k["state"]) for k in await ext.list_keys(CAROL)] == [(key_id, "active")]
+    await ext.request_access(CAROL, None)
+    assert (CAROL, "requested") in await ext.allowlist()
+    await ext.revoke_key(CAROL, key_id, None)
+    assert [(k["id"], k["state"]) for k in await ext.list_keys(CAROL)] == [(key_id, "revoked")]
+    assert [(r["kind"], r["email"]) for r in events.rows[-2:]] == [("access_requested", CAROL), ("key_revoked", CAROL)]
+
+
 async def test_someone_not_on_the_list_asks_to_join_and_an_admin_approves():
     ext, _ = extension()
     await ext.request_access(CAROL, None)
