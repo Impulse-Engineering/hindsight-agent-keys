@@ -8,49 +8,28 @@ under /ext/delegated, have their own router and gate (delegation.py).
 """
 
 import html
-from collections.abc import Awaitable
 from string import Template
-from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from hindsight_api.extensions.http import HttpExtension
-from pydantic import BaseModel, StringConstraints
 
 from hindsight_agent_keys.access import ACCESS_JWT_HEADER
+from hindsight_agent_keys.bodies import (
+    FormerMember,
+    Identity,
+    Member,
+    NewKey,
+    NewTeam,
+    RoleChange,
+    _or_refused,
+)
 from hindsight_agent_keys.delegation import delegated_router
 from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
-from hindsight_agent_keys.store import Refused
 
 STATE_CHANGE_HEADER = "x-agent-keys"
 # No page may be framed, so nobody can trick a signed-in admin into clicking Approve or Grant.
 NO_FRAMING = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'"}
-
-
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
-Email = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")]
-
-
-class NewKey(BaseModel):
-    name: Name
-
-
-class NewTeam(BaseModel):
-    name: Name
-
-
-class Member(BaseModel):
-    email: Email
-    role: Literal["owner", "member"]
-
-
-class FormerMember(BaseModel):
-    email: Email
-
-
-class RoleChange(BaseModel):
-    email: Email
-    role: Literal["member", "admin"] | None  # None removes the person, or declines their request
 
 
 # What the page says about a person's place on the Key Allowlist, by role.
@@ -81,18 +60,6 @@ def _stale_row(row) -> str:
     last = row["last_active"]
     shown = f"{last:%Y-%m-%d %H:%M} UTC" if last else "never had a key"
     return f"<tr><td>{html.escape(row['schema'])}</td><td>{html.escape(row['email'])}</td><td>{shown}</td></tr>"
-
-
-class Identity(BaseModel):
-    email: Email
-
-
-async def _or_refused(change: Awaitable):
-    """The change's result; a refusal becomes its HTTP status with the reason as detail."""
-    try:
-        return await change
-    except Refused as refusal:
-        raise HTTPException(refusal.status, str(refusal)) from None
 
 
 class AgentKeysHttpExtension(HttpExtension):
@@ -237,7 +204,7 @@ $allowlist
 <p id="result" role="status"></p>
 <h2>Your keys</h2>
 <table>
-  <thead><tr><th>Name</th><th>ID</th><th>Created</th><th>Expires</th><th>State</th><th></th></tr></thead>
+  <thead><tr><th>Name</th><th>ID</th><th>Created</th><th>Created via</th><th>Expires</th><th>State</th><th></th></tr></thead>
   <tbody id="keys"></tbody>
 </table>
 <script>
@@ -256,7 +223,7 @@ async function showKeys() {
   const keys = await (await fetch("/ext/keys")).json();
   document.getElementById("keys").replaceChildren(...keys.map((key) => {
     const row = document.createElement("tr");
-    for (const text of [key.name, key.id, key.created_at, key.expires_at, key.state]) {
+    for (const text of [key.name, key.id, key.created_at, key.via ? "WorkPlane" : "this page", key.expires_at, key.state]) {
       row.insertCell().textContent = text;
     }
     const actions = row.insertCell();

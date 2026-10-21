@@ -9,7 +9,9 @@ its holder is in that Team. Every other key, and a missing key, is refused.
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -42,6 +44,13 @@ SIGN_IN_WINDOW = timedelta(days=30)
 
 # Roles on the Key Allowlist that may create keys; 'requested' may not.
 LISTED = ("member", "admin")
+
+# Keys created via WorkPlane, per person, apart from their own (store.ACTIVE_KEYS, store.CREATIONS_PER_HOUR).
+# Defaults of the settings HINDSIGHT_API_TENANT_WORKPLANE_ACTIVE_KEYS and ..._WORKPLANE_KEYS_PER_HOUR. An hour may
+# fill the whole cap, so onboarding into many Teams at once is never held up; the rate still bounds a
+# create-and-revoke loop.
+WORKPLANE_ACTIVE_KEYS = 25
+WORKPLANE_KEYS_PER_HOUR = 25
 
 # Reserved key IDs are parenthesised: a presented key's ID is alphanumeric
 # (see _AGENT_KEY_ID), so no presented key can pose as one of these.
@@ -130,6 +139,16 @@ def host_and_json(headers: Mapping[str, str]) -> tuple[str, bool]:
     return host, content_type == "application/json"
 
 
+def _limit(config: dict[str, str], name: str, default: int) -> int:
+    """A whole-number setting; blank means the default, anything else that is not a whole number stops startup."""
+    text = (config.get(name) or "").strip()
+    if not text:
+        return default
+    if not re.fullmatch(r"[0-9]+", text):
+        raise ValueError(f"HINDSIGHT_API_TENANT_{name.upper()} is not a whole number: {text!r}")
+    return int(text)
+
+
 def _client_bucket(client_ip: str | None) -> str | None:
     """The unit one client is throttled by: an IPv4 address, or an IPv6 /64
     (one subscriber typically holds a whole /64 and can rotate within it)."""
@@ -200,6 +219,9 @@ class AgentKeysTenantExtension(TenantExtension):
         # The Delegate's service token is for the delegation application; the person's JWT for WorkPlane's.
         self._delegation = AccessVerifier(team, delegation_aud) if delegation else None
         self._workplane = AccessVerifier(team, workplane_aud) if delegation else None
+        # Checked only when a key is created, so lowering one revokes nothing.
+        self._workplane_cap = _limit(config, "workplane_active_keys", WORKPLANE_ACTIVE_KEYS)
+        self._workplane_per_hour = _limit(config, "workplane_keys_per_hour", WORKPLANE_KEYS_PER_HOUR)
         self._clock = clock or _now
         self._events = events if events is not None else PostgresEventLog()
         self._store = store if store is not None else PostgresKeyStore(self._db_url)
@@ -291,8 +313,12 @@ class AgentKeysTenantExtension(TenantExtension):
         if await self.role(email) not in LISTED:
             raise Refused(403, "You are not on the Key Allowlist.")
 
-    async def create_personal_key(self, email: str, name: str, client_ip: str | None) -> tuple[str, str]:
-        """Create a key for the person's own schema. Returns (key ID, key); the key is never stored."""
+    async def create_personal_key(
+        self, email: str, name: str, client_ip: str | None, *, via: str | None = None, idempotency_key: str | None = None
+    ) -> tuple[str, str | None]:
+        """Create a key for the person's own schema, marked as created via WorkPlane if `via` names
+        the Delegate. Returns (key ID, key); the key is never stored. A repeat of the Delegate's
+        `idempotency_key` within 24 hours returns (the key ID it created, None)."""
         if self._pepper is None:
             raise Refused(503, "Key creation is not configured.")
         await self._require_allowlisted(email)
@@ -304,35 +330,64 @@ class AgentKeysTenantExtension(TenantExtension):
             # shortcut: a concurrent first key for the same person wins and this schema stays
             # empty and unlisted; serialise first keys per person if that ever shows up.
             schema = await self._store.add_person(email, schema)
-        return await self._add_key(email, schema, "personal", name, client_ip)
+        return await self._add_key(email, schema, "personal", name, client_ip, via=via, idempotency_key=idempotency_key)
 
-    async def _add_key(self, email: str, schema: str, kind: str, name: str, client_ip: str | None) -> tuple[str, str]:
+    async def _add_key(
+        self,
+        email: str,
+        schema: str,
+        kind: str,
+        name: str,
+        client_ip: str | None,
+        *,
+        via: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> tuple[str, str | None]:
         key_id = secrets.token_hex(8)
         key = f"hsk_{key_id}_{secrets.token_urlsafe(32)}"
-        await self._store.add_key(key_id, self._hmac(key), name, email, schema, kind, self._clock() + KEY_LIFETIME)
+        expires_at = self._clock() + KEY_LIFETIME
+        limits = {"cap": self._workplane_cap, "per_hour": self._workplane_per_hour} if via else {}
+        # The body a repeat must match: what kind of key, for which schema, under which name.
+        idempotency = (idempotency_key, _digest(json.dumps([kind, schema, name]))) if idempotency_key else None
+        stored = await self._store.add_key(
+            key_id, self._hmac(key), name, email, schema, kind, expires_at, via=via, idempotency=idempotency, **limits
+        )
+        if stored != key_id:
+            # A repeat: the key it created, whose secret was shown once and never again.
+            return stored, None
         await self._record("key_created", key_id, client_ip, email, email, team=schema if kind == "team" else None)
         return key_id, key
 
-    async def list_keys(self, email: str) -> list[dict]:
-        """The person's own keys, oldest first, each with its state."""
+    # With `via_workplane`, the next three reach only the person's keys created via WorkPlane.
+
+    async def list_keys(self, email: str, *, via_workplane: bool = False) -> list[dict]:
+        """The person's own keys, oldest first, each with its state and whole days to expiry (rounded up)."""
         now = self._clock()
         return [
-            {**row, "state": "revoked" if row["revoked_at"] else "expired" if now >= row["expires_at"] else "active"}
-            for row in await self._store.list_keys(email)
+            {
+                **row,
+                "state": "revoked" if row["revoked_at"] else "expired" if now >= row["expires_at"] else "active",
+                "days_to_expiry": max(0, math.ceil((row["expires_at"] - now) / timedelta(days=1))),
+            }
+            for row in await self._store.list_keys(email, via_workplane=via_workplane)
         ]
 
-    async def renew_key(self, email: str, key_id: str, client_ip: str | None) -> datetime:
-        """Give the person's unexpired key another full lifetime; returns its new expiry."""
+    async def renew_key(self, email: str, key_id: str, client_ip: str | None, *, via_workplane: bool = False) -> datetime:
+        """Give the person's unexpired key another full lifetime from now; returns its new expiry.
+        Refused once the person's sign-in window has closed: their keys already stop working then."""
         now = self._clock()
+        signed_in = await self._store.last_sign_in(email)
+        if signed_in is None or now - signed_in >= SIGN_IN_WINDOW:
+            raise Refused(403, "You have not signed in through Access for 30 days; sign in again, then renew.")
         expires_at = now + KEY_LIFETIME
-        if not await self._store.renew_key(email, key_id, now, expires_at):
+        if not await self._store.renew_key(email, key_id, now, expires_at, via_workplane=via_workplane):
             raise Refused(404, "You hold no active key with that ID.")
         await self._record("key_renewed", key_id, client_ip, email, email)
         return expires_at
 
-    async def revoke_key(self, email: str, key_id: str, client_ip: str | None) -> None:
+    async def revoke_key(self, email: str, key_id: str, client_ip: str | None, *, via_workplane: bool = False) -> None:
         """Revoke one of the person's own keys; it is refused from its next request."""
-        if not await self._store.revoke_keys(email, self._clock(), key_id):
+        if not await self._store.revoke_keys(email, self._clock(), key_id, via_workplane=via_workplane):
             raise Refused(404, "You hold no unrevoked key with that ID.")
         await self._record("key_revoked", key_id, client_ip, email, email)
 
