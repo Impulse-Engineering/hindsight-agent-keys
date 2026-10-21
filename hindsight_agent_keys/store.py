@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.members (
     PRIMARY KEY (team, email)
 );
 CREATE INDEX IF NOT EXISTS members_email_idx ON {SCHEMA}.members (email);
--- Asked for over MCP; nobody joins until an owner or admin confirms on the Teams page.
+-- Asked for over MCP; nobody joins until an owner on the Key Allowlist, or an admin, confirms on the Teams page.
 CREATE TABLE IF NOT EXISTS {SCHEMA}.member_requests (
     team text NOT NULL REFERENCES {SCHEMA}.teams (schema),
     email text NOT NULL,

@@ -15,7 +15,7 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 | --- | --- | --- |
 | Anyone who signs in through Access | `/ext/` | Asks to join the Key Allowlist |
 | People on the Key Allowlist | `/ext/`, `/ext/teams` | Create, renew and revoke their own keys; create Teams; create Team and Public Team keys |
-| Team owners | `/ext/teams` | Add and remove members and owners; confirm or decline the people agents asked to add |
+| Team owners on the Key Allowlist | `/ext/teams` | Add and remove members and owners; confirm or decline the people agents asked to add |
 | Admins | `/ext/admin`, `/ext/teams` | Manage the Key Allowlist, revoke identities, see stale personal schemas, manage every Team |
 | Platform admins | Conductor and the CT | Set secrets (the first admins among them), approve digests, deploy, run CT commands |
 | Agents | The bypass hostname | Use memory with an Agent Key over the API and MCP; with a personal key, manage Teams over MCP |
@@ -26,7 +26,7 @@ Only people on it can create Agent Keys.
 
 - **First admins** come from the `AGENT_KEYS_ADMIN_EMAILS` secret, comma-separated. The image reads it at startup, so changing it with `platform_set_secret` restarts the app *(not verified)*. **Auth state:** down during the restart, then the same image and extension, so nothing opens. The page cannot change first admins (409), so to drop someone from the secret but keep them on the Key Allowlist: remove them from the secret (the app restarts), then add them on `/ext/admin` as a member or an admin. Between the two steps they are off the Key Allowlist and their keys get 401; adding them back makes those keys work again.
 - **Everyone else** is managed on `/ext/admin`: add people by email, approve or decline requests, grant or remove admin rights, and remove people. A signed-in person who is not on the list sees a button on `/ext/` that files a request.
-- **Removing someone** disables the keys they hold from their next request, without deleting them, so adding the person back makes those keys work again. To end someone's access, revoke their identity as well (below).
+- **Removing someone** disables the keys they hold from their next request, without deleting them, and stops them acting as a Team owner: adding or removing members, asking for people to join, confirming or declining requests, and creating Team keys. Their Teams, ownership and memberships are kept, so adding the person back makes the keys and the owner actions work again. Until then they can still list and revoke their own keys and ask to be added back. To end someone's access, revoke their identity as well (below).
 - **Listing it** from the CT *(not verified)*: `pg psql -d hindsight -Atc 'select role, email from agent_keys.allowlist order by 1, 2'`. The first admins come from the secret, so this can miss them.
 
 Every change is an event in `agent_keys.events` (README, "The event log").
@@ -48,7 +48,7 @@ For someone who leaves, or whose keys must stop now:
 
 1. On `/ext/admin`, enter their email to revoke their identity. Every key they hold, personal and Team, is revoked and fails on its next request, including inside an open MCP session. The event log records `identity_revoked` with you as `actor`.
 2. Remove them from the Key Allowlist on the same page. Otherwise they can create new keys.
-3. Remove them from their Teams on `/ext/teams`; admins see every Team there. Otherwise adding them back to the Key Allowlist later would give their new Team keys access again.
+3. Remove them from their Teams on `/ext/teams`; admins see every Team there. Otherwise adding them back to the Key Allowlist later would give their new Team keys access again, and an owner would manage the Team again.
 
 Their personal schema stays. It is listed as stale 90 days after their last key stopped working, and can then be purged (below).
 
@@ -64,8 +64,8 @@ read -r -p 'Email: ' email &&
 ## Teams
 
 - **Creating.** A person on the Key Allowlist creates a Team on `/ext/teams`, or an agent does with the MCP tool `create_team`; the creator is its first owner. A Team's ID (`t_…`), which the other MCP tools take, comes from `list_teams`.
-- **Members.** Owners add people by email, as a member or an owner, including people who have not signed in yet, and remove them. Admins can manage every Team.
-- **Agents cannot add people on their own.** `add_team_member` over MCP only files a pending request, shown under the Team on `/ext/teams`. Nobody gains access until an owner or admin presses **Confirm** there, so a poisoned memory cannot add someone to a Team. Tell owners to expect these requests.
+- **Members.** Owners add people by email, as a member or an owner, including people who have not signed in yet, and remove them. An owner acts only while on the Key Allowlist; admins can manage every Team, and handle the requests of a Team with no owner on the list.
+- **Agents cannot add people on their own.** `add_team_member` over MCP only files a pending request, shown under the Team on `/ext/teams`. Nobody gains access until an owner on the Key Allowlist, or an admin, presses **Confirm** there, so a poisoned memory cannot add someone to a Team. Tell owners to expect these requests.
 - **Removing a member** stops their Team keys on their next request. A Team's data stays whoever leaves, and Team schemas are never listed for purging.
 - **Over MCP**, the Team tools need a personal Agent Key; a Team key, a Public Team key or the legacy key gets an error. A bank whose config sets `mcp_enabled_tools` hides them on that bank's endpoint unless it names them.
 - **The Public Team** has no owners or members: everyone on the Key Allowlist can create a Public Team key.
