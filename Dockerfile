@@ -5,7 +5,8 @@ LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hi
       org.opencontainers.image.licenses="MIT"
 
 # Fixed versions over upstream's lockfile, for advisories the scan blocks or reports as High:
-# GHSA-h4mw-j7qp-8mwm (claude-agent-sdk), GHSA-2g87-pp6c-29x5 and GHSA-5wr8-gcqf-gqf3 (aiohttp, which needs this yarl).
+# GHSA-h4mw-j7qp-8mwm (claude-agent-sdk), GHSA-2g87-pp6c-29x5 and GHSA-5wr8-gcqf-gqf3 (aiohttp, which needs this yarl),
+# GHSA-8g5g-8vmr-9782 (pillow) and GHSA-6q48-6c7w-9gw2 (certifi).
 # docker/pins.txt holds the versions and the hash of every wheel; a file whose bytes match none fails the build,
 # whichever index serves it. --no-deps installs exactly those and resolves nothing else, and the check fails the
 # build if they no longer fit upstream's environment.
@@ -18,6 +19,14 @@ RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
     uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
       --python /app/api/.venv/bin/python -r /tmp/pins.txt && \
     uv pip check --python /app/api/.venv/bin/python
+
+# The same for upstream's own uv in the system Python, outside the venv: GHSA-hq85-5cpj-mr62.
+# docker/system-pins.txt is generated as above; only root can write /usr/local, so the step runs as root.
+USER root
+RUN --mount=type=bind,source=docker/system-pins.txt,target=/tmp/system-pins.txt \
+    uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
+      --python /usr/local/bin/python3 -r /tmp/system-pins.txt
+USER hindsight
 
 COPY hindsight_agent_keys /app/extensions/hindsight_agent_keys
 # The script's executable bit comes from git; COPY keeps it.
