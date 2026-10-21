@@ -24,6 +24,8 @@ RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
 # It keeps the pinned Python fixes above, so the same scan passes on both images.
 FROM base AS ui
 LABEL org.opencontainers.image.description="Hindsight's web UI, one process per Team"
+# Upstream's launcher stays in the image; if an entrypoint override runs it, it starts no API.
+ENV HINDSIGHT_ENABLE_API=false
 COPY docker/ui-start.sh /app/ui-start.sh
 ENTRYPOINT ["/app/ui-start.sh"]
 CMD []

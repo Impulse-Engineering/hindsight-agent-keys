@@ -159,7 +159,7 @@ The extension connects to the database once, at startup. If that fails it logs a
 
 ## The UI image
 
-`ghcr.io/impulse-engineering/hindsight-ui` runs upstream's web UI and nothing else, built from the same pinned upstream release as the API image (`docker build --target ui`). Upstream's UI sends one key, and a key reaches one Team, so the image starts one UI process per listed Team, each on its own port with its own key. Its entrypoint is `docker/ui-start.sh`. It never starts the API, and it takes no command.
+`ghcr.io/impulse-engineering/hindsight-ui` runs upstream's web UI and nothing else, built from the same pinned upstream release as the API image (`docker build --target ui`). Upstream's UI sends one key, and a key reaches one Team, so the image starts one UI process per listed Team, each on its own port with its own key. Its entrypoint is `docker/ui-start.sh`. It never starts the API, and it takes no command. The image sets `HINDSIGHT_ENABLE_API=false`, so even an entrypoint override that runs upstream's launcher starts only one UI.
 
 | Variable | Meaning |
 | --- | --- |
@@ -167,7 +167,7 @@ The extension connects to the database once, at startup. If that fails it logs a
 | `HINDSIGHT_UI_KEY_<TEAM>` | The key of each listed Team, where `<TEAM>` is its label upper-cased with `-` as `_` (`HINDSIGHT_UI_KEY_SILVER_AIR`): a Team key, or for `public` a Public Team key or the legacy key. Supply it as a secret. |
 | `HINDSIGHT_CP_DATAPLANE_API_URL` | Upstream's setting: the API every UI process calls. |
 
-Before any UI process starts, the script exits with status 78, naming each problem, if `HINDSIGHT_UI_TEAMS` is empty, an entry is malformed, a Team or a port is listed twice, a listed Team's key is unset or empty, or a command is passed. When one UI process exits, the script stops the others and the container exits non-zero (that process's status, or 1 if it was 0), so a platform that restarts on failure restarts the whole set. A stop signal (`SIGTERM` or `SIGINT`) stops every UI process and exits 0.
+Before any UI process starts, the script exits with status 78, naming each problem, if `HINDSIGHT_UI_TEAMS` is empty or holds a tab or line break, an entry is malformed, a Team or a port is listed twice, a listed Team's key is unset or empty, or a command is passed. When one UI process exits, the script stops the others and the container exits non-zero (that process's status, or 1 if it was 0), so a platform that restarts on failure restarts the whole set. A stop signal (`SIGTERM` or `SIGINT`), at any point, stops every UI process and exits 0.
 
 Every UI shows its Team's banks to whoever reaches its port, so put each hostname behind Access. Each UI process takes roughly 150 to 200 MB of memory: size the container for the Team count. Adding a Team to a running app is in [docs/operating.md](docs/operating.md), "The UI app".
 

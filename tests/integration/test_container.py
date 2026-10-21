@@ -907,7 +907,7 @@ MALFORMED = ["public", "public:", ":9999", "Public:9999", "-public:9999", "pub_l
         ("public:9999 silver-air:9999", {"PUBLIC": "k", "SILVER_AIR": "k"}, "port 9999 is listed for both"),
         ("public:9999 public:10000", {"PUBLIC": "k"}, "Team public is listed twice"),
         ("", {}, "HINDSIGHT_UI_TEAMS is unset or empty"),
-        ("public:9999\nsilver_air:10000", {"PUBLIC": "k"}, "'silver_air:10000' is not <team>:<port>"),
+        ("public:9999\nci-team:10000", {"PUBLIC": "k", "CI_TEAM": "k"}, "holds a tab or line break"),
         *[(entry, {"PUBLIC": "k"}, f"'{entry}' is not <team>:<port>") for entry in MALFORMED],
     ],
 )
@@ -969,6 +969,18 @@ def test_the_ui_image_serves_each_team_on_its_own_port_with_its_own_key(hindsigh
 
 def test_the_ui_image_never_starts_the_api(two_team_ui):
     assert port_state(two_team_ui["name"], 8888) == "closed"
+
+
+def test_upstreams_launcher_in_the_ui_image_starts_no_api():
+    """Even an entrypoint override that runs upstream's launcher starts only its UI, never the API."""
+    name, port = f"hak-it-ui-launcher-{RUN}", free_port()
+    try:
+        docker("run", "-d", "--name", name, "-p", f"127.0.0.1:{port}:9999", "--entrypoint", "/app/start-all.sh",
+               "-e", "HINDSIGHT_API_LLM_PROVIDER=mock", UI_IMAGE)  # an API, if one started, would come up
+        wait_healthy(port, name, "/api/health")
+        assert port_state(name, 8888) == "closed"
+    finally:
+        docker("rm", "-f", name, check=False)
 
 
 def test_one_ui_process_exiting_stops_the_container(two_team_ui):

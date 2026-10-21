@@ -6,13 +6,24 @@
 # and the container exits non-zero, so the platform restarts the whole set.
 set -eu
 
+pids=()
+stop() {
+  if [ ${#pids[@]} -ne 0 ]; then kill "${pids[@]}" 2>/dev/null || true; fi
+  wait || true
+}
+# Set before validation, so a stop request at any point exits 0.
+trap 'stop; exit 0' TERM INT
+
 problems=()
 if [ $# -ne 0 ]; then
   problems+=("the image takes no command; it runs only the UI processes HINDSIGHT_UI_TEAMS lists")
 fi
 
-# -d '' reads every line, so an entry after a newline is never dropped unchecked.
-read -r -d '' -a entries <<<"${HINDSIGHT_UI_TEAMS:-}" || true
+teams_value=${HINDSIGHT_UI_TEAMS:-}
+if [[ $teams_value == *[$'\t\n\r']* ]]; then
+  problems+=("HINDSIGHT_UI_TEAMS holds a tab or line break; separate entries with spaces")
+fi
+read -r -d '' -a entries <<<"$teams_value" || true
 if [ ${#entries[@]} -eq 0 ]; then
   problems+=("HINDSIGHT_UI_TEAMS is unset or empty; list each Team as <team>:<port>")
 fi
@@ -44,13 +55,6 @@ if [ ${#problems[@]} -ne 0 ]; then
   printf 'ui-start: refusing to start: %s\n' "${problems[@]}" >&2
   exit 78
 fi
-
-pids=()
-stop() {
-  kill "${pids[@]}" 2>/dev/null || true
-  wait || true
-}
-trap 'stop; exit 0' TERM INT
 
 cd /app/control-plane
 for team in "${teams[@]}"; do
