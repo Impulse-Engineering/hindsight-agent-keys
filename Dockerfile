@@ -20,8 +20,12 @@ RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
       --python /app/api/.venv/bin/python -r /tmp/pins.txt && \
     uv pip check --python /app/api/.venv/bin/python
 
-# The same for upstream's own uv in the system Python, outside the venv: GHSA-hq85-5cpj-mr62.
-# docker/system-pins.txt is generated as above; only root can write /usr/local, so the step runs as root.
+# The same for upstream's own uv in the system Python, outside the venv: GHSA-hq85-5cpj-mr62. uv has no
+# dependencies, so there is nothing for a check to fit. Only root can write /usr/local, so the step runs as root.
+# Regenerate docker/system-pins.txt with the system Python's version
+# (`docker run --rm --entrypoint /usr/local/bin/python3 <FROM image> -V`):
+#   printf 'uv==<version>\n' | uv pip compile - --no-deps --generate-hashes --only-binary :all: \
+#     --python-version <major.minor> --no-header --no-annotate -q -o docker/system-pins.txt
 USER root
 RUN --mount=type=bind,source=docker/system-pins.txt,target=/tmp/system-pins.txt \
     uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \

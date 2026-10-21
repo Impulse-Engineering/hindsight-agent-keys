@@ -44,11 +44,12 @@ jobs:
       - name: Script tests (release watcher, doc shell checks, pins)
         run: PATH="/tmp/it/bin:$PATH" pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 
-      - name: Unit tests (inside the pinned upstream image)
-        run: scripts/unit-tests.sh -v
-
       - name: Build the image
         run: docker build -t "$IMAGE" .
+
+      # In the built image, so the tests see its pinned packages, not only upstream's.
+      - name: Unit tests (inside the built image)
+        run: UNIT_TEST_IMAGE="$IMAGE" scripts/unit-tests.sh -v
 
       - name: Integration tests (real container, mock LLM)
         run: /tmp/it/bin/pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
