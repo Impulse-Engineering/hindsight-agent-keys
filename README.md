@@ -163,8 +163,8 @@ The extension connects to the database once, at startup. If that fails it logs a
 
 | Variable | Meaning |
 | --- | --- |
-| `HINDSIGHT_UI_TEAMS` | The Teams to serve, as space-separated `<team>:<port>` entries, such as `public:9999 silver-air:10000`. A name is lowercase letters, digits and inner hyphens; a port is 1024 to 65535. |
-| `HINDSIGHT_UI_KEY_<TEAM>` | The key of each listed Team, where `<TEAM>` is its name upper-cased with `-` as `_` (`HINDSIGHT_UI_KEY_SILVER_AIR`): a Team key, or for `public` a Public Team key or the legacy key. Supply it as a secret. |
+| `HINDSIGHT_UI_TEAMS` | The Teams to serve, as space-separated `<team>:<port>` entries, such as `public:9999 silver-air:10000`. `<team>` is a label the operator picks, which need not be the Team's name on `/ext/teams`: lowercase letters, digits and inner hyphens. A port is 1024 to 65535. |
+| `HINDSIGHT_UI_KEY_<TEAM>` | The key of each listed Team, where `<TEAM>` is its label upper-cased with `-` as `_` (`HINDSIGHT_UI_KEY_SILVER_AIR`): a Team key, or for `public` a Public Team key or the legacy key. Supply it as a secret. |
 | `HINDSIGHT_CP_DATAPLANE_API_URL` | Upstream's setting: the API every UI process calls. |
 
 Before any UI process starts, the script exits with status 78, naming each problem, if `HINDSIGHT_UI_TEAMS` is empty, an entry is malformed, a Team or a port is listed twice, a listed Team's key is unset or empty, or a command is passed. When one UI process exits, the script stops the others and the container exits non-zero (that process's status, or 1 if it was 0), so a platform that restarts on failure restarts the whole set. A stop signal (`SIGTERM` or `SIGINT`) stops every UI process and exits 0.

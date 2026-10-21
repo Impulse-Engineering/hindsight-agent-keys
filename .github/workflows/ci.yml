@@ -65,8 +65,10 @@ jobs:
 
       - name: Build the images (API, then UI from the same pinned base)
         run: |
-          docker build -t "$IMAGE" . && docker save "$IMAGE" -o "$RUNNER_TEMP/image.tar"
-          docker build --target ui -t "$UI_IMAGE" . && docker save "$UI_IMAGE" -o "$RUNNER_TEMP/ui-image.tar"
+          docker build -t "$IMAGE" .
+          docker save "$IMAGE" -o "$RUNNER_TEMP/image.tar"
+          docker build --target ui -t "$UI_IMAGE" .
+          docker save "$UI_IMAGE" -o "$RUNNER_TEMP/ui-image.tar"
 
       # Scans each exported tar: no Docker socket, read-only token.
       # Blocks on critical vulnerabilities that have a fix; reports the rest.

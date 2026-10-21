@@ -193,6 +193,11 @@ def test_workflows_hold_only_forms_the_check_reads():
     assert unread == []
 
 
+def test_both_images_build_on_the_one_upstream_pin():
+    """The API and UI images come from one pinned base, so the release watcher's one bump moves both."""
+    assert [image for where, image, _ in image_sites() if where.startswith("Dockerfile:")] == [upstream_ref()]
+
+
 def test_every_action_is_pinned_to_a_commit_sha_with_its_version():
     unpinned = [
         f"{where}: {text.strip()}"

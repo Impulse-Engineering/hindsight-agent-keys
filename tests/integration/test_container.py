@@ -882,16 +882,21 @@ def test_the_bundled_ui_is_not_listening(hindsight):
     assert port_state(hindsight["name"], 9999) == "closed"
 
 
-def run_ui(env, *command):
-    """Run the UI image to completion, as a refused configuration does."""
-    args = ["run", "--rm"]
-    for k, v in env.items():
-        args += ["-e", f"{k}={v}"]
-    return docker(*args, UI_IMAGE, *command, check=False, timeout=180)
+def env_args(env):
+    return [arg for k, v in env.items() for arg in ("-e", f"{k}={v}")]
 
 
-MALFORMED = ["public", "public:", ":9999", "Public:9999", "-public:9999", "pub_lic:9999", "public:80", "public:65536",
-             "public:09999", "public:9999:1"]
+def run_ui(env, *command, args=()):
+    """Run the UI image to completion, as a refused configuration does. A UI that starts instead is removed."""
+    name = f"hak-it-ui-run-{secrets.token_hex(4)}"
+    try:
+        return docker("run", "--rm", "--name", name, *args, *env_args(env), UI_IMAGE, *command, check=False, timeout=60)
+    finally:
+        docker("rm", "-f", name, check=False)
+
+
+MALFORMED = ["public", "public:", ":9999", "Public:9999", "-public:9999", "pub_lic:9999", "public:80", "public:1023",
+             "public:65536", "public:09999", "public:9999:1"]
 
 
 @pytest.mark.parametrize(
@@ -934,11 +939,10 @@ def two_team_ui(hindsight, ci_team):
             "HINDSIGHT_UI_KEY_PUBLIC": LEGACY,
             "HINDSIGHT_UI_KEY_CI_TEAM": ci_team["key"],
         }
-        args = ["run", "-d", "--name", name, "--network", name]
+        # As Conductor runs an image app: its own user, no capabilities.
+        args = ["run", "-d", "--name", name, "--network", name, "--user", "1000:1000", "--cap-drop=ALL"]
         args += ["-p", f"127.0.0.1:{ports['public']}:9999", "-p", f"127.0.0.1:{ports['ci-team']}:10000"]
-        for k, v in env.items():
-            args += ["-e", f"{k}={v}"]
-        docker(*args, UI_IMAGE)
+        docker(*args, *env_args(env), UI_IMAGE)
         for port in ports.values():
             wait_healthy(port, name, "/api/health")
         yield {"name": name, "ports": ports, "keys": {"public": LEGACY, "ci-team": ci_team["key"]}}
@@ -974,6 +978,18 @@ def test_one_ui_process_exiting_stops_the_container(two_team_ui):
     docker("exec", name, "kill", pids[0])
     assert docker("wait", name, timeout=60).stdout.strip() != "0"
     assert "a UI process exited" in docker("logs", name).stderr
+
+
+def test_a_ui_process_exiting_0_still_stops_the_container_with_a_failure(tmp_path):
+    """Conductor restarts an app only on failure, so a UI that exits cleanly must still fail the container."""
+    node = tmp_path / "node"
+    node.write_text('#!/bin/sh\n[ "$PORT" = 10000 ] && exit 0\nexec sleep 60\n')
+    node.chmod(0o755)
+    env = {"PATH": "/fake:/usr/local/bin:/usr/bin:/bin", "HINDSIGHT_UI_TEAMS": "public:9999 ci-team:10000",
+           "HINDSIGHT_UI_KEY_PUBLIC": "k", "HINDSIGHT_UI_KEY_CI_TEAM": "k"}
+    result = run_ui(env, args=["-v", f"{node}:/fake/node:ro"])
+    assert result.returncode == 1, result.stderr
+    assert "a UI process exited with status 0; stopping the others" in result.stderr
 
 
 def test_stopping_the_ui_container_stops_its_processes_and_exits_0():
