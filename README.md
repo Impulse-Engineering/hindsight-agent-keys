@@ -159,7 +159,7 @@ The extension connects to the database once, at startup. If that fails it logs a
 
 ## The UI image
 
-`ghcr.io/impulse-engineering/hindsight-ui` runs upstream's web UI and nothing else, built from the same pinned upstream release as the API image (`docker build --target ui`). Upstream's UI sends one key, and a key reaches one Team, so the image starts one UI process per listed Team, each on its own port with its own key. Its entrypoint is `docker/ui-start.sh`. It never starts the API, and it takes no command. The image sets `HINDSIGHT_ENABLE_API=false`, so even an entrypoint override that runs upstream's launcher starts only one UI.
+`ghcr.io/impulse-engineering/hindsight-ui` runs upstream's web UI and nothing else, built from the same pinned upstream release as the API image (`docker build --target ui`). Upstream's UI sends one key, and a key reaches one Team, so the image starts one UI process per listed Team, each on its own port with its own key. Its entrypoint is `docker/ui-start.sh`. It never starts the API, and it takes no command. The image sets `HINDSIGHT_ENABLE_API=false`, so even an entrypoint override that runs upstream's launcher starts only one UI; never override that variable.
 
 | Variable | Meaning |
 | --- | --- |
