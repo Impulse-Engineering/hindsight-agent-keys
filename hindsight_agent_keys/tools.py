@@ -12,9 +12,9 @@ from typing import Literal
 from hindsight_api.api.mcp import get_current_api_key, get_current_extra_headers
 from hindsight_api.extensions.mcp import MCPExtension
 
+from hindsight_agent_keys.bodies import Email, Name
 from hindsight_agent_keys.extension import acting_via, client_ip
 from hindsight_agent_keys.store import Refused
-from hindsight_agent_keys.web import Email, Name
 
 
 class AgentKeysMcpExtension(MCPExtension):

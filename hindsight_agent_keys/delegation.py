@@ -8,9 +8,13 @@ email, and a self operation takes no email from the body. Routes call the tenant
 only, never the store, so every rule and limit the key pages meet applies here too.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from hindsight_agent_keys.access import ACCESS_JWT_HEADER
+from hindsight_agent_keys.bodies import NewKey, _or_refused
 from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
 
 DELEGATED_JWT_HEADER = "x-delegated-access-jwt"
@@ -27,6 +31,7 @@ def delegated_router(memory) -> APIRouter:
             raise HTTPException(403, "State changes need JSON.")
         delegate = await keys.delegate(request.headers.get(ACCESS_JWT_HEADER))
         acting_via("delegated", delegate)
+        request.state.delegate = delegate
         # Read only for a valid Delegate, so nobody else can record the person's sign-in.
         email = await keys.delegated_email(request.headers.get(DELEGATED_JWT_HEADER)) if delegate else None
         if email is None:
@@ -46,6 +51,41 @@ def delegated_router(memory) -> APIRouter:
         return {"email": email, "role": await keys.role(email)}
 
     # Keys (#999)
+
+    @router.post("/keys")
+    async def create_key(
+        body: NewKey,
+        request: Request,
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+        email: str = Depends(delegated_person),
+    ):
+        """A personal key for the person, marked as created via WorkPlane; the key is shown only in this answer.
+        A repeat of the Idempotency-Key with the same body within 24 hours answers the same ID without the key."""
+        creation = memory.tenant_extension.create_personal_key(
+            email, body.name, client_ip(request.headers), via=request.state.delegate, idempotency_key=idempotency_key
+        )
+        key_id, key = await _or_refused(creation)
+        shown = {"key": key} if key else {}
+        return JSONResponse({"id": key_id, "name": body.name, **shown}, headers={"Cache-Control": "no-store"})
+
+    # Only the person's own keys marked as created via WorkPlane, never their key page keys or anyone else's.
+
+    @router.get("/keys")
+    async def my_keys(email: str = Depends(delegated_person)):
+        """Each with its state and days to expiry."""
+        return await memory.tenant_extension.list_keys(email, via_workplane=True)
+
+    @router.post("/keys/{key_id}/renew")
+    async def renew_key(key_id: str, request: Request, email: str = Depends(delegated_person)):
+        renewal = memory.tenant_extension.renew_key(email, key_id, client_ip(request.headers), via_workplane=True)
+        return {"id": key_id, "expires_at": await _or_refused(renewal)}
+
+    @router.post("/keys/{key_id}/revoke")
+    async def revoke_key(key_id: str, request: Request, email: str = Depends(delegated_person)):
+        """A repeat answers the same: the key is revoked."""
+        revocation = memory.tenant_extension.revoke_key(email, key_id, client_ip(request.headers), via_workplane=True)
+        await _or_refused(revocation)
+        return {"id": key_id, "state": "revoked"}
 
     # Admin (#1003)
 

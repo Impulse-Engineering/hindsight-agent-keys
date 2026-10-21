@@ -938,6 +938,52 @@ def test_a_restart_reuses_the_event_log(hindsight):
     assert [r["client_ip"] for r in rows] == ["203.0.113.61", "203.0.113.62"]
 
 
+def test_concurrent_delegated_creations_stop_at_the_workplane_cap(hindsight):
+    port, name, kim = hindsight["port"], hindsight["name"], "kim@example.test"
+    # On the Key Allowlist, and not an admin.
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": kim, "role": "member"})[0] == 204
+    own = personal_key(hindsight, kim)
+    # 23 WorkPlane keys created two hours ago, so the hourly limit lets every creation below through: only the cap refuses.
+    query(
+        name,
+        "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at, via, created_at)"
+        f" SELECT 'old' || n, decode('00', 'hex'), 'old', email, schema, 'personal', now() + interval '1 day',"
+        f" '{DELEGATE_ID}', now() - interval '2 hours' FROM agent_keys.people, generate_series(1, 23) n"
+        f" WHERE email = '{kim}' RETURNING id",
+    )
+    # Minted once, so the creations below reach the server together.
+    sent = {
+        "Host": DELEGATION_HOST,
+        "Cf-Access-Jwt-Assertion": access_token(name, common_name=DELEGATE_ID, sub="", aud=[DELEGATION_AUD]),
+        "X-Delegated-Access-Jwt": access_token(name, email=kim, aud=[WORKPLANE_AUD]),
+    }
+
+    def create(n, body=None):
+        headers = {**sent, "Idempotency-Key": f"ci-{n}"}
+        return http(port, "POST", "/ext/delegated/keys", body=body or {"name": f"wp{n}"}, headers=headers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        answers = list(pool.map(create, range(8)))
+    assert sorted(status for status, _ in answers) == [200, 200] + [429] * 6, answers
+    active = f"SELECT count(*) AS n FROM agent_keys.keys WHERE email = '{kim}' AND via IS NOT NULL AND revoked_at IS NULL"
+    assert query(name, active) == [{"n": 25}]
+    # A retry returns the key it created, without the key, even at the cap; another body is refused.
+    n, created = next((n, json.loads(text)) for n, (status, text) in enumerate(answers) if status == 200)
+    status, text = create(n)
+    assert (status, json.loads(text)) == (200, {"id": created["id"], "name": created["name"]})
+    assert create(n, {"name": "another"})[0] == 409
+    # 24 hours on, the same idempotency key is a new creation, which the cap refuses.
+    query(name, f"UPDATE agent_keys.idempotency SET created_at = now() - interval '24 hours' WHERE email = '{kim}' RETURNING key")
+    assert create(n)[0] == 429
+    # Delegated list, renew and revoke reach only the WorkPlane keys, and the key page counts its own apart.
+    status, text = http(port, "GET", "/ext/delegated/keys", headers=sent)
+    assert status == 200, text
+    assert [k["id"] for k in json.loads(text) if k["via"] != DELEGATE_ID or k["id"] == own["id"]] == []
+    for action in ("renew", "revoke"):
+        assert http(port, "POST", f"/ext/delegated/keys/{own['id']}/{action}", body={}, headers=sent)[0] == 404
+    personal_key(hindsight, kim)
+
+
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
     # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.

@@ -79,6 +79,18 @@ FROM {SCHEMA}.people p LEFT JOIN {SCHEMA}.sign_ins s ON s.email = p.email,
 LATERAL (SELECT max(least(expires_at, revoked_at, s.last_seen + interval '30 days')) AS last_active
          FROM {SCHEMA}.keys WHERE schema = p.schema) k
 WHERE p.schema IS NOT NULL AND coalesce(k.last_active, p.created_at) <= now() - interval '90 days';
+-- #999: a key created via WorkPlane names the Delegate (its service-token client ID) that created it; NULL on /ext.
+ALTER TABLE {SCHEMA}.keys ADD COLUMN IF NOT EXISTS via text;
+-- #999: the Delegate's idempotency key for each creation, kept 24 hours, so a retry returns the key it created.
+CREATE TABLE IF NOT EXISTS {SCHEMA}.idempotency (
+    delegate text NOT NULL,
+    email text NOT NULL,
+    key text NOT NULL,
+    body_sha256 bytea NOT NULL,
+    key_id text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (delegate, email, key)
+);
 """
 
 
@@ -146,25 +158,57 @@ class PostgresKeyStore:
         )
 
     async def add_key(
-        self, key_id: str, digest: bytes, name: str, email: str, schema: str, kind: str, expires_at: datetime
-    ) -> None:
-        """Store a key, or raise Refused(429) if its owner is at a limit."""
+        self,
+        key_id: str,
+        digest: bytes,
+        name: str,
+        email: str,
+        schema: str,
+        kind: str,
+        expires_at: datetime,
+        *,
+        via: str | None = None,
+        cap: int = ACTIVE_KEYS,
+        per_hour: int = CREATIONS_PER_HOUR,
+        idempotency: tuple[str, bytes] | None = None,
+    ) -> str:
+        """Store a key and return its ID, or raise Refused(429) if its owner is at a limit. Keys created
+        via WorkPlane (`via`, the Delegate's client ID) and the person's own are counted apart, each against
+        its own limits. With `idempotency`, the Delegate's (key, body digest): a repeat within 24 hours stores
+        nothing and returns the ID the first one stored, and the same key with another body is Refused(409)."""
         pool = await self._get_pool()
+        mine = "keys created via WorkPlane" if via else "keys"
         async with pool.acquire() as conn, conn.transaction():
-            # Locking the person makes concurrent creations count each other.
+            # Locking the person makes concurrent creations, and retries, count each other.
             await conn.execute(f"SELECT 1 FROM {SCHEMA}.people WHERE email = $1 FOR UPDATE", email)
+            if idempotency is not None:
+                await conn.execute(
+                    f"DELETE FROM {SCHEMA}.idempotency WHERE email = $1 AND created_at <= now() - interval '24 hours'", email
+                )
+                earlier = await conn.fetchrow(
+                    f"SELECT body_sha256, key_id FROM {SCHEMA}.idempotency WHERE delegate = $1 AND email = $2 AND key = $3",
+                    via,
+                    email,
+                    idempotency[0],
+                )
+                if earlier is not None:
+                    if earlier["body_sha256"] != idempotency[1]:
+                        raise Refused(409, "That idempotency key was used for another request.")
+                    return earlier["key_id"]
             active, recent = await conn.fetchrow(
                 "SELECT count(*) FILTER (WHERE revoked_at IS NULL AND expires_at > now()),"
-                f" count(*) FILTER (WHERE created_at > now() - interval '1 hour') FROM {SCHEMA}.keys WHERE email = $1",
+                f" count(*) FILTER (WHERE created_at > now() - interval '1 hour') FROM {SCHEMA}.keys"
+                " WHERE email = $1 AND (via IS NULL) = ($2::text IS NULL)",
                 email,
+                via,
             )
-            if active >= ACTIVE_KEYS:
-                raise Refused(429, f"You already hold {ACTIVE_KEYS} active keys.")
-            if recent >= CREATIONS_PER_HOUR:
-                raise Refused(429, f"You can create at most {CREATIONS_PER_HOUR} keys an hour.")
+            if active >= cap:
+                raise Refused(429, f"You already hold {cap} active {mine}.")
+            if recent >= per_hour:
+                raise Refused(429, f"You can create at most {per_hour} {mine} an hour.")
             await conn.execute(
-                f"INSERT INTO {SCHEMA}.keys (id, digest, name, email, schema, kind, expires_at)"
-                " VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                f"INSERT INTO {SCHEMA}.keys (id, digest, name, email, schema, kind, expires_at, via)"
+                " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 key_id,
                 digest,
                 name,
@@ -172,7 +216,17 @@ class PostgresKeyStore:
                 schema,
                 kind,
                 expires_at,
+                via,
             )
+            if idempotency is not None:
+                await conn.execute(
+                    f"INSERT INTO {SCHEMA}.idempotency (delegate, email, key, body_sha256, key_id) VALUES ($1, $2, $3, $4, $5)",
+                    via,
+                    email,
+                    *idempotency,
+                    key_id,
+                )
+        return key_id
 
     async def role(self, email: str) -> str | None:
         pool = await self._get_pool()
@@ -343,36 +397,52 @@ class PostgresKeyStore:
             at,
         )
 
-    async def list_keys(self, email: str) -> list[dict]:
+    # With `via_workplane`, the next three reach only keys created via WorkPlane.
+
+    async def list_keys(self, email: str, *, via_workplane: bool = False) -> list[dict]:
         pool = await self._get_pool()
         rows = await pool.fetch(
-            f"SELECT id, name, created_at, expires_at, revoked_at FROM {SCHEMA}.keys"
-            " WHERE email = $1 ORDER BY created_at, id",
+            f"SELECT id, name, created_at, expires_at, revoked_at, via FROM {SCHEMA}.keys"
+            " WHERE email = $1 AND (NOT $2::boolean OR via IS NOT NULL) ORDER BY created_at, id",
             email,
+            via_workplane,
         )
         return [dict(r) for r in rows]
 
-    async def renew_key(self, email: str, key_id: str, now: datetime, expires_at: datetime) -> bool:
+    async def renew_key(
+        self, email: str, key_id: str, now: datetime, expires_at: datetime, *, via_workplane: bool = False
+    ) -> bool:
         """Move the expiry of the person's key unless it is revoked or already expired."""
         pool = await self._get_pool()
         renewed = await pool.fetchval(
             f"UPDATE {SCHEMA}.keys SET expires_at = $4"
-            " WHERE id = $1 AND email = $2 AND revoked_at IS NULL AND expires_at > $3 RETURNING id",
+            " WHERE id = $1 AND email = $2 AND revoked_at IS NULL AND expires_at > $3 AND (NOT $5::boolean OR via IS NOT NULL)"
+            " RETURNING id",
             key_id,
             email,
             now,
             expires_at,
+            via_workplane,
         )
         return renewed is not None
 
-    async def revoke_keys(self, email: str, now: datetime, key_id: str | None = None) -> int:
+    async def revoke_keys(
+        self, email: str, now: datetime, key_id: str | None = None, *, via_workplane: bool = False
+    ) -> int:
         """Revoke one of the person's keys, or with no key ID all of them; returns how many."""
         pool = await self._get_pool()
         rows = await pool.fetch(
             f"UPDATE {SCHEMA}.keys SET revoked_at = $2"
-            " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) RETURNING id",
+            " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) AND (NOT $4::boolean OR via IS NOT NULL)"
+            " RETURNING id",
             email,
             now,
             key_id,
+            via_workplane,
         )
         return len(rows)
+
+    async def last_sign_in(self, email: str) -> datetime | None:
+        """When the person last signed in through Access, as `signed_in` recorded it."""
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT last_seen FROM {SCHEMA}.sign_ins WHERE email = $1", email)

@@ -4,7 +4,7 @@ the event log, and a Cloudflare Access team that serves signing keys and signs J
 import json
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
@@ -17,7 +17,12 @@ from hindsight_api.extensions.context import ExtensionContext
 from jwt.algorithms import RSAAlgorithm
 
 from hindsight_agent_keys.extension import AgentKeysTenantExtension
-from hindsight_agent_keys.store import TEAMS_PER_PERSON, Refused
+from hindsight_agent_keys.store import (
+    ACTIVE_KEYS,
+    CREATIONS_PER_HOUR,
+    TEAMS_PER_PERSON,
+    Refused,
+)
 from hindsight_agent_keys.web import AgentKeysHttpExtension
 
 AUD = "aud-tag-0123456789"
@@ -74,6 +79,7 @@ class MemoryStore:
         # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
         self.stale = []
         self.fail = False
+        self.idempotency = {}  # (delegate, email, key) -> body_sha256, key_id, created_at
 
     async def stale_schemas(self):
         return self.stale
@@ -151,8 +157,34 @@ class MemoryStore:
         self.people[email] = self.people.get(email) or schema
         return self.people[email]
 
-    async def add_key(self, key_id, digest, name, email, schema, kind, expires_at):
+    async def add_key(
+        self,
+        key_id,
+        digest,
+        name,
+        email,
+        schema,
+        kind,
+        expires_at,
+        *,
+        via=None,
+        cap=ACTIVE_KEYS,
+        per_hour=CREATIONS_PER_HOUR,
+        idempotency=None,
+    ):
         assert email in self.people, "keys.email references people"
+        now, mine = datetime.now(UTC), "keys created via WorkPlane" if via else "keys"
+        if idempotency is not None:
+            earlier = self.idempotency.get((via, email, idempotency[0]))
+            if earlier is not None and earlier["created_at"] > now - timedelta(hours=24):
+                if earlier["body_sha256"] != idempotency[1]:
+                    raise Refused(409, "That idempotency key was used for another request.")
+                return earlier["key_id"]
+        counted = [k for k in self.keys.values() if k["email"] == email and (k["via"] is None) == (via is None)]
+        if sum(k["revoked_at"] is None and k["expires_at"] > now for k in counted) >= cap:
+            raise Refused(429, f"You already hold {cap} active {mine}.")
+        if sum(k["created_at"] > now - timedelta(hours=1) for k in counted) >= per_hour:
+            raise Refused(429, f"You can create at most {per_hour} {mine} an hour.")
         self.keys[key_id] = {
             "id": key_id,
             "digest": digest,
@@ -163,7 +195,13 @@ class MemoryStore:
             "created_at": datetime.now(UTC),
             "expires_at": expires_at,
             "revoked_at": None,
+            "via": via,
         }
+        if idempotency is not None:
+            self.idempotency[via, email, idempotency[0]] = {
+                "body_sha256": idempotency[1], "key_id": key_id, "created_at": now
+            }
+        return key_id
 
     async def find_key(self, key_id):
         key = self.keys.get(key_id)
@@ -191,25 +229,35 @@ class MemoryStore:
     async def signed_in(self, email, at):
         self.sign_ins[email] = max(at, self.sign_ins.get(email, at))
 
-    async def list_keys(self, email):
-        fields = ("id", "name", "created_at", "expires_at", "revoked_at")
-        return [{f: k[f] for f in fields} for k in self.keys.values() if k["email"] == email]
+    def _reached(self, key, email, via_workplane):
+        return key is not None and key["email"] == email and (not via_workplane or key["via"] is not None)
 
-    async def renew_key(self, email, key_id, now, expires_at):
+    async def list_keys(self, email, *, via_workplane=False):
+        fields = ("id", "name", "created_at", "expires_at", "revoked_at", "via")
+        return [{f: k[f] for f in fields} for k in self.keys.values() if self._reached(k, email, via_workplane)]
+
+    async def renew_key(self, email, key_id, now, expires_at, *, via_workplane=False):
         key = self.keys.get(key_id)
-        if key is None or key["email"] != email or key["revoked_at"] is not None or key["expires_at"] <= now:
+        if not self._reached(key, email, via_workplane) or key["revoked_at"] is not None or key["expires_at"] <= now:
             return False
         key["expires_at"] = expires_at
         return True
 
-    async def revoke_keys(self, email, now, key_id=None):
-        hits = [k for k in self.keys.values() if k["email"] == email and k["revoked_at"] is None and key_id in (None, k["id"])]
+    async def revoke_keys(self, email, now, key_id=None, *, via_workplane=False):
+        hits = [
+            k
+            for k in self.keys.values()
+            if self._reached(k, email, via_workplane) and k["revoked_at"] is None and key_id in (None, k["id"])
+        ]
         for key in hits:
             key["revoked_at"] = now
         return len(hits)
 
     async def close(self):
         pass
+
+    async def last_sign_in(self, email):
+        return self.sign_ins.get(email)
 
 
 class Migrations(ExtensionContext):
@@ -307,7 +355,7 @@ def delegated_headers(team, email="alice@example.com", *, delegate=None, person=
     }
 
 
-def delegated_app(team, store=None, **config):
+def delegated_app(team, store=None, *, clock=None, **config):
     """The /ext router (key pages and Delegated Requests), mounted as upstream mounts it
     (api/http.py:5301-5316). Returns (client, extension, events); a config value of None drops it."""
     config = {
@@ -326,6 +374,7 @@ def delegated_app(team, store=None, **config):
         {k: v for k, v in config.items() if v is not None},
         store=store if store is not None else MemoryStore(),
         events=events,
+        clock=clock,
     )
     ext.set_context(Migrations())
     app = FastAPI()
