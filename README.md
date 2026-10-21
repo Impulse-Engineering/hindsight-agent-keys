@@ -157,7 +157,7 @@ The extension connects to the database once, at startup. If that fails it logs a
 
 ## Tests
 
-Unit tests run inside the pinned upstream image, which ships `hindsight_api` and pytest:
+Unit tests run inside the pinned upstream image, which ships `hindsight_api` and pytest. CI runs them inside the image it built (`UNIT_TEST_IMAGE`), so they also see the image's pinned packages:
 
 ```sh
 scripts/unit-tests.sh -v
