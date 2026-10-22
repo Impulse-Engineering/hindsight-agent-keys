@@ -295,6 +295,8 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def set_role(self, admin: str, email: str, role: str | None, client_ip: str | None) -> None:
         """An admin makes the person a 'member' or an 'admin' of the Key Allowlist, or removes them (None)."""
+        if await self.role(admin) != "admin":
+            raise Refused(403, "Only admins can manage the Key Allowlist.")
         if email in self.bootstrap_admins:
             raise Refused(409, "Admins set in AGENT_KEYS_ADMIN_EMAILS cannot be changed here.")
         old = await self._store.set_role(email, role)
@@ -403,11 +405,22 @@ class AgentKeysTenantExtension(TenantExtension):
         raise Refused(404, "You hold no unrevoked key with that ID.")
 
     async def revoke_identity(self, admin: str, email: str, client_ip: str | None) -> int:
-        """Revoke every key the person holds; returns how many. Admins only."""
+        """Revoke every key the person holds; returns how many. Admins only. Recorded only when it revoked
+        a key, so a repeat records nothing."""
         if await self.role(admin) != "admin":
             raise Refused(403, "Only an admin can revoke an identity.")
         revoked = await self._store.revoke_keys(email, self._clock())
-        await self._record("identity_revoked", NO_KEY_ID, client_ip, email, actor=admin)
+        if revoked:
+            await self._record("identity_revoked", NO_KEY_ID, client_ip, email, actor=admin)
+        return revoked
+
+    async def revoke_workplane_keys(self, admin: str, client_ip: str | None) -> int:
+        """The kill switch: revoke every key created via WorkPlane, whoever holds it; returns how many.
+        Admins only, on the /ext admin pages; no Delegated Request reaches it."""
+        if await self.role(admin) != "admin":
+            raise Refused(403, "Only an admin can revoke the keys created via WorkPlane.")
+        revoked = await self._store.revoke_workplane_keys(self._clock())
+        await self._record("workplane_keys_revoked", NO_KEY_ID, client_ip, actor=admin)
         return revoked
 
     async def create_team_key(

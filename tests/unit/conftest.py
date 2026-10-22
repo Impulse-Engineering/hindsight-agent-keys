@@ -274,6 +274,12 @@ class MemoryStore:
         async with self.name_locks.setdefault(name.strip().lower(), asyncio.Lock()):
             yield
 
+    async def revoke_workplane_keys(self, now):
+        hits = [k for k in self.keys.values() if k["via"] is not None and k["revoked_at"] is None]
+        for key in hits:
+            key["revoked_at"] = now
+        return len(hits)
+
 
 class Migrations(ExtensionContext):
     """Records the schemas Hindsight was asked to create and migrate."""

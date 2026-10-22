@@ -475,3 +475,11 @@ class PostgresKeyStore:
         finally:
             # Closing the connection releases the lock, on a failure too.
             await conn.close()
+
+    async def revoke_workplane_keys(self, now: datetime) -> int:
+        """Revoke every unrevoked key created via WorkPlane, whoever holds it; returns how many."""
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
+        )
+        return len(rows)
