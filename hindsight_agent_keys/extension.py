@@ -410,6 +410,13 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._record("identity_revoked", NO_KEY_ID, client_ip, email, actor=admin)
         return revoked
 
+    async def revoke_workplane_keys(self, admin: str, client_ip: str | None) -> int:
+        """The kill switch: revoke every key created via WorkPlane, whoever holds it; returns how many.
+        The caller checks that `admin` is one (the /ext admin pages; never a Delegated Request)."""
+        revoked = await self._store.revoke_workplane_keys(self._clock())
+        await self._record("workplane_keys_revoked", NO_KEY_ID, client_ip, actor=admin)
+        return revoked
+
     async def create_team_key(self, email: str, team: str, name: str, client_ip: str | None) -> tuple[str, str]:
         """Create a key for a Team the person is in, or for the Public Team (`public`).
         Returns (key ID, key); the key is never stored."""

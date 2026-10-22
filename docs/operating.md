@@ -1,6 +1,6 @@
 # Operating multi-user Hindsight
 
-How to run the `hindsight` app on this image day to day: the Key Allowlist, Agent Keys, Teams, revoking an identity, upstream upgrades and troubleshooting. The [README](../README.md) states the rules each part enforces; this page says who does what and how to check it. The cut-over and its rollback are in [cutover.md](cutover.md).
+How to run the `hindsight` app on this image day to day: the Key Allowlist, Agent Keys, Teams, revoking an identity, the kill switch for WorkPlane, upstream upgrades and troubleshooting. The [README](../README.md) states the rules each part enforces; this page says who does what and how to check it. The cut-over and its rollback are in [cutover.md](cutover.md).
 
 Commands marked *(not verified)* have not been run on Dev. Commands marked **CT** run on the app's container, after the setup block in [cutover.md](cutover.md) (the one that defines `pg` and `api`).
 
@@ -16,7 +16,7 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 | Anyone who signs in through Access | `/ext/` | Asks to join the Key Allowlist |
 | People on the Key Allowlist | `/ext/`, `/ext/teams` | Create, renew and revoke their own keys; create Teams; create Team and Public Team keys |
 | Team owners on the Key Allowlist | `/ext/teams` | Add and remove members and owners; confirm or decline the people agents asked to add |
-| Admins | `/ext/admin`, `/ext/teams` | Manage the Key Allowlist, revoke identities, see stale personal schemas, manage every Team |
+| Admins | `/ext/admin`, `/ext/teams` | Manage the Key Allowlist, revoke identities, revoke every key created via WorkPlane (the kill switch), see stale personal schemas, manage every Team |
 | Platform admins | Conductor and the CT | Set secrets (the first admins among them), approve digests, deploy, run CT commands |
 | Agents | The bypass hostname | Use memory with an Agent Key over the API and MCP; with a personal key, manage Teams over MCP |
 
@@ -60,6 +60,26 @@ read -r -p 'Email: ' email &&
   echo "select id, kind, schema, revoked_at from agent_keys.keys where email = :'email'" |
   pg psql -X -d hindsight -At -v email="$email"
 ```
+
+An admin signed in to WorkPlane can also do steps 1 and 2 through it, for keys of either origin; the events then name WorkPlane as the `delegate`.
+
+## Kill switch
+
+For a compromised or misbehaving WorkPlane: stop everything it does in Hindsight at once. Do both steps, in this order, or WorkPlane creates new keys for the people signed in to it as fast as step 2 revokes them.
+
+1. **Stop Delegated Requests in Access** (a Cloudflare Zero Trust admin). Under **Access controls** > **Service credentials** > **Service Tokens**, delete WorkPlane's service token, the one whose client ID is `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID`; a deleted token cannot be recovered. Then edit the delegation application and select **Revoke existing tokens**, which ends the sessions Access already issued to it. **Auth state:** from then on Access refuses every Delegated Request, so WorkPlane can neither manage access nor create keys, but the keys it created still retain and recall until step 2.
+2. **Revoke every key created via WorkPlane** (an admin). On `/ext/admin`, under **Kill switch**, press **Revoke every key created via WorkPlane**. Every such key, personal or Team, whoever holds it, is revoked in one transaction and fails on its next request, including inside an open MCP session. Keys people created on `/ext/` keep working. The event log records `workplane_keys_revoked` with you as `actor`. No Delegated Request can do this, even an admin's, so it never depends on WorkPlane.
+
+If step 1 has to wait for an Access admin, do step 2 at once and again after step 1: in between, WorkPlane can still create keys for the people who use it.
+
+To check from the CT, this prints the number of keys created via WorkPlane that are not revoked, 0 after step 2 *(not verified on Dev; runs in the integration tests)*:
+
+```sh
+# CT
+pg psql -X -d hindsight -Atc 'select count(*) from agent_keys.keys where via is not null and revoked_at is null'
+```
+
+To bring WorkPlane back once the cause is fixed *(not verified)*: create a new service token for it, add it to the delegation application's policy, and set `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID` to its client ID with `platform_set_secret`, which restarts the app. **Auth state:** down during the restart; afterwards Hindsight accepts only the new token. Then give WorkPlane the token. The revoked keys stay revoked; WorkPlane creates new ones the next time each person uses it.
 
 ## Teams
 

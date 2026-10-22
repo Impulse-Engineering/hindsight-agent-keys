@@ -446,3 +446,11 @@ class PostgresKeyStore:
         """When the person last signed in through Access, as `signed_in` recorded it."""
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT last_seen FROM {SCHEMA}.sign_ins WHERE email = $1", email)
+
+    async def revoke_workplane_keys(self, now: datetime) -> int:
+        """Revoke every unrevoked key created via WorkPlane, whoever holds it; returns how many."""
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
+        )
+        return len(rows)
