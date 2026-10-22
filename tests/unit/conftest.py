@@ -1,21 +1,40 @@
 """Stand-ins for what the extension talks to: its database, Hindsight's migrations,
 the event log, and a Cloudflare Access team that serves signing keys and signs JWTs."""
 
+import asyncio
+import contextlib
 import json
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from hindsight_api.extensions.context import ExtensionContext
 from jwt.algorithms import RSAAlgorithm
 
-from hindsight_agent_keys.store import TEAMS_PER_PERSON, Refused
+from hindsight_agent_keys.extension import AgentKeysTenantExtension
+from hindsight_agent_keys.store import (
+    ACTIVE_KEYS,
+    CREATIONS_PER_HOUR,
+    TEAMS_PER_PERSON,
+    Refused,
+)
+from hindsight_agent_keys.web import AgentKeysHttpExtension
 
 AUD = "aud-tag-0123456789"
+PEPPER = "pepper-0123456789abcdef0123456789abcdef"
+ACCESS_HOST = "keys.example.test"
+# The delegation application and WorkPlane's own Access application, on the same Access team.
+DELEGATION_HOST = "delegation.example.test"
+DELEGATION_AUD = "delegation-aud-0123"
+WORKPLANE_AUD = "workplane-aud-0123"
+DELEGATE_ID = "workplane-0123.access"
 
 
 class RecordedEvents:
@@ -29,11 +48,21 @@ class RecordedEvents:
     async def stop(self):
         pass
 
-    async def record(self, kind, key_id, client_ip, email=None, actor=None, team=None):
+    async def record(self, kind, key_id, client_ip, email=None, actor=None, team=None, *, channel=None, delegate=None):
         if self.fail:
             raise RuntimeError("event store unavailable")
+        # Every column PostgresEventLog writes, so a path that loses its channel shows in a test.
         self.rows.append(
-            {"kind": kind, "key_id": key_id, "client_ip": client_ip, "email": email, "actor": actor, "team": team}
+            {
+                "kind": kind,
+                "key_id": key_id,
+                "client_ip": client_ip,
+                "email": email,
+                "actor": actor,
+                "team": team,
+                "channel": channel,
+                "delegate": delegate,
+            }
         )
 
 
@@ -49,9 +78,15 @@ class MemoryStore:
         self.team_roles = {}  # (team, email) -> "owner" | "member"
         self.creators = {}  # team -> email
         self.requests = {}  # (team, email) -> (role, requested_by)
+        self.opened = set()  # the schemas of Open Teams
+        # When each request was filed, as the tables' requested_at: a Team's request by (team, email), and a Key Allowlist
+        # request by email. Asking again keeps it.
+        self.requested_at = {}
         # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
         self.stale = []
         self.fail = False
+        self.idempotency = {}  # (delegate, email, key) -> body_sha256, key_id, created_at
+        self.name_locks = {}  # lower-cased Team name -> asyncio.Lock
 
     async def stale_schemas(self):
         return self.stale
@@ -86,29 +121,61 @@ class MemoryStore:
         return self.team_roles.get((team, email))
 
     async def set_member(self, team, email, role):
+        had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
+        # A direct add settles the person's open request; (the role they had, who had asked for them).
+        _, asked_by = self.requests.pop((team, email), (None, None))
+        self.requested_at.pop((team, email), None)
+        return had, asked_by
 
     async def remove_member(self, team, email):
+        had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.pop((team, email), None))
+        return had
+
+    def _waiting(self, team, email, role):
+        """store._WAITING: the person is not in the Team already at the role asked for, or as an owner."""
+        return self.team_roles.get((team, email)) not in ("owner", role)
+
+    def _waiting_request(self, team, email):
+        """(role, requested_by) of the person's request if it waits, else None."""
+        request = self.requests.get((team, email))
+        return request if request and self._waiting(team, email, request[0]) else None
 
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)
+        if not self._waiting(team, email, role) or self.requests.get((team, email)) == (role, by):
+            return False
         self.requests[team, email] = (role, by)
+        self.requested_at.setdefault((team, email), datetime.now(UTC))
+        return True
+
+    async def add_join_request(self, team, email, role):
+        if team not in self.teams_by_schema or (team, email) in self.team_roles or (team, email) in self.requests:
+            return False
+        self.requests[team, email] = (role, email)
+        self.requested_at[team, email] = datetime.now(UTC)
+        return True
 
     async def confirm_member(self, team, email, role):
-        asked, _ = self.requests.get((team, email), (None, None))
+        asked, by = self._waiting_request(team, email) or (None, None)
         if asked == role:
             await self.set_member(team, email, role)
-            del self.requests[team, email]
-        return asked
+        return asked and (asked, by)
 
     async def decline_member(self, team, email):
         self._change_members(team, lambda roles: None)
-        role, _ = self.requests.pop((team, email), (None, None))
-        return role
+        if self._waiting_request(team, email) is None:
+            return None
+        self.requested_at.pop((team, email), None)
+        return self.requests.pop((team, email))  # (the role it asked for, who asked)
 
     async def member_requests(self, team):
-        return [{"email": e, "role": r, "requested_by": b} for (t, e), (r, b) in sorted(self.requests.items()) if t == team]
+        return [
+            {"email": e, "role": r, "requested_by": b}
+            for (t, e), (r, b) in sorted(self.requests.items())
+            if t == team and self._waiting(t, e, r)
+        ]
 
     def _change_members(self, team, change):
         if team not in self.teams_by_schema:
@@ -129,8 +196,34 @@ class MemoryStore:
         self.people[email] = self.people.get(email) or schema
         return self.people[email]
 
-    async def add_key(self, key_id, digest, name, email, schema, kind, expires_at):
+    async def add_key(
+        self,
+        key_id,
+        digest,
+        name,
+        email,
+        schema,
+        kind,
+        expires_at,
+        *,
+        via=None,
+        cap=ACTIVE_KEYS,
+        per_hour=CREATIONS_PER_HOUR,
+        idempotency=None,
+    ):
         assert email in self.people, "keys.email references people"
+        now, mine = datetime.now(UTC), "keys created via WorkPlane" if via else "keys"
+        if idempotency is not None:
+            earlier = self.idempotency.get((via, email, idempotency[0]))
+            if earlier is not None and earlier["created_at"] > now - timedelta(hours=24):
+                if earlier["body_sha256"] != idempotency[1]:
+                    raise Refused(409, "That idempotency key was used for another request.")
+                return earlier["key_id"]
+        counted = [k for k in self.keys.values() if k["email"] == email and (k["via"] is None) == (via is None)]
+        if sum(k["revoked_at"] is None and k["expires_at"] > now for k in counted) >= cap:
+            raise Refused(429, f"You already hold {cap} active {mine}.")
+        if sum(k["created_at"] > now - timedelta(hours=1) for k in counted) >= per_hour:
+            raise Refused(429, f"You can create at most {per_hour} {mine} an hour.")
         self.keys[key_id] = {
             "id": key_id,
             "digest": digest,
@@ -141,7 +234,13 @@ class MemoryStore:
             "created_at": datetime.now(UTC),
             "expires_at": expires_at,
             "revoked_at": None,
+            "via": via,
         }
+        if idempotency is not None:
+            self.idempotency[via, email, idempotency[0]] = {
+                "body_sha256": idempotency[1], "key_id": key_id, "created_at": now
+            }
+        return key_id
 
     async def find_key(self, key_id):
         key = self.keys.get(key_id)
@@ -169,25 +268,82 @@ class MemoryStore:
     async def signed_in(self, email, at):
         self.sign_ins[email] = max(at, self.sign_ins.get(email, at))
 
-    async def list_keys(self, email):
-        fields = ("id", "name", "created_at", "expires_at", "revoked_at")
-        return [{f: k[f] for f in fields} for k in self.keys.values() if k["email"] == email]
+    def _reached(self, key, email, via_workplane):
+        return key is not None and key["email"] == email and (not via_workplane or key["via"] is not None)
 
-    async def renew_key(self, email, key_id, now, expires_at):
+    async def list_keys(self, email, *, via_workplane=False):
+        fields = ("id", "name", "created_at", "expires_at", "revoked_at", "via")
+        return [{f: k[f] for f in fields} for k in self.keys.values() if self._reached(k, email, via_workplane)]
+
+    async def renew_key(self, email, key_id, now, expires_at, *, via_workplane=False):
         key = self.keys.get(key_id)
-        if key is None or key["email"] != email or key["revoked_at"] is not None or key["expires_at"] <= now:
+        if not self._reached(key, email, via_workplane) or key["revoked_at"] is not None or key["expires_at"] <= now:
             return False
         key["expires_at"] = expires_at
         return True
 
-    async def revoke_keys(self, email, now, key_id=None):
-        hits = [k for k in self.keys.values() if k["email"] == email and k["revoked_at"] is None and key_id in (None, k["id"])]
+    async def revoke_keys(self, email, now, key_id=None, *, via_workplane=False):
+        hits = [
+            k
+            for k in self.keys.values()
+            if self._reached(k, email, via_workplane) and k["revoked_at"] is None and key_id in (None, k["id"])
+        ]
         for key in hits:
             key["revoked_at"] = now
         return len(hits)
 
     async def close(self):
         pass
+
+    async def last_sign_in(self, email):
+        return self.sign_ins.get(email)
+
+    async def team_name(self, team):
+        return self.teams_by_schema.get(team)
+
+    async def team_creator(self, team):
+        return self.creators.get(team)
+
+    @contextlib.asynccontextmanager
+    async def team_name_lock(self, name):
+        async with self.name_locks.setdefault(name.strip().lower(), asyncio.Lock()):
+            yield
+
+    async def revoke_workplane_keys(self, now):
+        hits = [k for k in self.keys.values() if k["via"] is not None and k["revoked_at"] is None]
+        for key in hits:
+            key["revoked_at"] = now
+        return len(hits)
+
+    # --- Open Teams ---
+
+    async def set_open(self, team, opened):
+        if team not in self.teams_by_schema:
+            raise Refused(404, "There is no such Team.")
+        was = team in self.opened
+        (self.opened.add if opened else self.opened.discard)(team)
+        return was
+
+    async def join_open_team(self, team, email):
+        if team not in self.opened:
+            return None
+        joined = (team, email) not in self.team_roles
+        if self.requests.get((team, email), (None,))[0] == "member":
+            del self.requests[team, email]
+            self.requested_at.pop((team, email), None)
+        return self.team_roles.setdefault((team, email), "member"), joined
+
+    async def open_teams(self, email):
+        return [r for r in await self.teams(email, everyone=True) if r["schema"] in self.opened]
+
+    # --- pending_reviews ---
+
+    async def pending_join_requests(self, email, *, admin, older_than):
+        return sum(
+            self._waiting(team, asker, role)
+            and (self.team_roles.get((team, email)) == "owner" or (admin and self.requested_at[team, asker] < older_than))
+            for (team, asker), (role, _) in self.requests.items()
+        )
 
 
 class Migrations(ExtensionContext):
@@ -269,3 +425,44 @@ def team():
     yield t
     t.server.shutdown()
     t.server.server_close()
+
+
+def delegated_headers(team, email="alice@example.com", *, delegate=None, person=None):
+    """A Delegated Request's headers: the Delegate's service-token JWT, as Access forwards it, and the
+    person's own JWT for WorkPlane's application. Each dict overrides that credential's claims; an
+    override of None drops the claim (as Team.token does)."""
+    service = {"email": None, "sub": "", "common_name": DELEGATE_ID, "aud": [DELEGATION_AUD], **(delegate or {})}
+    signed_in = {"email": email, "aud": [WORKPLANE_AUD], **(person or {})}
+    return {
+        "Host": DELEGATION_HOST,
+        "Cf-Access-Jwt-Assertion": team.token(**service),
+        "X-Delegated-Access-Jwt": team.token(**signed_in),
+        "Content-Type": "application/json",
+    }
+
+
+def delegated_app(team, store=None, *, clock=None, **config):
+    """The /ext router (key pages and Delegated Requests), mounted as upstream mounts it
+    (api/http.py:5301-5316). Returns (client, extension, events); a config value of None drops it."""
+    config = {
+        "key_pepper": PEPPER,
+        "access_team_domain": team.url,
+        "access_aud": team.aud,
+        "access_host": ACCESS_HOST,
+        "delegation_host": DELEGATION_HOST,
+        "delegation_aud": DELEGATION_AUD,
+        "workplane_aud": WORKPLANE_AUD,
+        "delegate_client_id": DELEGATE_ID,
+        **config,
+    }
+    events = RecordedEvents()
+    ext = AgentKeysTenantExtension(
+        {k: v for k, v in config.items() if v is not None},
+        store=store if store is not None else MemoryStore(),
+        events=events,
+        clock=clock,
+    )
+    ext.set_context(Migrations())
+    app = FastAPI()
+    app.include_router(AgentKeysHttpExtension({}).get_router(SimpleNamespace(tenant_extension=ext)), prefix="/ext")
+    return TestClient(app), ext, events

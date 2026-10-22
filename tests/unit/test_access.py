@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 
 import jwt
 import pytest
-from conftest import FIRST, SECOND
+from conftest import AUD, FIRST, SECOND
 
 from hindsight_agent_keys.access import AccessVerifier
 
@@ -20,20 +20,34 @@ async def test_a_valid_token_identifies_the_person_by_lowercase_email_and_when_t
     "claims",
     [
         {"aud": ["another-application"]},
+        # PyJWT accepts a token whose audiences include ours; it must be ours alone.
+        {"aud": [AUD, "another-application"]},
+        {"aud": ["another-application", AUD]},
         {"iss": "https://other-team.cloudflareaccess.com"},
         {"exp": int(time.time()) - 60},
         {"exp": None},
         {"iat": None},
+        # PyJWT accepts any iat that int() can read; a sign-in date must be a number.
+        {"iat": "1700000000"},
+        {"iat": True},
         {"aud": None},
         # A service token carries common_name, not email.
         {"email": None, "common_name": "ci-service-token.access"},
         {"email": ""},
+        {"email": "  "},
+        {"email": 42},
         # Custom claims are never read: an email there is not an identity.
         {"email": None, "custom": {"email": "alice@example.com"}},
     ],
 )
 async def test_a_token_that_fails_validation_is_refused(team, claims):
     assert await AccessVerifier(team.url, team.aud).email(team.token(**claims)) is None
+
+
+async def test_an_audience_given_as_a_string_or_a_one_element_list_is_accepted(team):
+    verifier = AccessVerifier(team.url, team.aud)
+    for aud in (AUD, [AUD]):
+        assert (await verifier.email(team.token(aud=aud)))[0] == "alice@example.com"
 
 
 async def test_a_token_signed_by_an_unpublished_key_is_refused(team):

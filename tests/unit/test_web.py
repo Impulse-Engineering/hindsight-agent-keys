@@ -83,6 +83,13 @@ def test_without_full_access_configuration_the_key_pages_refuse_everything(team,
     assert client.get("/ext/", headers=signed_in(team)).status_code == 404
 
 
+@pytest.mark.parametrize("blank", ["access_team_domain", "access_aud", "access_host"])
+def test_a_blank_access_setting_turns_the_key_pages_off(team, blank):
+    client, _, _ = pages(team, **{blank: "   "})
+    for host in (HOST, ""):
+        assert client.get("/ext/", headers=signed_in(team, host)).status_code == 404
+
+
 @pytest.mark.parametrize("token", [None, "", "not-a-jwt"])
 def test_the_key_pages_refuse_a_missing_or_invalid_access_token(team, token):
     client, _, _ = pages(team)
@@ -192,6 +199,51 @@ async def test_an_admin_revokes_every_key_a_person_holds(team, monkeypatch):
             await ext.authenticate(RequestContext(api_key=key))
     assert ("identity_revoked", "bob@example.com", "alice@example.com") in [
         (r["kind"], r["email"], r["actor"]) for r in events.rows
+    ]
+
+
+async def test_every_change_on_the_key_pages_records_who_made_it_on_the_ext_channel(team):
+    client, ext, events = pages(team)
+    bob = as_person(team, "bob@example.com")
+    alice = json_post(team)
+
+    def ok(method, path, headers=alice, **body):
+        resp = client.request(method, f"/ext{path}", headers=headers, json=body)
+        assert resp.status_code in (200, 204), resp.text
+        return resp.json() if resp.status_code == 200 else None
+
+    key_id = ok("POST", "/keys", name="laptop")["id"]
+    ok("POST", f"/keys/{key_id}/renew")
+    ok("POST", f"/keys/{key_id}/revoke")
+    ok("POST", "/access-requests", headers=bob)
+    ok("POST", "/admin/people", email="bob@example.com", role="member")
+    # Revoking an identity is recorded only when it revokes a key.
+    ok("POST", "/keys", headers=bob, name="phone")
+    ok("POST", "/admin/revoke-identity", email="bob@example.com")
+    team_id = ok("POST", "/teams", name="Platform")["team"]
+    ok("POST", f"/teams/{team_id}/keys", name="ci")
+    ok("POST", f"/teams/{team_id}/members", email="bob@example.com", role="member")
+    ok("DELETE", f"/teams/{team_id}/members", email="bob@example.com")
+    # Requests an agent filed over MCP, answered on the Teams page.
+    for person in ("carol@example.com", "dave@example.com"):
+        await ext.request_member("alice@example.com", team_id, person, "member", None)
+    ok("POST", f"/teams/{team_id}/confirmations", email="carol@example.com", role="member")
+    ok("DELETE", f"/teams/{team_id}/requests", email="dave@example.com")
+    page_rows = [r for r in events.rows if r["kind"] != "member_requested"]
+    assert [(r["kind"], r["actor"], r["channel"], r["delegate"]) for r in page_rows] == [
+        ("key_created", "alice@example.com", "ext", None),
+        ("key_renewed", "alice@example.com", "ext", None),
+        ("key_revoked", "alice@example.com", "ext", None),
+        ("access_requested", "bob@example.com", "ext", None),
+        ("access_approved", "alice@example.com", "ext", None),
+        ("key_created", "bob@example.com", "ext", None),
+        ("identity_revoked", "alice@example.com", "ext", None),
+        ("team_created", "alice@example.com", "ext", None),
+        ("key_created", "alice@example.com", "ext", None),
+        ("member_added", "alice@example.com", "ext", None),
+        ("member_removed", "alice@example.com", "ext", None),
+        ("member_confirmed", "alice@example.com", "ext", None),
+        ("member_declined", "alice@example.com", "ext", None),
     ]
 
 

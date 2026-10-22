@@ -62,7 +62,7 @@ ENV PYTHONPATH=/app/extensions \
     HINDSIGHT_API_EXTENSION_PASSTHROUGH_HEADERS=x-real-ip
 
 # Fail the build, not the deploy, if the extension cannot be imported.
-RUN ["/app/api/.venv/bin/python", "-c", "import hindsight_agent_keys.extension, hindsight_agent_keys.web, hindsight_agent_keys.tools, hindsight_agent_keys.guard"]
+RUN ["/app/api/.venv/bin/python", "-c", "import hindsight_agent_keys.extension, hindsight_agent_keys.web, hindsight_agent_keys.bodies, hindsight_agent_keys.delegation, hindsight_agent_keys.tools, hindsight_agent_keys.guard"]
 
 # The guard is the entrypoint so that overriding the command cannot skip it.
 ENTRYPOINT ["/app/agent-keys-start.sh"]

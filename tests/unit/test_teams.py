@@ -16,6 +16,7 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 CAROL = "carol@example.com"
 DAVE = "dave@example.com"
+ERIN = "erin@example.com"
 
 
 @pytest.fixture(autouse=True)
@@ -82,9 +83,10 @@ def roles(teams, team):
 
 
 async def test_owners_add_and_remove_members_and_owners_by_email_before_they_have_signed_in():
-    ext, _, _, _ = extension()
+    ext, store, _, _ = extension()
     team = await ext.create_team(ALICE, "Platform", None)
-    # Carol has never signed in and is not on the Key Allowlist; as an owner she still manages the Team.
+    # Carol and Dave are on the Key Allowlist, which owners need to manage a Team, but have not joined this one.
+    store.roles.update(dict.fromkeys((CAROL, DAVE), "member"))
     await ext.set_member(ALICE, team, CAROL, "owner", None)
     await ext.set_member(CAROL, team, DAVE, "member", None)
     assert roles(await ext.teams(DAVE), team) == {ALICE: "owner", CAROL: "owner", DAVE: "member"}
@@ -138,7 +140,8 @@ async def test_changing_the_members_of_a_team_that_does_not_exist_is_refused():
 
 
 async def test_team_and_membership_changes_are_logged_with_who_made_them():
-    ext, _, _, events = extension()
+    ext, store, _, events = extension()
+    store.roles[CAROL] = "member"
     team = await ext.create_team(ALICE, "Platform", "203.0.113.7")
     await ext.set_member(ALICE, team, CAROL, "owner", None)
     await ext.set_member(ALICE, team, DAVE, "member", None)
@@ -214,7 +217,8 @@ def pending(teams, team):
 
 
 async def test_asking_to_add_someone_grants_nothing_until_an_owner_confirms():
-    ext, _, _, _ = extension()
+    ext, store, _, _ = extension()
+    store.roles[CAROL] = "member"
     team = await ext.create_team(ALICE, "Platform", None)
     await ext.request_member(ALICE, team, BOB, "owner", None)
     assert roles(await ext.teams(ALICE), team) == {ALICE: "owner"}
@@ -289,7 +293,8 @@ async def test_declining_a_request_drops_only_the_request():
 
 
 async def test_requests_and_their_confirmations_are_logged_with_who_made_them():
-    ext, _, _, events = extension()
+    ext, store, _, events = extension()
+    store.roles[CAROL] = "member"
     team = await ext.create_team(ALICE, "Platform", None)
     await ext.request_member(ALICE, team, CAROL, "owner", "203.0.113.8")
     await ext.request_member(ALICE, team, DAVE, "member", None)
@@ -322,5 +327,84 @@ async def test_team_key_creation_is_logged_with_the_team():
     team = await ext.create_team(ALICE, "Platform", None)
     key_id, _ = await ext.create_team_key(ALICE, team, "ci", "203.0.113.7")
     assert events.rows[-1] == {
-        "kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "actor": None, "team": team
+        "kind": "key_created", "key_id": key_id, "client_ip": "203.0.113.7", "email": ALICE, "actor": ALICE, "team": team,
+        "channel": None, "delegate": None,
     }
+
+
+async def platform_with_carol_as_owner(ext):
+    """Alice creates Platform; Carol, on the Key Allowlist as a member, is a second owner and Dave a
+    member, and Alice has asked for Erin to join. Returns the Team."""
+    team = await ext.create_team(ALICE, "Platform", None)
+    await ext.set_role(ALICE, CAROL, "member", None)
+    await ext.set_member(ALICE, team, CAROL, "owner", None)
+    await ext.set_member(ALICE, team, DAVE, "member", None)
+    await ext.request_member(ALICE, team, ERIN, "member", None)
+    return team
+
+
+async def standing(ext, team):
+    teams = await ext.teams(ALICE)
+    return roles(teams, team), pending(teams, team)
+
+
+OWNER_ACTIONS = [
+    pytest.param(lambda ext, team: ext.set_member(CAROL, team, ERIN, "member", None), id="add a member"),
+    pytest.param(lambda ext, team: ext.remove_member(CAROL, team, DAVE, None), id="remove a member"),
+    pytest.param(lambda ext, team: ext.request_member(CAROL, team, DAVE, "owner", None), id="ask to add someone"),
+    pytest.param(lambda ext, team: ext.confirm_member(CAROL, team, ERIN, "member", None), id="approve a request"),
+    pytest.param(lambda ext, team: ext.decline_member(CAROL, team, ERIN, None), id="decline a request"),
+]
+
+
+@pytest.mark.parametrize("act", OWNER_ACTIONS)
+async def test_an_owner_off_the_key_allowlist_is_refused_owner_actions_until_added_back(act):
+    ext, _, _, _ = extension()
+    team = await platform_with_carol_as_owner(ext)
+    before = await standing(ext, team)
+    await ext.set_role(ALICE, CAROL, None, None)
+    with pytest.raises(Refused) as refusal:
+        await act(ext, team)
+    assert refusal.value.status == 403
+    assert await standing(ext, team) == before
+    await ext.set_role(ALICE, CAROL, "member", None)
+    assert await standing(ext, team) == before
+    await act(ext, team)
+
+
+async def test_removing_an_owner_from_the_key_allowlist_deletes_no_membership_or_ownership():
+    ext, _, _, _ = extension()
+    team = await platform_with_carol_as_owner(ext)
+    before = await standing(ext, team), await ext.teams(CAROL)
+    await ext.set_role(ALICE, CAROL, None, None)
+    assert (await standing(ext, team), await ext.teams(CAROL)) == before
+    assert [t["role"] for t in before[1]] == ["owner"]
+
+
+async def test_an_owner_off_the_key_allowlist_creates_no_team_keys_until_added_back():
+    ext, _, _, _ = extension()
+    team = await platform_with_carol_as_owner(ext)
+    await ext.create_team_key(CAROL, team, "ci", None)
+    await ext.set_role(ALICE, CAROL, None, None)
+    with pytest.raises(Refused) as refusal:
+        await ext.create_team_key(CAROL, team, "ci", None)
+    assert refusal.value.status == 403
+    await ext.set_role(ALICE, CAROL, "member", None)
+    await ext.create_team_key(CAROL, team, "ci", None)
+
+
+async def test_an_admin_answers_the_requests_of_a_team_whose_owners_are_all_off_the_key_allowlist():
+    ext, _, _, events = extension()
+    await ext.set_role(ALICE, CAROL, "member", None)
+    team = await ext.create_team(CAROL, "Platform", None)
+    await ext.request_member(CAROL, team, DAVE, "member", None)
+    await ext.request_member(CAROL, team, ERIN, "member", None)
+    await ext.set_role(ALICE, CAROL, None, None)
+    await ext.confirm_member(BOB, team, DAVE, "member", None)
+    await ext.decline_member(BOB, team, ERIN, None)
+    assert roles(await ext.teams(BOB), team) == {CAROL: "owner", DAVE: "member"}
+    assert pending(await ext.teams(BOB), team) == []
+    assert [(r["kind"], r["email"], r["actor"]) for r in events.rows[-2:]] == [
+        ("member_confirmed", DAVE, BOB),
+        ("member_declined", ERIN, BOB),
+    ]

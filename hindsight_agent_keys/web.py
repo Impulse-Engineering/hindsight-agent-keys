@@ -3,54 +3,37 @@
 Upstream mounts this router with no authentication of its own, so one gate on the
 router covers every route: the Access-protected hostname only (agents' bypass
 hostname gets 404), a valid Access JWT, and for state changes JSON, a custom header
-and a same-origin Origin. The state lives on the tenant extension.
+and a same-origin Origin. The state lives on the tenant extension. Delegated Requests,
+under /ext/delegated, have their own router and gate (delegation.py).
 """
 
 import html
-from collections.abc import Awaitable
 from datetime import UTC, datetime
 from string import Template
-from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from hindsight_api.extensions.http import HttpExtension
-from pydantic import BaseModel, StringConstraints
 
-from hindsight_agent_keys.extension import client_ip
-from hindsight_agent_keys.store import Refused
+from hindsight_agent_keys.access import ACCESS_JWT_HEADER
+from hindsight_agent_keys.bodies import (
+    FormerMember,
+    Identity,
+    JoinRequest,
+    Member,
+    NewKey,
+    NewTeam,
+    NoticePreference,
+    Openness,
+    RoleChange,
+    _or_refused,
+)
+from hindsight_agent_keys.delegation import delegated_router
+from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
 
-ACCESS_JWT_HEADER = "cf-access-jwt-assertion"
 STATE_CHANGE_HEADER = "x-agent-keys"
 # No page may be framed, so nobody can trick a signed-in admin into clicking Approve or Grant.
 NO_FRAMING = {"X-Frame-Options": "DENY", "Content-Security-Policy": "frame-ancestors 'none'"}
-
-
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
-Email = Annotated[str, StringConstraints(strip_whitespace=True, to_lower=True, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")]
-
-
-class NewKey(BaseModel):
-    name: Name
-
-
-class NewTeam(BaseModel):
-    name: Name
-
-
-class Member(BaseModel):
-    email: Email
-    role: Literal["owner", "member"]
-
-
-class FormerMember(BaseModel):
-    email: Email
-
-
-class RoleChange(BaseModel):
-    email: Email
-    role: Literal["member", "admin"] | None  # None removes the person, or declines their request
-
 
 # What the page says about a person's place on the Key Allowlist, by role.
 ALLOWLIST_NOTE = {
@@ -69,6 +52,17 @@ ROLE_ACTIONS = {
     "member": (("admin", "Grant admin rights", "sec"), ("", "Remove", "danger")),
     "admin": (("member", "Remove admin rights", "sec"), ("", "Remove", "danger")),
 }
+
+
+def webex_note(on: bool | None) -> str:
+    """What the page says about Webex notices: nothing where they are not set up."""
+    if on is None:
+        return ""
+    state, enable, label = ("on", "false", "Turn off") if on else ("off", "true", "Turn on")
+    return (
+        f'<div class="note"><span class="grow">Webex notices are {state}.</span>'
+        f'<button class="btn sec sm" id="webex-notices" type="button" data-enable="{enable}">{label}</button></div>'
+    )
 
 
 def _allowlist_row(email: str, role: str, bootstrap: bool) -> str:
@@ -91,28 +85,17 @@ def _stale_row(row) -> str:
     return f"<tr><td>{html.escape(row['schema'])}</td><td>{html.escape(row['email'])}</td><td>{shown}</td></tr>"
 
 
-class Identity(BaseModel):
-    email: Email
-
-
-async def _or_refused(change: Awaitable):
-    """The change's result; a refusal becomes its HTTP status with the reason as detail."""
-    try:
-        return await change
-    except Refused as refusal:
-        raise HTTPException(refusal.status, str(refusal)) from None
-
-
 class AgentKeysHttpExtension(HttpExtension):
     def get_router(self, memory) -> APIRouter:
         async def person(request: Request) -> str:
             """The signed-in person's email; refuses everything else."""
             keys = memory.tenant_extension
-            host = (request.headers.get("host") or "").partition(":")[0].lower()
+            host, json_body = host_and_json(request.headers)
             if keys.access_host is None or host != keys.access_host:
                 raise HTTPException(404)
+            acting_via("ext")
             if request.method != "GET" and not (
-                request.headers.get("content-type", "").partition(";")[0].strip().lower() == "application/json"
+                json_body
                 and request.headers.get(STATE_CHANGE_HEADER) == "1"
                 and request.headers.get("origin") == f"https://{keys.access_host}"
             ):
@@ -134,9 +117,12 @@ class AgentKeysHttpExtension(HttpExtension):
 
         @router.get("/", response_class=HTMLResponse)
         async def page(email: str = Depends(person)):
-            role = await memory.tenant_extension.role(email)
+            keys = memory.tenant_extension
+            role = await keys.role(email)
+            webex = webex_note(await keys.webex_notices(email))
+            create_hidden = "" if role in ("member", "admin") else " hidden"
             # One pass, so a value that contains a placeholder is not substituted again.
-            main = PAGE.substitute(allowlist=ALLOWLIST_NOTE[role], create_hidden="" if role in ("member", "admin") else " hidden")
+            main = PAGE.substitute(allowlist=ALLOWLIST_NOTE[role], webex=webex, create_hidden=create_hidden)
             return HTMLResponse(shell("Your keys", "/ext/", email, role, main), headers=NO_FRAMING)
 
         @router.post("/access-requests", status_code=204)
@@ -185,7 +171,8 @@ class AgentKeysHttpExtension(HttpExtension):
         @router.get("/teams", response_class=HTMLResponse)
         async def teams_page(email: str = Depends(person)):
             keys = memory.tenant_extension
-            return HTMLResponse(teams_html(email, await keys.role(email), await keys.teams(email)), headers=NO_FRAMING)
+            page = teams_html(email, await keys.role(email), await keys.teams(email), await keys.open_teams(email))
+            return HTMLResponse(page, headers=NO_FRAMING)
 
         @router.post("/teams")
         async def create_team(body: NewTeam, request: Request, email: str = Depends(person)):
@@ -199,11 +186,18 @@ class AgentKeysHttpExtension(HttpExtension):
             key_id, key = await _or_refused(creation)
             return JSONResponse({"id": key_id, "name": body.name, "key": key}, headers={"Cache-Control": "no-store"})
 
+        @router.post("/join-requests")
+        async def ask_to_join(body: JoinRequest, request: Request, email: str = Depends(person)):
+            """Ask the Team's owners to let the person in; the answer is the same whether the Team exists."""
+            await _or_refused(memory.tenant_extension.request_to_join(email, body.name, client_ip(request.headers)))
+            return {"name": body.name, "status": "pending"}
+
         @router.post("/teams/{team}/members")
         async def set_member(team: str, body: Member, request: Request, email: str = Depends(person)):
+            """A person who manages nothing here may add only themselves, which files a Join Request for the role given."""
             change = memory.tenant_extension.set_member(email, team, body.email, body.role, client_ip(request.headers))
-            await _or_refused(change)
-            return {"team": team, "email": body.email, "role": body.role}
+            added = {"team": team, "email": body.email, "role": body.role}
+            return added if await _or_refused(change) else {**added, "status": "pending"}
 
         @router.delete("/teams/{team}/members")
         async def remove_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
@@ -212,19 +206,51 @@ class AgentKeysHttpExtension(HttpExtension):
 
         @router.post("/teams/{team}/confirmations")
         async def confirm_member(team: str, body: Member, request: Request, email: str = Depends(person)):
-            """Confirm a pending request to add someone, filed by an agent over MCP, for the role the page showed."""
+            """Confirm a pending request to add someone, filed by an agent over MCP or by the person (a Join Request),
+            for the role the page showed."""
             change = memory.tenant_extension.confirm_member(email, team, body.email, body.role, client_ip(request.headers))
             await _or_refused(change)
             return {"team": team, "email": body.email, "role": body.role}
 
         @router.delete("/teams/{team}/requests")
         async def decline_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
-            """Decline a pending request to add someone, filed by an agent over MCP."""
+            """Decline a pending request to add someone, filed by an agent over MCP or by the person (a Join Request)."""
             await _or_refused(memory.tenant_extension.decline_member(email, team, body.email, client_ip(request.headers)))
             return {"team": team, "email": body.email}
 
+        @admin_router.post("/revoke-workplane-keys")
+        async def revoke_workplane_keys(request: Request, email: str = Depends(admin)):
+            """The kill switch for WorkPlane's retain and recall. Here only: no Delegated Request reaches it."""
+            return {"revoked": await _or_refused(memory.tenant_extension.revoke_workplane_keys(email, client_ip(request.headers)))}
+
+        # Open Teams
+
+        @router.post("/teams/{team}/open")
+        async def set_open(team: str, body: Openness, request: Request, email: str = Depends(person)):
+            """Admins only: open the Team to anyone on the Key Allowlist, or close it, keeping its members."""
+            await _or_refused(memory.tenant_extension.set_open(email, team, body.open, client_ip(request.headers)))
+            return {"team": team, "open": body.open}
+
+        @router.post("/teams/{team}/join")
+        async def join_team(team: str, request: Request, email: str = Depends(person)):
+            """Join an Open Team; a Team that is not open gets the person's Join Request instead."""
+            role = await _or_refused(memory.tenant_extension.join_team(email, team, client_ip(request.headers)))
+            joined = {"team": team, "email": email, "role": role or "member"}
+            return joined if role else {**joined, "status": "pending"}
+
+        # --- Webex notices ---
+
+        @router.post("/webex-notices", status_code=204)
+        async def set_webex_notices(body: NoticePreference, email: str = Depends(person)):
+            """Turn the person's Webex notices off or on; the page and the MCP tool are not affected."""
+            await _or_refused(memory.tenant_extension.set_webex_notices(email, body.enabled))
+
         router.include_router(admin_router)
-        return router
+        # The pages' gate stays on their own router; Delegated Requests have their own gate.
+        outer = APIRouter(include_in_schema=False)
+        outer.include_router(router)
+        outer.include_router(delegated_router(memory), prefix="/delegated")
+        return outer
 
 
 NAV = (("/ext/", "key", "Your keys"), ("/ext/teams", "users", "Teams"), ("/ext/admin", "shield", "Key Allowlist"))
@@ -505,6 +531,7 @@ PAGE = Template("""<div class="head"><h1>Your keys</h1>
 <div class="banner"><svg class="i"><use href="#clock"/></svg>
 <b>Your keys work for 90 days, and only while you sign in here at least every 30 days.</b></div>
 $allowlist
+$webex
 <p class="status" id="result" role="status"></p>
 <div class="card"$create_hidden>
 <header><div><h2>Create a personal key</h2><p>Name it after the agent or machine that will use it.</p></div></header>
@@ -514,8 +541,8 @@ $allowlist
 </div>
 <div class="card"><header><h2>Keys</h2><span class="sub" id="key-count"></span></header>
 <div class="tw"><table>
-<thead><tr><th scope="col">Name</th><th scope="col">ID</th><th scope="col">Created</th><th scope="col">Expires</th>
-<th scope="col">State</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
+<thead><tr><th scope="col">Name</th><th scope="col">ID</th><th scope="col">Created</th><th scope="col">Created via</th>
+<th scope="col">Expires</th><th scope="col">State</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
 <tbody id="keys"></tbody>
 </table></div></div>
 <script>
@@ -549,6 +576,7 @@ async function showKeys() {
     const created = row.insertCell();
     created.textContent = ago(key.created_at);
     created.title = day(key.created_at);
+    row.insertCell().textContent = key.via ? "WorkPlane" : "this page";
     row.insertCell().innerHTML = key.state === "revoked" ? '<span class="sub">-</span>' : expiry(key);
     const pill = row.insertCell().appendChild(document.createElement("span"));
     pill.className = "pill " + key.state;
@@ -571,7 +599,7 @@ async function showKeys() {
     }
     return row;
   });
-  if (!rows.length) rows.push(Object.assign(document.createElement("tr"), {innerHTML: '<td colspan="6" class="empty">No keys yet.</td>'}));
+  if (!rows.length) rows.push(Object.assign(document.createElement("tr"), {innerHTML: '<td colspan="7" class="empty">No keys yet.</td>'}));
   document.getElementById("keys").replaceChildren(...rows);
 }
 document.getElementById("create").addEventListener("submit", async (event) => {
@@ -588,11 +616,15 @@ showKeys();
 document.getElementById("request-access")?.addEventListener("click", async () => {
   if (await send("POST", "/ext/access-requests", {})) location.reload();
 });
+document.getElementById("webex-notices")?.addEventListener("click", async (event) => {
+  if (await send("POST", "/ext/webex-notices", {enabled: event.currentTarget.dataset.enable === "true"})) location.reload();
+});
 </script>
 """)
 
 ADMIN_PAGE = Template("""<div class="head"><h1>Key Allowlist</h1>
-<p>Only people on the Key Allowlist can create Agent Keys. Removing someone disables the keys they hold.</p></div>
+<p>Only people on the Key Allowlist can create Agent Keys or act as a Team owner. Removing someone disables the keys they hold and
+their owner actions; they keep their Teams, and adding them again restores both.</p></div>
 <p class="status" id="result" role="status"></p>
 <div class="two">
 <div class="card"><header><div><h2>Add to the Key Allowlist</h2><p>They can create keys right away.</p></div></header>
@@ -603,6 +635,10 @@ ADMIN_PAGE = Template("""<div class="head"><h1>Key Allowlist</h1>
 <input id="identity" type="email" required maxlength="254"></div>
 <button class="btn danger">Revoke every key this person holds</button></div></form></div>
 </div>
+<div class="card risky"><header><div><h2>Kill switch</h2>
+<p>Stops WorkPlane's retain and recall: revokes every key created via WorkPlane, for everyone. Keys people created here keep working.
+Delete WorkPlane's service token in Access first, or WorkPlane creates new ones (<code>docs/operating.md</code>, "Kill switch").</p></div>
+<button class="btn danger" id="revoke-workplane-keys" type="button">Revoke every key created via WorkPlane</button></header></div>
 <div class="card"><header><h2>People</h2></header>
 <div class="tw"><table>
 <thead><tr><th scope="col">Email</th><th scope="col">Role</th><th scope="col"><span class="sr">Change</span></th></tr></thead>
@@ -640,13 +676,19 @@ document.getElementById("revoke-identity").addEventListener("submit", async (eve
   const answer = await send("POST", "/ext/admin/revoke-identity", {email});
   if (answer) say("Revoked " + answer.revoked + " keys held by " + email + ".");
 });
+document.getElementById("revoke-workplane-keys").addEventListener("click", async () => {
+  if (!confirm("Revoke every key created via WorkPlane, for everyone?")) return;
+  const answer = await send("POST", "/ext/admin/revoke-workplane-keys", {});
+  if (answer) say("Revoked " + answer.revoked + " keys created via WorkPlane.");
+});
 </script>
 """)
 
 
-def teams_html(email: str, role: str | None, teams: list[dict]) -> str:
+def teams_html(email: str, role: str | None, teams: list[dict], open_teams: list[dict]) -> str:
     """The Teams page; every value from the database or the token is escaped."""
     e = html.escape
+    opened = {o["team"] for o in open_teams}
     sections = []
     for t in teams:
         url = f"/ext/teams/{e(t['team'])}"
@@ -658,10 +700,16 @@ def teams_html(email: str, role: str | None, teams: list[dict]) -> str:
             f'{REMOVE_FORM.format(url=url, email=e(m["email"]), team=e(t["name"])) if manage else ""}</li>'
             for m in t["members"]
         )
+        is_open = t["team"] in opened
+        flag = '<span class="pill ask">Open Team</span><span class="sub">anyone on the Key Allowlist may join it</span>' if is_open else ""
+        toggle = ""
+        if role == "admin":
+            label = "Close it; its members stay" if is_open else "Open it to everyone on the Key Allowlist"
+            toggle = OPEN_FORM.format(url=url, open=str(not is_open).lower(), label=label)
         header = (
             f'<header><div><h2>{e(t["name"])}</h2><div class="meta"><span class="mono">{e(t["team"])}</span>'
             f'<span class="pill {"admin" if t["role"] == "owner" else "member"}">Your role: {e(t["role"] or "none (admin)")}</span>'
-            "</div></div></header>"
+            f"{flag}</div></div>{toggle}</header>"
         )
         parts = [header]
         if t["requests"]:
@@ -672,12 +720,19 @@ def teams_html(email: str, role: str | None, teams: list[dict]) -> str:
             )
             parts.append(f'<div class="pending"><b>Waiting for an owner to confirm</b><ul>{asked}</ul></div>')
         side = KEY_FORM.format(url=url, label="Create a Team key", cls="subform") if t["role"] else ""
-        side += MEMBER_FORM.format(url=url) if manage else '<p class="hint">Only owners and admins change membership.</p>'
+        side += MEMBER_FORM.format(url=url)
+        if not manage:
+            side += '<p class="hint">Only owners and admins change membership; adding yourself, as a member or an owner, asks them.</p>'
         parts.append(f'<div class="cols"><div><h3>Members</h3><ul class="members">{members}</ul></div><div>{side}</div></div>')
         sections.append('<article class="card team">' + "".join(parts) + "</article>")
+    joinable = []
+    for o in open_teams:
+        action = '<span class="sub">you are in it</span>' if o["role"] else JOIN_FORM.format(url=f"/ext/teams/{e(o['team'])}")
+        joinable.append(f'<li><span class="e">{e(o["name"])}</span>{action}</li>')
     # One pass, so a value that contains a placeholder is not substituted again.
     main = TEAMS_PAGE.substitute(
         public=KEY_FORM.format(url="/ext/teams/public", label="Create a Public Team key", cls="row"),
+        open=f'<ul class="members">{"".join(joinable)}</ul>' if joinable else '<p class="hint">None listed for you.</p>',
         teams="".join(sections) or '<p class="note">You are in no Team yet.</p>',
     )
     return shell("Teams", "/ext/teams", email, role, main)
@@ -687,6 +742,8 @@ KEY_FORM = """<form class="{cls}" data-url="{url}/keys" data-method="POST">
 <div><label>Key name <input type="text" name="name" required maxlength="100"></label></div>
 <button class="btn sec">{label}</button></form>"""
 
+# Shown to members too; the server refuses changes from anyone but admins and owners on the Key Allowlist,
+# except that a person adding themselves, as a member or an owner, only files a Join Request.
 MEMBER_FORM = """<form class="subform" data-url="{url}/members" data-method="POST">
 <h3>Add a member, or change a role</h3>
 <label>Email <input name="email" type="email" required maxlength="254"></label>
@@ -699,12 +756,18 @@ MEMBER_FORM = """<form class="subform" data-url="{url}/members" data-method="POS
 REMOVE_FORM = """<form data-url="{url}/members" data-method="DELETE" data-confirm="Remove {email} from {team}?">
 <input type="hidden" name="email" value="{email}"><button class="btn danger sm x">Remove</button></form>"""
 
-# A request an agent filed over MCP lets nobody in until an owner or admin presses Confirm,
-# which sends the role shown, so a request changed since is refused rather than granted.
+# A request an agent filed over MCP, or a person filed for themselves (a Join Request), lets nobody in until an owner on
+# the Key Allowlist, or an admin, presses Confirm, which sends the role shown, so a request changed since is refused rather than granted.
 REQUEST_FORMS = """<form data-url="{url}/confirmations" data-method="POST">
 <input type="hidden" name="email" value="{email}"><input type="hidden" name="role" value="{role}"><button class="btn sm">Confirm</button></form>
 <form data-url="{url}/requests" data-method="DELETE">
 <input type="hidden" name="email" value="{email}"><button class="btn sec sm">Decline</button></form>"""
+
+# Shown to admins only; the server refuses anyone else too.
+OPEN_FORM = """<form data-url="{url}/open" data-method="POST">
+<input type="hidden" name="open" value="{open}"><button class="btn sec sm">{label}</button></form>"""
+
+JOIN_FORM = """<form data-url="{url}/join" data-method="POST"><button class="btn sm">Join</button></form>"""
 
 TEAMS_PAGE = Template("""<div class="head"><h1>Teams</h1>
 <p>Shared memory for a group. Team keys reach that Team's schema only.</p></div>
@@ -716,6 +779,15 @@ TEAMS_PAGE = Template("""<div class="head"><h1>Teams</h1>
 <form class="pad" data-url="/ext/teams" data-method="POST"><div class="row"><div><label for="team-name">Team name</label>
 <input id="team-name" name="name" type="text" required maxlength="100"></div><button class="btn">Create</button></div></form></div>
 </div>
+<div class="two">
+<div class="card"><header><div><h2>Ask to join a Team</h2><p>Name a Team you are not in. Its owners, or an admin, decide;
+this page answers the same whether or not the Team exists.</p></div></header>
+<form class="pad" data-url="/ext/join-requests" data-method="POST"><div class="row"><div><label for="join-name">Team name</label>
+<input id="join-name" name="name" type="text" required maxlength="100"></div><button class="btn sec">Ask to join</button></div></form></div>
+<div class="card"><header><div><h2>Open Teams</h2>
+<p>Anyone on the Key Allowlist joins an Open Team without asking. Only admins open or close a Team.</p></div></header>
+<div class="pad">$open</div></div>
+</div>
 $teams
 <script>
 for (const form of document.querySelectorAll("form[data-url]")) {
@@ -726,6 +798,9 @@ for (const form of document.querySelectorAll("form[data-url]")) {
     if (body && body.key) {
       form.reset();
       reveal(body);
+    } else if (body && body.status === "pending") {
+      form.reset();
+      say("Asked. You gain no access until an owner of the Team, or an admin, confirms it.");
     } else if (body) {
       location.reload();
     }

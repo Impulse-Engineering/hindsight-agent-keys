@@ -98,6 +98,8 @@ async def test_an_older_token_does_not_move_the_last_sign_in_back(keys):
 async def test_the_owner_can_renew_a_key_for_90_days_from_the_renewal(keys):
     key_id, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
     keys.clock.now = START + 60 * DAY
+    # Renewal needs a sign-in within 30 days, as a key page request makes.
+    await sign_in(keys, ALICE, keys.clock.now)
     await keys.ext.renew_key(ALICE, key_id, None)
     await sign_in(keys, ALICE, START + 149 * DAY)
     keys.clock.now = START + 150 * DAY - timedelta(seconds=1)
@@ -109,6 +111,7 @@ async def test_the_owner_can_renew_a_key_for_90_days_from_the_renewal(keys):
 async def test_an_expired_key_cannot_be_renewed(keys):
     key_id, _ = await keys.ext.create_personal_key(ALICE, "laptop", None)
     keys.clock.now = START + 90 * DAY
+    await sign_in(keys, ALICE, keys.clock.now)
     with pytest.raises(Refused) as refusal:
         await keys.ext.renew_key(ALICE, key_id, None)
     assert refusal.value.status == 404
@@ -128,7 +131,8 @@ async def test_a_revoked_key_is_refused_on_its_next_request_and_cannot_be_renewe
 
 async def test_nobody_but_the_owner_can_renew_or_revoke_a_key(keys):
     key_id, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
-    await sign_in(keys, ALICE, START)
+    for person in (ALICE, BOB):
+        await sign_in(keys, person, START)
     for change in (keys.ext.renew_key, keys.ext.revoke_key):
         with pytest.raises(Refused) as refusal:
             await change(BOB, key_id, None)
@@ -156,6 +160,7 @@ async def test_the_owner_lists_only_their_own_keys_each_with_its_state(keys):
 
 async def test_renewals_and_revocations_are_logged_with_the_key_its_owner_and_the_client_ip(keys):
     key_id, _ = await keys.ext.create_personal_key(ALICE, "laptop", None)
+    await sign_in(keys, ALICE, START)
     await keys.ext.renew_key(ALICE, key_id, "203.0.113.7")
     await keys.ext.revoke_key(ALICE, key_id, "203.0.113.8")
     assert [(r["kind"], r["key_id"], r["email"], r["client_ip"]) for r in keys.events.rows[1:]] == [
@@ -174,7 +179,10 @@ async def test_an_admin_revoking_an_identity_disables_every_key_the_person_holds
     assert not await works(keys, laptop)
     assert not await works(keys, desktop)
     assert await works(keys, alices)
-    logged = {"kind": "identity_revoked", "key_id": "(none)", "client_ip": "203.0.113.9", "email": BOB, "actor": ALICE, "team": None}
+    logged = {
+        "kind": "identity_revoked", "key_id": "(none)", "client_ip": "203.0.113.9", "email": BOB, "actor": ALICE, "team": None,
+        "channel": None, "delegate": None,
+    }
     assert logged in keys.events.rows
 
 
