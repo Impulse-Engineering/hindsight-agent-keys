@@ -724,6 +724,22 @@ async def test_a_notice_waiting_for_an_admin_who_has_since_been_demoted_is_dropp
     assert world.store.queue == []
 
 
+async def test_joining_an_open_team_tells_nobody_but_joining_a_closed_one_files_a_join_request_the_owners_hear_of(world):
+    # Closed: the Team's join route files the person's Join Request, as asking by name does.
+    resp = world.post(DAVE, f"/teams/{world.schema}/join", {})
+    assert (resp.status_code, resp.json()["status"]) == (200, "pending")
+    await world.send()
+    assert [(to, DAVE in text) for to, text in world.webex.sent] == [(ALICE, True), (BOB, True)]
+    # Open: the person is in at once, and nothing waits for anyone.
+    await world.ext.set_open(ADMIN, world.schema, True, None)
+    world.webex.sent.clear()
+    world.clock.later(minutes=20)
+    resp = world.post(GINA, f"/teams/{world.schema}/join", {})
+    assert (resp.status_code, resp.json()["role"]) == (200, "member")
+    await world.send()
+    assert world.webex.sent == [] and world.store.queue == []
+
+
 # A decision never waits on a notice
 
 

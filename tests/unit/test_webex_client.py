@@ -36,7 +36,11 @@ class Webex:
             def log_message(self, *args):
                 pass
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        class Quiet(ThreadingHTTPServer):
+            def handle_error(self, request, client_address):
+                pass  # a client that gave up on a slow answer is the point of a test, not a traceback
+
+        self.server = Quiet(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True).start()
 
