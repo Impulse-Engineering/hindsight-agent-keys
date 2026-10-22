@@ -14,8 +14,8 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 | Who | Where | What |
 | --- | --- | --- |
 | Anyone who signs in through Access | `/ext/` | Asks to join the Key Allowlist |
-| People on the Key Allowlist | `/ext/`, `/ext/teams` | Create, renew and revoke their own keys; create Teams; create Team and Public Team keys |
-| Team owners on the Key Allowlist | `/ext/teams` | Add and remove members and owners; confirm or decline the people agents asked to add |
+| People on the Key Allowlist | `/ext/`, `/ext/teams` | Create, renew and revoke their own keys; create Teams; ask to join a Team by name; create Team and Public Team keys |
+| Team owners on the Key Allowlist | `/ext/teams`, or WorkPlane | Add and remove members and owners; confirm or decline the people agents asked to add and the people who asked to join |
 | Admins | `/ext/admin`, `/ext/teams` | Manage the Key Allowlist, revoke identities, revoke every key created via WorkPlane (the kill switch), see stale personal schemas, manage every Team |
 | Platform admins | Conductor and the CT | Set secrets (the first admins among them), approve digests, deploy, run CT commands |
 | Agents | The bypass hostname | Use memory with an Agent Key over the API and MCP; with a personal key, manage Teams over MCP |
@@ -29,7 +29,7 @@ Only people on it can create Agent Keys.
 - **Removing someone** disables the keys they hold from their next request, without deleting them, and stops them acting as a Team owner: adding or removing members, asking for people to join, confirming or declining requests, and creating Team keys. Their Teams, ownership and memberships are kept, so adding the person back makes the keys and the owner actions work again. Until then they can still list and revoke their own keys and ask to be added back. To end someone's access, revoke their identity as well (below).
 - **Listing it** from the CT *(not verified)*: `pg psql -d hindsight -Atc 'select role, email from agent_keys.allowlist order by 1, 2'`. The first admins come from the secret, so this can miss them.
 
-Every change is an event in `agent_keys.events` (README, "The event log").
+Every change is recorded as an event in `agent_keys.events` (README, "The event log"). A change stored just before a stop or an event-log failure has no event row; the tables are the source of truth and nothing needs repairing (README, "Delegated Requests").
 
 ## Agent Keys
 
@@ -86,7 +86,8 @@ To bring WorkPlane back once the cause is fixed *(not verified)*: create a new s
 
 - **Creating.** A person on the Key Allowlist creates a Team on `/ext/teams`, or an agent does with the MCP tool `create_team`; the creator is its first owner. A Team's ID (`t_…`), which the other MCP tools take, comes from `list_teams`.
 - **Members.** Owners add people by email, as a member or an owner, including people who have not signed in yet, and remove them. An owner acts only while on the Key Allowlist; admins can manage every Team, and handle the requests of a Team with no owner on the list.
-- **Agents cannot add people on their own.** `add_team_member` over MCP only files a pending request, shown under the Team on `/ext/teams`. Nobody gains access until an owner on the Key Allowlist, or an admin, presses **Confirm** there, so a poisoned memory cannot add someone to a Team. Tell owners to expect these requests.
+- **Join Requests.** Anyone on the Key Allowlist asks to join a Team by its name (the form on `/ext/teams`, the MCP tool `request_to_join_team`, or WorkPlane). The request waits under the Team, as an agent's does; any one owner on the Key Allowlist, or an admin, presses **Confirm** or **Decline**, on the page or by WorkPlane for the signed-in owner or admin, and never an agent. A person adding themselves to a Team they do not own, as a member or an owner, asks the same way, for that role. Asking tells the person nothing about whether the Team exists, so tell people the exact name.
+- **Agents cannot add people on their own.** `add_team_member` over MCP only files a pending request, shown under the Team on `/ext/teams`. Nobody gains access until an owner on the Key Allowlist, or an admin, presses **Confirm** there (or WorkPlane confirms for them by Delegated Request), so a poisoned memory cannot add someone to a Team. Tell owners to expect these requests.
 - **Removing a member** stops their Team keys on their next request. A Team's data stays whoever leaves, and Team schemas are never listed for purging.
 - **Over MCP**, the Team tools need a personal Agent Key; a Team key, a Public Team key or the legacy key gets an error. A bank whose config sets `mcp_enabled_tools` hides them on that bank's endpoint unless it names them.
 - **The Public Team** has no owners or members: everyone on the Key Allowlist can create a Public Team key.

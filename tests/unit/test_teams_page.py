@@ -63,7 +63,7 @@ def test_a_member_needs_an_email_and_a_role(team, body):
 def test_refusals_answer_with_their_status_and_reason(team):
     client, _, _ = pages(team)
     created = create_team(client, team)
-    resp = client.post(f"/ext/teams/{created}/members", json={"email": CAROL, "role": "owner"}, headers=as_person(team, CAROL))
+    resp = client.post(f"/ext/teams/{created}/members", json={"email": BOB, "role": "owner"}, headers=as_person(team, CAROL))
     assert resp.status_code == 403 and "owners" in resp.json()["detail"]
     resp = client.post("/ext/teams", json={"name": "public"}, headers=as_person(team, ALICE))
     assert resp.status_code == 409 and "reserved" in resp.json()["detail"]

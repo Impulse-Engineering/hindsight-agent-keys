@@ -158,8 +158,12 @@ async def test_anyone_but_an_owner_or_admin_is_refused_a_direct_add_or_removal(t
     del ext._store.roles[ERIN]
     before = (dict(ext._store.team_roles), len(events.rows))
     members = f"{TEAMS}/{schema}/members"
-    # A non-owner adding themselves is no direct add either: a Join Request is #1001.
-    for method, body in [("POST", {"email": FRANK, "role": "member"}), ("POST", {"email": actor, "role": "owner"}), ("DELETE", {"email": BOB})]:
+    attempts = [("POST", {"email": FRANK, "role": "member"}), ("DELETE", {"email": BOB})]
+    # Adding themselves is no direct add either: a Join Request for a person on the Key Allowlist who owns nothing here
+    # (test_join_requests.py), and refused for the others.
+    if actor in (DAVE, ERIN):
+        attempts += [("POST", {"email": actor, "role": role}) for role in ("member", "owner")]
+    for method, body in attempts:
         assert send(client, team, method, members, body, actor).status_code == 403, body
     assert (ext._store.team_roles, len(events.rows)) == before
 

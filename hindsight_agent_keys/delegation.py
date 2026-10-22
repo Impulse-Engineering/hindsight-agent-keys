@@ -17,6 +17,7 @@ from hindsight_agent_keys.access import ACCESS_JWT_HEADER
 from hindsight_agent_keys.bodies import (
     FormerMember,
     Identity,
+    JoinRequest,
     Member,
     NewKey,
     NewTeam,
@@ -150,8 +151,8 @@ def delegated_router(memory) -> APIRouter:
         shown = {"key": key} if key else {}
         return JSONResponse({"id": key_id, "name": body.name, **shown}, headers={"Cache-Control": "no-store"})
 
-    # The person must own the Team (on the Key Allowlist) or be an admin. Anyone else is refused (403): a
-    # non-owner's add becomes a Join Request in #1001.
+    # The person must own the Team (on the Key Allowlist) or be an admin. Anyone else may add only themselves,
+    # which is a Join Request for the role given; anything more is refused (403).
 
     @router.post("/teams/{team}/members")
     async def set_member(team: str, body: Member, request: Request, email: str = Depends(delegated_person)):
@@ -159,8 +160,8 @@ def delegated_router(memory) -> APIRouter:
         change = memory.tenant_extension.set_member(
             email, team, body.email, body.role, client_ip(request.headers), delegated_repeat=True
         )
-        await _or_refused(change)
-        return {"team": team, "email": body.email, "role": body.role}
+        added = {"team": team, "email": body.email, "role": body.role}
+        return added if await _or_refused(change) else {**added, "status": "pending"}
 
     @router.delete("/teams/{team}/members")
     async def remove_member(team: str, body: FormerMember, request: Request, email: str = Depends(delegated_person)):
@@ -169,7 +170,32 @@ def delegated_router(memory) -> APIRouter:
         await _or_refused(removal)
         return {"team": team, "email": body.email}
 
-    # Join Requests (#1001)
+    # Join Requests (#1001): filed here by name; an owner or an admin answers with the routes below.
+
+    @router.post("/join-requests")
+    async def ask_to_join(body: JoinRequest, request: Request, email: str = Depends(delegated_person)):
+        """Ask the Team's owners to let the person in. The answer is the same whether the Team exists, the
+        person is in it, or they asked before; only a new request for an existing Team is stored."""
+        await _or_refused(memory.tenant_extension.request_to_join(email, body.name, client_ip(request.headers)))
+        return {"name": body.name, "status": "pending"}
+
+    @router.post("/teams/{team}/confirmations")
+    async def confirm_member(team: str, body: Member, request: Request, email: str = Depends(delegated_person)):
+        """Confirm a pending request for the role it asks for. A repeat answers the same and records nothing."""
+        change = memory.tenant_extension.confirm_member(
+            email, team, body.email, body.role, client_ip(request.headers), delegated_repeat=True
+        )
+        await _or_refused(change)
+        return {"team": team, "email": body.email, "role": body.role}
+
+    @router.delete("/teams/{team}/requests")
+    async def decline_member(team: str, body: FormerMember, request: Request, email: str = Depends(delegated_person)):
+        """Drop a pending request. A repeat answers the same and records nothing."""
+        decline = memory.tenant_extension.decline_member(
+            email, team, body.email, client_ip(request.headers), delegated_repeat=True
+        )
+        await _or_refused(decline)
+        return {"team": team, "email": body.email}
 
     # Open Teams (#1002)
 

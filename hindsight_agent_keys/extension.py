@@ -489,23 +489,47 @@ class AgentKeysTenantExtension(TenantExtension):
             for r in rows
         ]
 
+    async def _manages(self, email: str, team: str) -> bool:
+        """Whether the person is an admin or an owner of the Team. An owner counts whether or not they are still on
+        the Key Allowlist: `_require_manager` asks for that."""
+        return await self.role(email) == "admin" or await self._store.team_role(team, email) == "owner"
+
     async def _require_manager(self, email: str, team: str) -> None:
-        if await self.role(email) == "admin":
-            return
-        if await self._store.team_role(team, email) != "owner":
+        if not await self._manages(email, team):
             raise Refused(403, "Only the Team's owners and admins can change its members.")
         # An owner cut off from the Key Allowlist keeps the Team and returns to managing it when added back.
         await self._require_allowlisted(email)
 
+    async def _is_join_request(self, email: str, team: str, member: str) -> bool:
+        """Whether adding `member` is only a Join Request: a person who manages nothing here adds themselves."""
+        return member == email and not await self._manages(email, team)
+
+    async def request_to_join(self, email: str, name: str, client_ip: str | None) -> None:
+        """File the person's request to join the Team with this name, in any case and with spaces around it trimmed.
+        Anyone on the Key Allowlist may. The caller learns nothing of whether the Team exists, or has the person:
+        a Team that is missing is dropped, not stored, and one that has them, or an earlier request of theirs, changes nothing."""
+        await self._ask_to_join(email, await self._store.team_schema(name.strip()), "member", client_ip)
+
+    async def _ask_to_join(self, email: str, team: str | None, role: str, client_ip: str | None) -> None:
+        await self._require_allowlisted(email)
+        if team is not None and await self._store.add_join_request(team, email, role):
+            await self._record("join_requested", NO_KEY_ID, client_ip, email, email, team=team)
+
     async def set_member(
         self, email: str, team: str, member: str, role: str, client_ip: str | None, *, delegated_repeat: bool = False
-    ) -> None:
+    ) -> bool:
         """As an admin, or an owner on the Key Allowlist, add `member` to the Team as "owner" or "member", or change their role.
-        With `delegated_repeat` (a Delegated Request), a repeat that leaves their role as it was records nothing."""
+        With `delegated_repeat` (a Delegated Request), a repeat that leaves their role as it was records nothing.
+        Anyone else may only add themselves, as a member or an owner, which files a Join Request for that role
+        instead (False; True when added)."""
+        if await self._is_join_request(email, team, member):
+            await self._ask_to_join(email, team, role, client_ip)
+            return False
         await self._require_manager(email, team)
         had = await self._store.set_member(team, member, role)
         if not (delegated_repeat and had == role):
             await self._record(f"{role}_added", NO_KEY_ID, client_ip, member, email, team=team)
+        return True
 
     async def remove_member(self, email: str, team: str, member: str, client_ip: str | None, *, delegated_repeat: bool = False) -> None:
         """As an admin, or an owner on the Key Allowlist, take `member` out of the Team. With `delegated_repeat`
@@ -517,25 +541,38 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def request_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
         """As an admin, or an owner on the Key Allowlist, ask for `member` to become an "owner" or "member" of the Team.
-        Agents add people this way: nothing changes until an owner on the Key Allowlist, or an admin, confirms it on the Teams page."""
+        Agents add people this way: nothing changes until an owner on the Key Allowlist, or an admin, confirms it, on the
+        Teams page or by Delegated Request. Anyone else may only ask for themselves, which files a Join Request."""
+        if await self._is_join_request(email, team, member):
+            return await self._ask_to_join(email, team, role, client_ip)
         await self._require_manager(email, team)
         await self._store.request_member(team, member, role, email)
         await self._record(f"{role}_requested", NO_KEY_ID, client_ip, member, email, team=team)
 
-    async def confirm_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
+    async def confirm_member(
+        self, email: str, team: str, member: str, role: str, client_ip: str | None, *, delegated_repeat: bool = False
+    ) -> None:
         """As an admin, or an owner on the Key Allowlist, give `member` the role a pending request asked for. `role` is the one
-        the page showed: if the request asks for another now, nothing is granted (Refused 409)."""
+        the page showed: if the request asks for another now, nothing is granted (Refused 409). With `delegated_repeat`
+        (a Delegated Request), no request while `member` already has that role is the same request again: it records nothing."""
         confirm = partial(self._store.confirm_member, role=role)
-        await self._answer_request(email, team, member, client_ip, confirm, "confirmed", role)
+        await self._answer_request(email, team, member, client_ip, confirm, "confirmed", role, delegated_repeat=delegated_repeat)
 
-    async def decline_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
-        """As an admin, or an owner on the Key Allowlist, drop a pending request for `member`; their place in the Team stays as it was."""
-        await self._answer_request(email, team, member, client_ip, self._store.decline_member, "declined")
+    async def decline_member(
+        self, email: str, team: str, member: str, client_ip: str | None, *, delegated_repeat: bool = False
+    ) -> None:
+        """As an admin, or an owner on the Key Allowlist, drop a pending request for `member`; their place in the Team stays as it was.
+        With `delegated_repeat` (a Delegated Request), no request is the same request again: it records nothing."""
+        await self._answer_request(
+            email, team, member, client_ip, self._store.decline_member, "declined", delegated_repeat=delegated_repeat
+        )
 
-    async def _answer_request(self, email, team, member, client_ip, answer, outcome, shown=None) -> None:
+    async def _answer_request(self, email, team, member, client_ip, answer, outcome, shown=None, delegated_repeat=False) -> None:
         await self._require_manager(email, team)
         role = await answer(team, member)
         if role is None:
+            if delegated_repeat and (shown is None or await self._store.team_role(team, member) == shown):
+                return
             raise Refused(404, "Nobody asked to add that person to the Team.")
         if shown not in (None, role):
             raise Refused(409, f"That request now asks for {role}; reload the page.")

@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.members (
     PRIMARY KEY (team, email)
 );
 CREATE INDEX IF NOT EXISTS members_email_idx ON {SCHEMA}.members (email);
--- Asked for over MCP; nobody joins until an owner on the Key Allowlist, or an admin, confirms on the Teams page.
+-- Asked for by an owner or admin over MCP, or by the person themselves (a Join Request, requested_by = email);
+-- nobody joins until an owner on the Key Allowlist, or an admin, confirms on the Teams page or by Delegated Request.
 CREATE TABLE IF NOT EXISTS {SCHEMA}.member_requests (
     team text NOT NULL REFERENCES {SCHEMA}.teams (schema),
     email text NOT NULL,
@@ -334,7 +335,9 @@ class PostgresKeyStore:
             team,
             f"WITH had AS (SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2),"
             f" put AS (INSERT INTO {SCHEMA}.members (team, email, role) VALUES ($1, $2, $3)"
-            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role)"
+            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role),"
+            # A direct add settles the person's open request, so confirming it later cannot change the role they were given.
+            f" settled AS (DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2)"
             " SELECT role FROM had",
             email,
             role,
@@ -356,6 +359,27 @@ class PostgresKeyStore:
             role,
             by,
         )
+
+    async def add_join_request(self, team: str, email: str, role: str) -> bool:
+        """Record the person's own request for this role unless they are in the Team or already asked
+        (their open request, whoever filed it, stays as it is); True if recorded. A Team that does not exist
+        stores nothing and is no error, so the caller cannot tell it from a Team that does."""
+        try:
+            return bool(
+                await self._change_members(
+                    team,
+                    f"INSERT INTO {SCHEMA}.member_requests (team, email, role, requested_by)"
+                    " SELECT $1::text, $2::text, $3::text, $2::text"
+                    f" WHERE NOT EXISTS (SELECT 1 FROM {SCHEMA}.members WHERE team = $1 AND email = $2)"
+                    " ON CONFLICT (team, email) DO NOTHING RETURNING true",
+                    email,
+                    role,
+                )
+            )
+        except Refused as refusal:
+            if refusal.status != 404:
+                raise
+            return False
 
     async def confirm_member(self, team: str, email: str, role: str) -> str | None:
         """Give the person `role` if a pending request asks for exactly that. Returns the role the
