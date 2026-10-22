@@ -522,8 +522,10 @@ $allowlist
 const ACTIONS = [["renew", "Renew", "sec", "renewed"], ["revoke", "Revoke", "danger", "revoked"]];
 function expiry(key) {
   // Built only from dates and numbers, never from what a person typed.
-  const left = Math.ceil((Date.parse(key.expires_at) - Date.now()) / DAY);
-  const when = left > 0 ? left + (left === 1 ? " day left" : " days left") : "expired " + ago(key.expires_at);
+  // Whole days left, so 1d 1s reads "1 day left"; the server's state wins over the browser clock.
+  const left = Math.floor((Date.parse(key.expires_at) - Date.now()) / DAY);
+  const when = key.state === "expired" ? "expired " + ago(key.expires_at)
+    : left < 1 ? "expires today" : left + (left === 1 ? " day left" : " days left");
   const width = Math.max(0, Math.min(100, left / 90 * 100));
   return '<div class="life" title="' + day(key.expires_at) + '"><span>' + when + '</span>'
     + '<div class="bar' + (left < 30 ? " low" : "") + '" role="img" aria-label="' + Math.max(left, 0) + ' of 90 days left">'
