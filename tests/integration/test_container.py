@@ -1766,6 +1766,9 @@ def test_an_agents_repeated_request_stores_and_records_nothing_and_a_change_of_r
         {"kind": "owner_requested", "actor": owner},
         {"kind": "owner_requested", "actor": coowner},
     ]
+    # Leave nothing waiting: the reminder tests below count every request the shared database holds.
+    team_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", owner, {"email": joiner})
+    assert query(name, row) == []
 
 # Webex notices. The container runs without a bot token, so no background sweep competes with these for the queue
 # (the sweep, the messages and the HTTP routes are in tests/unit). They call the store the extension uses, and need
