@@ -307,10 +307,16 @@ class AgentKeysTenantExtension(TenantExtension):
         """The person's place on the Key Allowlist: 'admin', 'member', 'requested' (asked to join) or None."""
         return "admin" if email in self.bootstrap_admins else await self._store.role(email)
 
+    def _key_allowlist(self, rows: list) -> list:
+        """The Key Allowlist as every reader takes it, from its stored rows (each with `email` and `role`): the bootstrap
+        admins as admins, then everyone else's row. A bootstrap admin's own row is never read, so a request left in it
+        waits for nobody: the admin page, pending_reviews, the notices and the reminders all read the list through this."""
+        admins = [{"email": e, "role": "admin"} for e in sorted(self.bootstrap_admins)]
+        return admins + [r for r in rows if r["email"] not in self.bootstrap_admins]
+
     async def allowlist(self) -> list[tuple[str, str]]:
         """(email, role) for the bootstrap admins, then everyone else with a role, pending requests first."""
-        stored = [(r["email"], r["role"]) for r in await self._store.allowlist() if r["email"] not in self.bootstrap_admins]
-        return [(e, "admin") for e in sorted(self.bootstrap_admins)] + stored
+        return [(r["email"], r["role"]) for r in self._key_allowlist(await self._store.allowlist())]
 
     async def request_access(self, email: str, client_ip: str | None) -> None:
         """Ask the admins to add a signed-in person; does nothing if they already have a role."""
@@ -572,11 +578,13 @@ class AgentKeysTenantExtension(TenantExtension):
     async def request_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
         """As an admin, or an owner on the Key Allowlist, ask for `member` to become an "owner" or "member" of the Team.
         Agents add people this way: nothing changes until an owner on the Key Allowlist, or an admin, confirms it, on the
-        Teams page or by Delegated Request. Anyone else may only ask for themselves, which files a Join Request."""
+        Teams page or by Delegated Request. Anyone else may only ask for themselves, which files a Join Request. A request
+        for someone in the Team already at that role, or as an owner, changes, records and tells nothing."""
         if await self._is_join_request(email, team, member):
             return await self._ask_to_join(email, team, role, client_ip)
         await self._require_manager(email, team)
-        await self._store.request_member(team, member, role, email)
+        if not await self._store.request_member(team, member, role, email):
+            return
         await self._record(f"{role}_requested", NO_KEY_ID, client_ip, member, email, team=team)
         await self._notify(partial(self._member_requested_notice, email, team, member, role))
 
@@ -704,7 +712,7 @@ class AgentKeysTenantExtension(TenantExtension):
     async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
         return HindsightConfig.get_configurable_fields() - DENIED_BANK_FIELDS
 
-    # --- #1002 ---
+    # --- Open Teams ---
 
     async def set_open(self, admin: str, team: str, opened: bool, client_ip: str | None) -> None:
         """An admin opens the Team, so anyone on the Key Allowlist may join it with a live session, or closes it, which keeps
@@ -717,7 +725,8 @@ class AgentKeysTenantExtension(TenantExtension):
     async def join_team(self, email: str, team: str, client_ip: str | None) -> str | None:
         """Join an Open Team as a member, with a live session: the Teams page or a Delegated Request, never over MCP. Anyone on
         the Key Allowlist may. Returns the person's role in it; someone in it already keeps theirs, and only a join records
-        an event. A Team that is not open, or does not exist, gets the person's Join Request instead (None), as asking by name does."""
+        an event. Their request for a member's place is settled, telling nobody; one for an owner's place stays. A Team that
+        is not open, or does not exist, gets the person's Join Request instead (None), as asking by name does."""
         await self._require_allowlisted(email)
         joined = await self._store.join_open_team(team, email)
         if joined is None:
@@ -735,19 +744,19 @@ class AgentKeysTenantExtension(TenantExtension):
             return []
         return [{"team": r["schema"], "name": r["name"], "role": r["role"]} for r in await self._store.open_teams(email)]
 
-    # --- pending_reviews (#1004) ---
+    # --- pending_reviews ---
 
     async def pending_reviews(self, email: str) -> dict:
         """What waits for the person to review, as counts only, so no user-written text reaches an agent: the requests
         to join the Teams they own and, for an admin, those for any other Team left waiting more than
         ADMIN_REVIEW_AFTER, and the Key Allowlist requests. Carries the Teams page's link when the key pages are on."""
-        joins, access = await self._store.pending_review_counts(
-            email, admin=await self.role(email) == "admin", older_than=self._clock() - ADMIN_REVIEW_AFTER
-        )
+        admin = await self.role(email) == "admin"
+        joins = await self._store.pending_join_requests(email, admin=admin, older_than=self._clock() - ADMIN_REVIEW_AFTER)
+        access = sum(role == "requested" for _, role in await self.allowlist()) if admin else 0
         link = {"link": f"https://{self.access_host}/ext/teams"} if self.access_host else {}
         return {"join_requests": joins, "access_requests": access, **link}
 
-    # --- #1005 ---
+    # --- Webex notices ---
 
     async def webex_notices(self, email: str) -> bool | None:
         """Whether Webex notices to the person are on (they are, unless the person turned them off); None where they
@@ -768,7 +777,8 @@ class AgentKeysTenantExtension(TenantExtension):
         if self.notices is not None:
             await self.notices.tell(build)
 
-    async def _team_name(self, team: str) -> str:
+    async def _shown_team(self, team: str) -> str:
+        """The Team's name, flattened and defanged (`plain`) for a notice."""
         return plain(await self._store.team_name(team) or "")
 
     async def _listed_owners(self, team: str, *, but: str | None = None) -> list[str]:
@@ -787,23 +797,23 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def _join_requested_notice(self, email: str, team: str, role: str) -> Notice:
         asked = " as an owner" if role == "owner" else ""
-        line = f'{plain(email)} asked to join your Team "{await self._team_name(team)}"{asked}.'
+        line = f'{plain(email)} asked to join your Team "{await self._shown_team(team)}"{asked}.'
         return Notice("owner", await self._listed_owners(team), line, "/ext/teams", team)
 
     async def _member_requested_notice(self, filer: str, team: str, member: str, role: str) -> Notice:
         """An owner or an admin asked for someone else to join: the Team's other owners are told."""
         asked = " as an owner" if role == "owner" else ""
-        line = f'{plain(filer)} asked to add {plain(member)} to your Team "{await self._team_name(team)}"{asked}.'
+        line = f'{plain(filer)} asked to add {plain(member)} to your Team "{await self._shown_team(team)}"{asked}.'
         return Notice("owner", await self._listed_owners(team, but=filer), line, "/ext/teams", team)
 
     async def _request_decided_notice(self, team: str, member: str, asker: str, actor: str, outcome: str) -> Notice:
         """Tells whoever asked, unless they decided it themselves."""
         decided = "approved" if outcome == "confirmed" else "declined"
         asked = "to join" if asker == member else f"to add {plain(member)} to"
-        line = f'Your request {asked} the Team "{await self._team_name(team)}" was {decided}.'
+        line = f'Your request {asked} the Team "{await self._shown_team(team)}" was {decided}.'
         return Notice("asker", [] if asker == actor else [asker], line, "/ext/teams")
 
-    # --- #1006 ---
+    # --- Reminders ---
 
     def _reminders(self, now: datetime, due: dict) -> list[Notice]:
         """The day's reminders, from what store.run_reminders read (`due`). Daily, while it waits: a request untouched
@@ -812,19 +822,20 @@ class AgentKeysTenantExtension(TenantExtension):
         None before the first run): a warning to
         the holder of a key that works and expires within KEY_WARNING, and to someone holding one whose sign-in window
         closes within SIGN_IN_WARNING."""
-        roles = {r["email"]: r["role"] for r in due["allowlist"]}
+        allowlist = self._key_allowlist(due["allowlist"])
+        roles = {r["email"]: r["role"] for r in allowlist}
         signed_in = {r["email"]: r["last_seen"] for r in due["sign_ins"]}
-        admins = sorted(self.bootstrap_admins | {email for email, role in roles.items() if role == "admin"})
+        admins = sorted(email for email, role in roles.items() if role == "admin")
 
         def listed(email: str) -> bool:
-            return email in self.bootstrap_admins or roles.get(email) in LISTED
+            return roles.get(email) in LISTED
 
         def came_due(at: datetime) -> bool:
             return at <= now and (due["last"] is None or at > due["last"])
 
         def works(key) -> bool:
             # The rule `principal` applies to a key on each request (with `find_key`'s columns), which the stale_schemas
-            # view also counts by: a change to one belongs in the others.
+            # view and store._WORKS also count by: a change to one belongs in the others.
             seen = signed_in.get(key["email"])
             team = key["kind"] == "team" and key["schema"] != PUBLIC_SCHEMA
             return listed(key["email"]) and seen is not None and now - seen < SIGN_IN_WINDOW and (not team or key["team_role"])
@@ -832,8 +843,7 @@ class AgentKeysTenantExtension(TenantExtension):
         reminders = []
         for r in due["requests"]:
             waited = now - r["requested_at"]
-            # Someone already in the Team at the role asked for, or above it, has nothing left to wait for.
-            if waited <= REMIND_AFTER or r["has"] in ("owner", r["role"]):
+            if waited <= REMIND_AFTER:
                 continue
             # An owner off the Key Allowlist is dropped when the notice is claimed, as for every "owner" notice.
             owners = r["owners"]
@@ -842,10 +852,8 @@ class AgentKeysTenantExtension(TenantExtension):
                 # An admin who owns the Team has it as an owner.
                 others = [a for a in admins if a not in owners]
                 reminders.append(Notice("admin", others, _waiting(r, waited, "the"), "/ext/teams"))
-        for r in due["allowlist"]:
-            waited = now - r["requested_at"]
-            # A bootstrap admin is an admin whatever their row says, so no request of theirs waits.
-            if r["role"] == "requested" and r["email"] not in self.bootstrap_admins and waited > REMIND_AFTER:
+        for r in allowlist:
+            if r["role"] == "requested" and (waited := now - r["requested_at"]) > REMIND_AFTER:
                 line = f"{plain(r['email'])} has waited {_days(waited // _DAY)} for a place on the Key Allowlist."
                 reminders.append(Notice("admin", admins, line, "/ext/admin"))
         working = [k for k in due["keys"] if works(k)]
@@ -858,7 +866,7 @@ class AgentKeysTenantExtension(TenantExtension):
                 else:
                     team = f' for the Team "{plain(k["team_name"])}"'
                 line = f'Your Agent Key "{plain(k["name"])}"{team} expires {_when(k["expires_at"], now)}. Renew it on your key page.'
-                reminders.append(Notice("holder", [k["email"]], line, "/ext/"))
+                reminders.append(Notice("holder", [k["email"]], line, "/ext/", key=k["id"]))
         for email in sorted({k["email"] for k in working}):
             closes = signed_in[email] + SIGN_IN_WINDOW
             if came_due(closes - SIGN_IN_WARNING):

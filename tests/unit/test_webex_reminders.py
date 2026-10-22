@@ -7,6 +7,7 @@ import asyncio
 from datetime import timedelta
 
 import pytest
+from test_teams_page import as_person
 from test_webex_notices import (
     ACCESS_HOST,
     ADMIN,
@@ -116,9 +117,9 @@ async def test_after_7_days_every_admin_is_reminded_too_and_an_admin_who_owns_th
 async def test_admins_are_reminded_daily_of_a_key_allowlist_request_untouched_more_than_3_days(world):
     world.post(ERIN, "/access-requests", {})
     await settled(world)
-    world.store.asked_at[ERIN] = world.clock.now - timedelta(days=3)
+    world.store.requested_at[ERIN] = world.clock.now - timedelta(days=3)
     # A bootstrap admin is an admin whatever the Key Allowlist still holds for them, so no request of theirs waits.
-    world.store.roles[ADMIN], world.store.asked_at[ADMIN] = "requested", world.clock.now - timedelta(days=9)
+    world.store.roles[ADMIN], world.store.requested_at[ADMIN] = "requested", world.clock.now - timedelta(days=9)
     await remind(world)
     assert world.webex.sent == []
     world.clock.later(days=1)
@@ -132,19 +133,29 @@ async def test_admins_are_reminded_daily_of_a_key_allowlist_request_untouched_mo
     assert [to for to, _ in world.webex.sent] == [ERIN]  # the decision, and no reminder
 
 
-async def test_no_reminder_for_a_request_whose_person_is_already_in_the_team_at_that_role_or_above(world):
-    # DAVE asked while the Team was closed and joined once it was opened: his request stays (README, "Open Teams").
-    world.ask(DAVE)
+@pytest.mark.parametrize("agent", ["the owner's", "the person's"])
+async def test_joining_an_open_team_settles_an_agents_request_for_a_members_place(world, agent):
+    """Over MCP, the owner's agent asked for DAVE (add_team_member) or DAVE's own asked to join (request_to_join_team); DAVE
+    then joined on the Teams page once an admin opened the Team. Nothing waits: no count, nothing on the page, no reminder,
+    and nothing to decline, so nobody can be told it was declined."""
+    if agent == "the owner's":
+        await world.ext.request_member(ALICE, world.schema, DAVE, "member", None)
+    else:
+        await world.ext.request_to_join(DAVE, "Platform", None)
+    await world.ext.request_member(ALICE, world.schema, CAROL, "owner", None)  # CAROL, a member, is not an owner yet
     await world.ext.set_open(ADMIN, world.schema, True, None)
     assert world.post(DAVE, f"/teams/{world.schema}/join", {}).json()["role"] == "member"
-    await world.ext.request_member(ALICE, world.schema, BOB, "member", None)  # BOB already owns it
-    await world.ext.request_member(ALICE, world.schema, CAROL, "owner", None)  # CAROL, a member, is not an owner yet
     await settled(world)
-    for person in (DAVE, BOB, CAROL):
-        aged(world, person, days=4)
+    for person in (DAVE, CAROL):
+        aged(world, person, days=8)
+    assert [(await world.ext.pending_reviews(p))["join_requests"] for p in (ALICE, ADMIN)] == [1, 1]
+    page = world.client.get("/ext/teams", headers=as_person(world.team, ALICE)).text
+    assert f"{CAROL} as owner" in page and f"{DAVE} as member" not in page
     await remind(world)
-    [for_alice] = world.heard(ALICE)
-    assert CAROL in for_alice and DAVE not in for_alice and BOB not in for_alice
+    reminded = [*world.heard(ALICE), *world.heard(ADMIN)]
+    assert len(reminded) == 2 and all(CAROL in text and DAVE not in text for text in reminded)
+    decline = world.client.request("DELETE", f"/ext/teams/{world.schema}/requests", json={"email": DAVE}, headers=as_person(world.team, ALICE))
+    assert decline.status_code == 404
 
 
 # Key holders
@@ -224,7 +235,7 @@ async def test_every_value_a_person_wrote_is_flattened_and_defanged_in_a_reminde
     await remind(world)  # the first run
     for person in (DAVE, crafted, GINA):
         world.store.requested_at[team, person] = world.clock.now
-    world.store.asked_at[crafted] = world.clock.now
+    world.store.requested_at[crafted] = world.clock.now
     world.clock.later(days=76)
     world.store.sign_ins[CAROL] = world.clock.now
     await remind(world)
@@ -271,6 +282,27 @@ async def test_a_warning_queued_for_someone_since_removed_from_the_key_allowlist
     await world.send()
     assert [to for to, _ in world.webex.sent] == [DAVE]
     assert world.store.queue == []
+
+
+async def test_a_warning_about_a_key_revoked_since_it_was_queued_is_dropped_unsent(world):
+    await _warned(world)
+    [tablet] = [k["id"] for k in await world.ext.list_keys(GINA)]
+    await world.ext.revoke_key(GINA, tablet, None)
+    await world.send()
+    assert [to for to, _ in world.webex.sent] == [DAVE]
+    assert world.store.queue == [] and [row["recipient"] for row in world.store.log] == [DAVE]
+
+
+async def test_a_key_revoked_between_the_claim_and_the_send_stops_its_warning(world):
+    await _warned(world)
+    [tablet] = [k["id"] for k in await world.ext.list_keys(GINA)]
+    world.store.after_claim = lambda person: world.store.keys[tablet].update(revoked_at=world.clock.now) if person == GINA else None
+    await world.send()
+    assert [to for to, _ in world.webex.sent] == [DAVE]
+    assert [(row["recipient"], row["status"], row["detail"]) for row in world.store.log] == [
+        (DAVE, "sent", None),
+        (GINA, "skipped", "no longer eligible"),
+    ]
 
 
 async def test_a_key_holder_removed_from_the_key_allowlist_between_the_claim_and_the_send_is_not_sent_to(world):
@@ -366,7 +398,7 @@ async def test_a_stop_before_the_days_run_commits_queues_nothing_and_the_next_sw
     world.post(ERIN, "/access-requests", {})
     await settled(world)
     aged(world, DAVE, days=4)
-    world.store.asked_at[ERIN] = world.clock.now - timedelta(days=4)
+    world.store.requested_at[ERIN] = world.clock.now - timedelta(days=4)
     queue_notice = world.store.queue_notice
     if where == "after the day is recorded":
         world.store.break_on["run_reminders"] = Stopped()
@@ -375,11 +407,11 @@ async def test_a_stop_before_the_days_run_commits_queues_nothing_and_the_next_sw
     else:
         calls = []
 
-        async def second_stops(*args):
+        async def second_stops(*args, **kwargs):
             calls.append(args)
             if len(calls) == 2:
                 raise Stopped
-            await queue_notice(*args)
+            await queue_notice(*args, **kwargs)
 
         world.store.queue_notice = second_stops
     with pytest.raises(Stopped):

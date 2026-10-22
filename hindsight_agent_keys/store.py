@@ -30,19 +30,50 @@ def _notice_lock_key(email: str) -> str:
     return f"{SCHEMA}.notice_send:{email}"
 
 
+async def _poll_for_lock(conn: asyncpg.Connection, sql: str, key: str, wait: float, poll: float, timeout: Exception) -> None:
+    """Take the advisory lock of `key` with `sql` (a pg_try_advisory_*lock), trying every `poll` seconds, and raise `timeout`
+    once `wait` seconds have passed. It polls, never waits in one statement: see team_name_lock."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + wait
+    while not await conn.fetchval(sql, key):
+        if loop.time() >= deadline:
+            raise timeout
+        await asyncio.sleep(poll)
+
+
 # Whether the person ($1) is on the Key Allowlist, given the bootstrap admins ($2), who are admins whatever the allowlist
 # says. 'member' and 'admin' are extension.LISTED, the roles that may create keys.
 _LISTED = f"($1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role IN ('member', 'admin')))"
-# Whether a queued notice (t.kind, t.team) is still the person's to read: an owner of the Team on the Key Allowlist, an
-# admin, a key's holder still on the Key Allowlist, or the asker of a decided request. Any other kind is not.
+# Whether the key `k` works at $3, as `principal` decides on each request, but for its holder's place on the Key Allowlist
+# (`_LISTED`): not revoked or expired, its holder signed in within extension.SIGN_IN_WINDOW, and a Team key's holder still
+# in its Team. extension._reminders' `works` and the stale_schemas view count by the same rule: a change to one belongs in
+# the others.
+_WORKS = (
+    "k.revoked_at IS NULL AND $3::timestamptz < k.expires_at"
+    f" AND EXISTS (SELECT 1 FROM {SCHEMA}.sign_ins s WHERE s.email = k.email AND $3::timestamptz - s.last_seen < interval '30 days')"
+    f" AND (k.kind <> 'team' OR k.schema = 'public'"
+    f" OR EXISTS (SELECT 1 FROM {SCHEMA}.members km WHERE km.team = k.schema AND km.email = k.email))"
+)
+# Whether a queued notice (t.kind, t.team, t.key_id) is still the person's to read at $3: an owner of the Team on the Key
+# Allowlist, an admin, a key's holder still on the Key Allowlist whose key still works (for a warning that names none, the
+# sign-in window's, any key of theirs that works), or the asker of a decided request. Any other kind is not.
 NOTICE_ELIGIBLE = (
     "CASE t.kind"
     f" WHEN 'owner' THEN EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = t.team AND m.email = $1 AND m.role = 'owner')"
     f"   AND {_LISTED}"
     f" WHEN 'admin' THEN $1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role = 'admin')"
-    f" WHEN 'holder' THEN {_LISTED}"
+    f" WHEN 'holder' THEN {_LISTED} AND EXISTS (SELECT 1 FROM {SCHEMA}.keys k WHERE k.email = $1"
+    f"   AND (t.key_id IS NULL OR k.id = t.key_id) AND {_WORKS})"
     " WHEN 'asker' THEN true"
     " ELSE false END"
+)
+# Whether the request `r` (a member_requests row) still waits for an answer: its person is not in the Team already at the
+# role it asks for, or as an owner. Nothing files one that does not, and joining an Open Team settles one for a member's
+# place, but a request filed before those rules may be left. The Teams page, pending_reviews and the reminders all read
+# requests through this, only a request where it holds is confirmed or declined, and one for someone else is filed only
+# where it holds.
+_WAITING = (
+    f"NOT EXISTS (SELECT 1 FROM {SCHEMA}.members w WHERE w.team = r.team AND w.email = r.email AND w.role IN ('owner', r.role))"
 )
 
 # Idempotent and outside upstream's Alembic history, like the event log.
@@ -167,6 +198,19 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.reminder_runs (
 -- gave #1005's column CHECK, so a table #1005 made takes it too.
 ALTER TABLE {SCHEMA}.notice_queue DROP CONSTRAINT IF EXISTS notice_queue_kind_check,
     ADD CONSTRAINT notice_queue_kind_check CHECK (kind IN ('owner', 'admin', 'asker', 'holder'));
+-- The key a 'holder' warning is about, which must still work for it to be sent; NULL for a sign-in window warning, which
+-- needs any key of the holder's that works. Added once, under the table's lock so a concurrent start waits and then finds
+-- it: a warning an earlier release queued names no key, and would read as a sign-in window warning, so the run that adds
+-- the column drops every warning then queued, unsent (its key cannot be known, and the day's runs warn of a key once).
+DO $$
+BEGIN
+    LOCK TABLE {SCHEMA}.notice_queue IN ACCESS EXCLUSIVE MODE;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = '{SCHEMA}.notice_queue'::regclass
+                   AND attname = 'key_id' AND NOT attisdropped) THEN
+        ALTER TABLE {SCHEMA}.notice_queue ADD COLUMN key_id text;
+        DELETE FROM {SCHEMA}.notice_queue WHERE kind = 'holder';
+    END IF;
+END $$;
 """
 
 
@@ -381,6 +425,41 @@ class PostgresKeyStore:
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT schema FROM {SCHEMA}.teams WHERE lower(name) = lower($1)", name)
 
+    async def team_name(self, team: str) -> str | None:
+        """The Team's name as it was created, None if there is no such Team."""
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT name FROM {SCHEMA}.teams WHERE schema = $1", team)
+
+    async def team_creator(self, team: str) -> str | None:
+        """The email of the person who created the Team, None if there is no such Team."""
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT created_by FROM {SCHEMA}.teams WHERE schema = $1", team)
+
+    @contextlib.asynccontextmanager
+    async def team_name_lock(self, name: str):
+        """Hold a lock on the Team name, in any case, across API processes. It takes a connection of its own,
+        not one of the pool's, so waiting for it, or a migration under it, never starves the key lookups.
+        A waiter gives up after TEAM_NAME_LOCK_WAIT seconds with Refused(503) and closes its connection, so each
+        waiter behind a stuck holder holds a connection for at most that long; how many wait is not capped. A holder
+        that stops, mid-migration say, frees the lock as its connection closes."""
+        conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
+        try:
+            # Postgres's own lower(), the one the unique index on the name uses. A waiter polls: a statement left
+            # waiting for the lock holds a transaction open, and the migration under the lock creates indexes
+            # concurrently, which waits for every open transaction to finish, so a blocked waiter would deadlock it.
+            await _poll_for_lock(
+                conn,
+                "SELECT pg_try_advisory_lock(hashtext(lower($1)))",
+                f"{SCHEMA}.team_name:{name.strip()}",
+                TEAM_NAME_LOCK_WAIT,
+                TEAM_NAME_LOCK_POLL,
+                Refused(503, "Another request is still creating a Team with that name; try again in a minute."),
+            )
+            yield
+        finally:
+            # Closing the connection releases the lock, on a failure too.
+            await conn.close()
+
     async def teams(self, email: str, everyone: bool = False) -> list[asyncpg.Record]:
         """The person's Teams (all Teams if `everyone`) with the person's role, None if not a member."""
         pool = await self._get_pool()
@@ -425,16 +504,21 @@ class PostgresKeyStore:
             team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2 RETURNING role", email, who=email
         )
 
-    async def request_member(self, team: str, email: str, role: str, by: str) -> None:
-        """Ask for the person to get this role in the Team; replaces an earlier request for them."""
-        await self._change_members(
-            team,
-            f"INSERT INTO {SCHEMA}.member_requests (team, email, role, requested_by) VALUES ($1, $2, $3, $4)"
-            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role, requested_by = excluded.requested_by",
-            email,
-            role,
-            by,
-            who=None,
+    async def request_member(self, team: str, email: str, role: str, by: str) -> bool:
+        """Ask for the person to get this role in the Team, replacing an earlier request for them; True if filed. Nothing
+        is filed for someone in the Team already at that role, or as an owner: it would wait for nothing (`_WAITING`)."""
+        return bool(
+            await self._change_members(
+                team,
+                f"INSERT INTO {SCHEMA}.member_requests (team, email, role, requested_by)"
+                f" SELECT r.team, r.email, r.role, $4::text FROM (SELECT $1::text AS team, $2::text AS email, $3::text AS role) r"
+                f" WHERE {_WAITING}"
+                " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role, requested_by = excluded.requested_by RETURNING true",
+                email,
+                role,
+                by,
+                who=None,
+            )
         )
 
     async def add_join_request(self, team: str, email: str, role: str) -> bool:
@@ -461,11 +545,13 @@ class PostgresKeyStore:
 
     async def confirm_member(self, team: str, email: str, role: str) -> tuple[str, str] | None:
         """Give the person `role` if a pending request asks for exactly that. Returns (the role the request asks for,
-        who asked), nothing changing if it asks for another role, or None if there is no request."""
+        who asked), nothing changing if it asks for another role, or None if there is no request that waits (`_WAITING`)."""
         row = await self._change_members(
             team,
-            f"WITH asked AS (SELECT role, requested_by FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2),"
-            f" taken AS (DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 AND role = $3 RETURNING role),"
+            f"WITH asked AS (SELECT r.role, r.requested_by FROM {SCHEMA}.member_requests r"
+            f" WHERE r.team = $1 AND r.email = $2 AND {_WAITING}),"
+            f" taken AS (DELETE FROM {SCHEMA}.member_requests r WHERE r.team = $1 AND r.email = $2 AND r.role = $3"
+            f" AND {_WAITING} RETURNING r.role),"
             f" granted AS (INSERT INTO {SCHEMA}.members (team, email, role) SELECT $1, $2, role FROM taken"
             " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role)"
             " SELECT role, requested_by FROM asked",
@@ -477,10 +563,12 @@ class PostgresKeyStore:
         return None if row is None else (row["role"], row["requested_by"])
 
     async def decline_member(self, team: str, email: str) -> tuple[str, str] | None:
-        """Drop a pending request; returns (the role it asked for, who asked), or None if there was no request."""
+        """Drop a pending request; returns (the role it asked for, who asked), or None if there was no request that waits
+        (`_WAITING`)."""
         row = await self._change_members(
             team,
-            f"DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 RETURNING role, requested_by",
+            f"DELETE FROM {SCHEMA}.member_requests r WHERE r.team = $1 AND r.email = $2 AND {_WAITING}"
+            " RETURNING r.role, r.requested_by",
             email,
             who=None,
             row=True,
@@ -488,9 +576,12 @@ class PostgresKeyStore:
         return None if row is None else (row["role"], row["requested_by"])
 
     async def member_requests(self, team: str) -> list[asyncpg.Record]:
+        """The Team's requests that wait for an answer (`_WAITING`)."""
         pool = await self._get_pool()
         return await pool.fetch(
-            f"SELECT email, role, requested_by FROM {SCHEMA}.member_requests WHERE team = $1 ORDER BY email", team
+            f"SELECT r.email, r.role, r.requested_by FROM {SCHEMA}.member_requests r WHERE r.team = $1 AND {_WAITING}"
+            " ORDER BY r.email",
+            team,
         )
 
     async def _change_members(self, team: str, sql: str, *args: str, who: str | None, row: bool = False):
@@ -552,17 +643,20 @@ class PostgresKeyStore:
     async def revoke_keys(
         self, email: str, now: datetime, key_id: str | None = None, *, via_workplane: bool = False
     ) -> int:
-        """Revoke one of the person's keys, or with no key ID all of them; returns how many."""
+        """Revoke one of the person's keys, or with no key ID all of them; returns how many. Under the person's notice lock
+        (`_lock_notices`): a revocation can end their eligibility for a warning."""
         pool = await self._get_pool()
-        rows = await pool.fetch(
-            f"UPDATE {SCHEMA}.keys SET revoked_at = $2"
-            " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) AND (NOT $4::boolean OR via IS NOT NULL)"
-            " RETURNING id",
-            email,
-            now,
-            key_id,
-            via_workplane,
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            await self._lock_notices(conn, email)
+            rows = await conn.fetch(
+                f"UPDATE {SCHEMA}.keys SET revoked_at = $2"
+                " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) AND (NOT $4::boolean OR via IS NOT NULL)"
+                " RETURNING id",
+                email,
+                now,
+                key_id,
+                via_workplane,
+            )
         return len(rows)
 
     async def last_sign_in(self, email: str) -> datetime | None:
@@ -570,50 +664,22 @@ class PostgresKeyStore:
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT last_seen FROM {SCHEMA}.sign_ins WHERE email = $1", email)
 
-    async def team_name(self, team: str) -> str | None:
-        """The Team's name as it was created, None if there is no such Team."""
-        pool = await self._get_pool()
-        return await pool.fetchval(f"SELECT name FROM {SCHEMA}.teams WHERE schema = $1", team)
-
-    async def team_creator(self, team: str) -> str | None:
-        """The email of the person who created the Team, None if there is no such Team."""
-        pool = await self._get_pool()
-        return await pool.fetchval(f"SELECT created_by FROM {SCHEMA}.teams WHERE schema = $1", team)
-
-    @contextlib.asynccontextmanager
-    async def team_name_lock(self, name: str):
-        """Hold a lock on the Team name, in any case, across API processes. It takes a connection of its own,
-        not one of the pool's, so waiting for it, or a migration under it, never starves the key lookups.
-        A waiter gives up after TEAM_NAME_LOCK_WAIT seconds with Refused(503) and closes its connection, so each
-        waiter behind a stuck holder holds a connection for at most that long; how many wait is not capped. A holder
-        that stops, mid-migration say, frees the lock as its connection closes."""
-        conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
-        try:
-            # Postgres's own lower(), the one the unique index on the name uses. A waiter polls: a statement left
-            # waiting for the lock holds a transaction open, and the migration under the lock creates indexes
-            # concurrently, which waits for every open transaction to finish, so a blocked waiter would deadlock it.
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + TEAM_NAME_LOCK_WAIT
-            while not await conn.fetchval(
-                "SELECT pg_try_advisory_lock(hashtext(lower($1)))", f"{SCHEMA}.team_name:{name.strip()}"
-            ):
-                if loop.time() >= deadline:
-                    raise Refused(503, "Another request is still creating a Team with that name; try again in a minute.")
-                await asyncio.sleep(TEAM_NAME_LOCK_POLL)
-            yield
-        finally:
-            # Closing the connection releases the lock, on a failure too.
-            await conn.close()
-
     async def revoke_workplane_keys(self, now: datetime) -> int:
-        """Revoke every unrevoked key created via WorkPlane, whoever holds it; returns how many."""
+        """Revoke every unrevoked key created via WorkPlane, whoever holds it; returns how many. Under each holder's notice
+        lock, taken in order (`_lock_notices`), as for any revocation."""
         pool = await self._get_pool()
-        rows = await pool.fetch(
-            f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            holders = await conn.fetch(
+                f"SELECT DISTINCT email FROM {SCHEMA}.keys WHERE via IS NOT NULL AND revoked_at IS NULL ORDER BY email"
+            )
+            for holder in holders:
+                await self._lock_notices(conn, holder["email"])
+            rows = await conn.fetch(
+                f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
+            )
         return len(rows)
 
-    # --- #1002 ---
+    # --- Open Teams ---
 
     async def set_open(self, team: str, opened: bool) -> bool:
         """Open or close the Team; returns whether it was open. Refused(404) if there is no such Team."""
@@ -628,7 +694,8 @@ class PostgresKeyStore:
 
     async def join_open_team(self, team: str, email: str) -> tuple[str, bool] | None:
         """Make the person a member of the Team if it is open: (their role now, whether they joined just now); someone in it
-        already keeps their role. None, changing nothing, if the Team is not open or does not exist."""
+        already keeps their role. Their request for a member's place, which then waits for nothing, is settled; one for an
+        owner's place stays for an owner to answer. None, changing nothing, if the Team is not open or does not exist."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
             # The Team's lock, as every member change takes, so a join waits for a concurrent closing or approval.
@@ -639,6 +706,9 @@ class PostgresKeyStore:
                 " ON CONFLICT (team, email) DO NOTHING RETURNING true",
                 team,
                 email,
+            )
+            await conn.execute(
+                f"DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 AND role = 'member'", team, email
             )
             role = await conn.fetchval(f"SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2", team, email)
         return role, bool(joined)
@@ -652,92 +722,47 @@ class PostgresKeyStore:
             email,
         )
 
-    # --- pending_reviews (#1004) ---
+    # --- pending_reviews ---
 
-    async def pending_review_counts(self, email: str, *, admin: bool, older_than: datetime) -> tuple[int, int]:
-        """What waits for the person: (requests to join the Teams they own, and for an admin those for any other
-        Team filed before `older_than`; the people who asked for a place on the Key Allowlist, for an admin only)."""
+    async def pending_join_requests(self, email: str, *, admin: bool, older_than: datetime) -> int:
+        """How many requests to join the Teams the person owns wait (`_WAITING`), and for an admin those for any other Team
+        filed before `older_than`."""
         pool = await self._get_pool()
-        joins, access = await pool.fetchrow(
-            f"SELECT (SELECT count(*) FROM {SCHEMA}.member_requests r WHERE ($2::boolean AND r.requested_at < $3) OR EXISTS"
-            f" (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner')),"
-            f" (SELECT count(*) FROM {SCHEMA}.allowlist WHERE $2::boolean AND role = 'requested')",
+        return await pool.fetchval(
+            f"SELECT count(*) FROM {SCHEMA}.member_requests r WHERE {_WAITING} AND (($2::boolean AND r.requested_at < $3)"
+            f" OR EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner'))",
             email,
             admin,
             older_than,
         )
-        return joins, access
 
-    # --- #1005 ---
+    # --- Webex notices ---
 
     async def queue_notice(
-        self, recipients: list[str], kind: str, team: str | None, line: str, path: str, conn: asyncpg.Connection | None = None
+        self,
+        recipients: list[str],
+        kind: str,
+        team: str | None,
+        line: str,
+        path: str,
+        conn: asyncpg.Connection | None = None,
+        *,
+        key_id: str | None = None,
     ) -> None:
         """Queue one line, linking to `path` on the key pages, for each recipient, who is `kind` to it ('owner' of
-        `team`, 'admin', 'asker' or 'holder'). On `conn`, inside its transaction, when given."""
+        `team`, 'admin', 'asker' or 'holder' of the key `key_id`, or of any key for a warning that names none). On `conn`,
+        inside its transaction, when given."""
         db = conn or await self._get_pool()
         await db.execute(
-            f"INSERT INTO {SCHEMA}.notice_queue (recipient, kind, team, line, path)"
-            " SELECT r, $2, $3, $4, $5 FROM unnest($1::text[]) r",
+            f"INSERT INTO {SCHEMA}.notice_queue (recipient, kind, team, line, path, key_id)"
+            " SELECT r, $2, $3, $4, $5, $6 FROM unnest($1::text[]) r",
             recipients,
             kind,
             team,
             line,
             path,
+            key_id,
         )
-
-    async def run_reminders(
-        self,
-        day: date,
-        now: datetime,
-        is_due: Callable[[datetime | None, bool], bool],
-        build: Callable[[dict], list],
-    ) -> bool:
-        """Queue the reminders of `day` unless a process has, if `is_due(the last run's time or None, whether the day before
-        was run)` (Notices.remind). One transaction records the day, reads what reminders are made of, and queues the notices
-        `build(due)` makes, so a stop anywhere in it leaves the day not run and nothing queued. A second process running the
-        same day waits for the first's transaction at the day's row, then finds the day run. Returns whether the day has been
-        run, by this call or before; False, queuing nothing, while it is not due. `due` holds `last`, when the previous run
-        was (None before the first), and every row of `allowlist`, `sign_ins` and `requests` (with the Team's name, the
-        person's role in it now, `has`, and its owners), and of `keys` that are unrevoked and unexpired at `now` (with their
-        Team's name and their holder's role in it, `team_role`)."""
-        pool = await self._get_pool()
-        async with pool.acquire() as conn, conn.transaction():
-            last, ran, ran_before = await conn.fetchrow(
-                f"SELECT max(at), bool_or(day = $1::date), bool_or(day = $1::date - 1) FROM {SCHEMA}.reminder_runs", day
-            )
-            if ran:
-                return True
-            if not is_due(last, bool(ran_before)):
-                return False
-            if not await conn.fetchval(
-                f"INSERT INTO {SCHEMA}.reminder_runs (day, at) VALUES ($1, $2) ON CONFLICT (day) DO NOTHING RETURNING true",
-                day,
-                now,
-            ):
-                return True
-            due = {
-                "last": last,
-                "allowlist": await conn.fetch(f"SELECT email, role, requested_at FROM {SCHEMA}.allowlist ORDER BY email"),
-                "sign_ins": await conn.fetch(f"SELECT email, last_seen FROM {SCHEMA}.sign_ins ORDER BY email"),
-                "requests": await conn.fetch(
-                    f"SELECT r.team, t.name, r.email, r.role, r.requested_by, r.requested_at, m.role AS has,"
-                    f" ARRAY(SELECT o.email FROM {SCHEMA}.members o WHERE o.team = r.team AND o.role = 'owner' ORDER BY o.email)"
-                    f" AS owners FROM {SCHEMA}.member_requests r JOIN {SCHEMA}.teams t ON t.schema = r.team"
-                    f" LEFT JOIN {SCHEMA}.members m ON m.team = r.team AND m.email = r.email"
-                    " ORDER BY r.requested_at, r.team, r.email"
-                ),
-                "keys": await conn.fetch(
-                    f"SELECT k.email, k.name, k.kind, k.schema, k.expires_at, t.name AS team_name, m.role AS team_role"
-                    f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.teams t ON t.schema = k.schema"
-                    f" LEFT JOIN {SCHEMA}.members m ON m.team = k.schema AND m.email = k.email"
-                    " WHERE k.revoked_at IS NULL AND k.expires_at > $1 ORDER BY k.expires_at, k.id",
-                    now,
-                ),
-            }
-            for notice in build(due):
-                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path, conn)
-        return True
 
     async def queued_recipients(self) -> list[str]:
         pool = await self._get_pool()
@@ -745,11 +770,11 @@ class PostgresKeyStore:
 
     async def claim_notice(
         self, recipient: str, now: datetime, since: datetime, admins: list[str]
-    ) -> tuple[int, list[tuple[str, str, str, str | None]]] | None:
-        """Take everything queued for the person that they are still eligible for and log it as one message `sending`:
-        (log ID, [(line, path, kind, team)]). Eligible is still what the notice made them (NOTICE_ELIGIBLE): an owner of its
-        Team who is on the Key Allowlist, an admin (`admins` are the bootstrap admins), or a key's holder on the Key
-        Allowlist; the rest is dropped. None, taking
+    ) -> tuple[int, list[tuple[str, str, str, str | None, str | None]]] | None:
+        """Take everything queued for the person that they are still eligible for at `now` and log it as one message
+        `sending`: (log ID, [(line, path, kind, team, key ID)]). Eligible is still what the notice made them
+        (NOTICE_ELIGIBLE): an owner of its Team who is on the Key Allowlist, an admin (`admins` are the bootstrap admins),
+        or a key's holder on the Key Allowlist whose key still works; the rest is dropped. None, taking
         nothing, if they were messaged after `since` (it stays queued) or have nothing left to be told; their queue is
         emptied, and nothing logged, if they turned notices off. One transaction, one at a time per person across
         processes: a stop inside it rolls it back and the queue is as it was. The sender checks eligibility again under
@@ -760,10 +785,11 @@ class PostgresKeyStore:
             if await conn.fetchval(f"SELECT 1 FROM {SCHEMA}.notice_log WHERE recipient = $1 AND at > $2", recipient, since):
                 return None
             rows = await conn.fetch(
-                f"WITH taken AS (DELETE FROM {SCHEMA}.notice_queue WHERE recipient = $1 RETURNING id, kind, team, line, path)"
-                f" SELECT line, path, kind, team FROM taken t WHERE {NOTICE_ELIGIBLE} ORDER BY id",
+                f"WITH taken AS (DELETE FROM {SCHEMA}.notice_queue WHERE recipient = $1 RETURNING id, kind, team, key_id, line, path)"
+                f" SELECT line, path, kind, team, key_id FROM taken t WHERE {NOTICE_ELIGIBLE} ORDER BY id",
                 recipient,
                 admins,
+                now,
             )
             if not rows or await conn.fetchval(f"SELECT 1 FROM {SCHEMA}.notice_optouts WHERE email = $1", recipient):
                 return None
@@ -773,20 +799,29 @@ class PostgresKeyStore:
                 now,
                 len(rows),
             )
-        return log_id, [(r["line"], r["path"], r["kind"], r["team"]) for r in rows]
+        return log_id, [(r["line"], r["path"], r["kind"], r["team"], r["key_id"]) for r in rows]
 
     async def still_eligible(
-        self, conn: asyncpg.Connection, recipient: str, items: list[tuple[str, str, str, str | None]], admins: list[str]
+        self,
+        conn: asyncpg.Connection,
+        recipient: str,
+        items: list[tuple[str, str, str, str | None, str | None]],
+        admins: list[str],
+        now: datetime,
     ) -> list[bool]:
-        """For each claimed item, whether the person is still eligible for it now. Called under the person's notice lock, on
-        the connection `notice_lock` gave, which every change that can end their eligibility takes before it commits, so once
-        one has committed this sees it and, until it has, the change waits for the message that follows."""
+        """For each claimed item, whether the person is still eligible for it at `now`. Called under the person's notice
+        lock, on the connection `notice_lock` gave, which every change that can end their eligibility (a revocation of the
+        key a warning is about included) takes before it commits, so once one has committed this sees it and, until it has,
+        the change waits for the message that follows."""
         rows = await conn.fetch(
-            f"SELECT t.ord FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS t(kind, team, ord) WHERE {NOTICE_ELIGIBLE}",
+            "SELECT t.ord FROM unnest($4::text[], $5::text[], $6::text[]) WITH ORDINALITY AS t(kind, team, key_id, ord)"
+            f" WHERE {NOTICE_ELIGIBLE}",
             recipient,
             admins,
+            now,
             [item[2] for item in items],
             [item[3] for item in items],
+            [item[4] for item in items],
         )
         yes = {r["ord"] - 1 for r in rows}
         return [i in yes for i in range(len(items))]
@@ -807,12 +842,14 @@ class PostgresKeyStore:
         while they wait). TimeoutError after NOTICE_LOCK_WAIT seconds, which is longer than a send can last."""
         conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
         try:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + NOTICE_LOCK_WAIT
-            while not await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", _notice_lock_key(email)):
-                if loop.time() >= deadline:
-                    raise TimeoutError
-                await asyncio.sleep(NOTICE_LOCK_POLL)
+            await _poll_for_lock(
+                conn,
+                "SELECT pg_try_advisory_lock(hashtext($1))",
+                _notice_lock_key(email),
+                NOTICE_LOCK_WAIT,
+                NOTICE_LOCK_POLL,
+                TimeoutError(),
+            )
             yield conn
         finally:
             await conn.close()
@@ -820,16 +857,19 @@ class PostgresKeyStore:
     async def _lock_notices(self, conn: asyncpg.Connection, email: str) -> None:
         """Take the person's notice lock until the transaction on `conn` ends. Every change that can end someone's eligibility
         for a notice (a removal or a role change in a Team, a role change on the Key Allowlist) calls this before it changes
-        anything, so it waits for a message to them in flight and a message whose final check comes after the commit sees it.
+        anything, so it waits for a message to them in flight and a message whose final check comes after the commit sees it;
+        so does a revocation of a key of theirs, which can end a warning's.
         It takes the lock on the transaction's own connection, first, so a change holds one pool connection while it waits
         and never waits for a second while it holds the lock.
         Polls, as notice_lock does; Refused(503) if the message does not finish within NOTICE_LOCK_WAIT seconds."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + NOTICE_LOCK_WAIT
-        while not await conn.fetchval("SELECT pg_try_advisory_xact_lock(hashtext($1))", _notice_lock_key(email)):
-            if loop.time() >= deadline:
-                raise Refused(503, "A message to that person is being sent; try again in a moment.")
-            await asyncio.sleep(NOTICE_LOCK_POLL)
+        await _poll_for_lock(
+            conn,
+            "SELECT pg_try_advisory_xact_lock(hashtext($1))",
+            _notice_lock_key(email),
+            NOTICE_LOCK_WAIT,
+            NOTICE_LOCK_POLL,
+            Refused(503, "A message to that person is being sent; try again in a moment."),
+        )
 
     async def notices_enabled(self, email: str, conn: asyncpg.Connection | None = None) -> bool:
         """Whether the person has not turned notices off; on `notice_lock`'s connection when the sender holds the lock."""
@@ -845,3 +885,57 @@ class PostgresKeyStore:
             return
         async with self.notice_lock(email) as conn:
             await conn.execute(f"INSERT INTO {SCHEMA}.notice_optouts (email) VALUES ($1) ON CONFLICT DO NOTHING", email)
+
+    # --- Reminders ---
+
+    async def run_reminders(
+        self,
+        day: date,
+        now: datetime,
+        is_due: Callable[[datetime | None, bool], bool],
+        build: Callable[[dict], list],
+    ) -> bool:
+        """Queue the reminders of `day` unless a process has, if `is_due(the last run's time or None, whether the day before
+        was run)` (Notices.remind). One transaction records the day, reads what reminders are made of, and queues the notices
+        `build(due)` makes, so a stop anywhere in it leaves the day not run and nothing queued. A second process running the
+        same day waits for the first's transaction at the day's row, then finds the day run. Returns whether the day has been
+        run, by this call or before; False, queuing nothing, while it is not due. `due` holds `last`, when the previous run
+        was (None before the first), and every row of `allowlist` and `sign_ins`, of `requests` that wait (`_WAITING`, with
+        the Team's name and its owners), and of `keys` that are unrevoked and unexpired at `now` (with their Team's name and
+        their holder's role in it, `team_role`)."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            last, ran, ran_before = await conn.fetchrow(
+                f"SELECT max(at), bool_or(day = $1::date), bool_or(day = $1::date - 1) FROM {SCHEMA}.reminder_runs", day
+            )
+            if ran:
+                return True
+            if not is_due(last, bool(ran_before)):
+                return False
+            if not await conn.fetchval(
+                f"INSERT INTO {SCHEMA}.reminder_runs (day, at) VALUES ($1, $2) ON CONFLICT (day) DO NOTHING RETURNING true",
+                day,
+                now,
+            ):
+                return True
+            due = {
+                "last": last,
+                "allowlist": await conn.fetch(f"SELECT email, role, requested_at FROM {SCHEMA}.allowlist ORDER BY email"),
+                "sign_ins": await conn.fetch(f"SELECT email, last_seen FROM {SCHEMA}.sign_ins ORDER BY email"),
+                "requests": await conn.fetch(
+                    f"SELECT r.team, t.name, r.email, r.role, r.requested_by, r.requested_at,"
+                    f" ARRAY(SELECT o.email FROM {SCHEMA}.members o WHERE o.team = r.team AND o.role = 'owner' ORDER BY o.email)"
+                    f" AS owners FROM {SCHEMA}.member_requests r JOIN {SCHEMA}.teams t ON t.schema = r.team"
+                    f" WHERE {_WAITING} ORDER BY r.requested_at, r.team, r.email"
+                ),
+                "keys": await conn.fetch(
+                    f"SELECT k.id, k.email, k.name, k.kind, k.schema, k.expires_at, t.name AS team_name, m.role AS team_role"
+                    f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.teams t ON t.schema = k.schema"
+                    f" LEFT JOIN {SCHEMA}.members m ON m.team = k.schema AND m.email = k.email"
+                    " WHERE k.revoked_at IS NULL AND k.expires_at > $1 ORDER BY k.expires_at, k.id",
+                    now,
+                ),
+            }
+            for notice in build(due):
+                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path, conn, key_id=notice.key)
+        return True

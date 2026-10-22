@@ -1536,7 +1536,7 @@ def test_approving_declining_and_asking_to_join_wait_for_the_teams_lock(hindsigh
     assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": kai}]
 
 
-# --- #1002 ---
+# --- Open Teams ---
 
 
 def test_an_admin_opens_a_team_anyone_listed_joins_it_and_closing_keeps_its_members(hindsight):
@@ -1553,7 +1553,7 @@ def test_an_admin_opens_a_team_anyone_listed_joins_it_and_closing_keeps_its_memb
     # Only an admin opens it, its owner included.
     assert send("POST", f"/teams/{team}/open", gus, {"open": True})[0] == 403
     assert send("GET", "/open-teams", hal) == (200, [])
-    # Hal asks to join while it is closed; his request outlives his join below.
+    # Hal asks to join while it is closed; his join below settles it.
     assert send("POST", "/join-requests", hal, {"name": "open team"}) == (200, {"name": "open team", "status": "pending"})
     for _ in range(2):
         assert send("POST", f"/teams/{team}/open", ALICE, {"open": True}) == (200, {"team": team, "open": True})
@@ -1574,7 +1574,7 @@ def test_an_admin_opens_a_team_anyone_listed_joins_it_and_closing_keeps_its_memb
         {"email": gus, "role": "owner"}, {"email": hal, "role": "member"}, {"email": ida, "role": "member"}
     ]
     requests = f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}' ORDER BY email"
-    assert query(name, requests) == [{"email": hal}, {"email": jay}]
+    assert query(name, requests) == [{"email": jay}]
     kinds = "('team_opened', 'team_closed', 'member_joined', 'join_requested')"
     sql = f"SELECT kind, email, actor, channel FROM agent_keys.events WHERE team = '{team}' AND kind IN {kinds} ORDER BY id"
     assert [(r["kind"], r["email"], r["actor"], r["channel"]) for r in query(name, sql)] == [
@@ -1671,6 +1671,72 @@ def test_a_join_that_waits_for_a_closing_finds_the_team_closed_and_files_a_join_
     assert (joined[0], json.loads(joined[1])) == (200, {"team": team, "email": pia, "role": "member", "status": "pending"})
     assert query(name, f"SELECT email FROM agent_keys.members WHERE team = '{team}'") == [{"email": oli}]
     assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": pia}]
+
+
+# What the day's reminders read as a Team's waiting requests (store.run_reminders), on a day nobody runs: `build` raises,
+# which rolls the run back, so no day is recorded and nothing is queued.
+REMINDER_READ = """
+class Read(Exception):
+    pass
+
+
+def build(due):
+    out["waiting"] = [r["email"] for r in due["requests"] if r["team"] == TEAM]
+    raise Read
+
+
+try:
+    await store.run_reminders(datetime(2000, 1, 1).date(), T0, lambda last, ran_before: True, build)
+except Read:
+    pass
+"""
+
+
+def test_no_request_waits_for_someone_in_the_team_and_a_join_settles_an_agents_request_in_postgres(hindsight):
+    name, port, multi = hindsight["name"], hindsight["port"], MCP_ENDPOINTS[0]
+    owner, coowner, member, joiner = (f"settled-{who}-{RUN}@example.test" for who in ("owner", "coowner", "member", "joiner"))
+    for person in (owner, coowner, member, joiner):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    owner_key = personal_key(hindsight, owner)["key"]
+    team = team_page(hindsight, "POST", "/ext/teams", owner, {"name": f"Settled {RUN}"})["team"]
+    team_page(hindsight, "POST", f"/ext/teams/{team}/members", owner, {"email": member, "role": "member"})
+    team_page(hindsight, "POST", f"/ext/teams/{team}/members", owner, {"email": coowner, "role": "owner"})
+    requests = f"SELECT email, role FROM agent_keys.member_requests WHERE team = '{team}' ORDER BY email"
+
+    def waiting():
+        """What the owner's agent counts and lists for the Team, and what the reminders read."""
+        (listed,) = [t for t in call_tool(port, owner_key, multi, "list_teams")["teams"] if t["team"] == team]
+        read = notice_store(name, f"TEAM = {team!r}\n{REMINDER_READ}")["waiting"]
+        return call_tool(port, owner_key, multi, "pending_reviews")["join_requests"], [r["email"] for r in listed["requests"]], read
+
+    # The owner's agent asks for the member and for the owner as members: each is in the Team at that role or above, so
+    # the same reply and nothing filed or recorded. Its request for the joiner is filed.
+    for email in (member, owner, joiner):
+        answer = call_tool(port, owner_key, multi, "add_team_member", team=team, email=email)
+        assert answer == {"team": team, "email": email, "role": "member", "status": "pending"}
+    assert query(name, requests) == [{"email": joiner, "role": "member"}]
+    assert waiting() == (1, [joiner], [joiner])
+    # The joiner joins once an admin opens the Team: the request is settled, and nothing is left to count, list, remind
+    # or decline, so no decline can be announced.
+    assert key_page(hindsight, "POST", f"/ext/teams/{team}/open", ALICE, body={"open": True})[0] == 200
+    assert team_page(hindsight, "POST", f"/ext/teams/{team}/join", joiner, {}) == {"team": team, "email": joiner, "role": "member"}
+    assert query(name, requests) == []
+    assert waiting() == (0, [], [])
+    assert key_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", owner, body={"email": joiner})[0] == 404
+    # Requests an earlier release left for people now in the Team wait for no one either, and answering one decides
+    # nothing, as for no request: no event, and nobody's place changes (the co-owner is not made a member).
+    stale = f"('{team}', '{joiner}', 'member', '{owner}'), ('{team}', '{coowner}', 'member', '{owner}')"
+    query(name, f"INSERT INTO agent_keys.member_requests (team, email, role, requested_by) VALUES {stale} RETURNING email")
+    assert waiting() == (0, [], [])
+    confirm = {"email": coowner, "role": "member"}
+    assert key_page(hindsight, "POST", f"/ext/teams/{team}/confirmations", owner, body=confirm)[0] == 404
+    assert key_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", owner, body={"email": joiner})[0] == 404
+    assert query(name, f"SELECT email, role FROM agent_keys.members WHERE team = '{team}' ORDER BY email") == sorted(
+        [{"email": e, "role": r} for e, r in ((owner, "owner"), (coowner, "owner"), (member, "member"), (joiner, "member"))],
+        key=lambda m: m["email"],
+    )
+    sql = f"SELECT kind, email FROM agent_keys.events WHERE team = '{team}' AND kind ~ '_(requested|confirmed|declined)$' ORDER BY id"
+    assert query(name, sql) == [{"kind": "member_requested", "email": joiner}]
 
 # Webex notices. The container runs without a bot token, so no background sweep competes with these for the queue
 # (the sweep, the messages and the HTTP routes are in tests/unit). They call the store the extension uses, and need
@@ -2187,11 +2253,11 @@ class StopsQueuing(PostgresKeyStore):
 
     calls = 0
 
-    async def queue_notice(self, *args):
+    async def queue_notice(self, *args, **kwargs):
         self.calls += 1
         if self.calls == 2:
             raise Stopped
-        await super().queue_notice(*args)
+        await super().queue_notice(*args, **kwargs)
 
 
 def process(store_class=PostgresKeyStore):
@@ -2318,19 +2384,139 @@ def test_a_warning_goes_only_to_a_key_holder_still_on_the_key_allowlist_in_postg
         hindsight["name"],
         f"""
 listed, removed = {people["own1"]!r}, {people["own2"]!r}
+{KEY_ROWS}
+await add_keys([listed, removed])
 await store.queue_notice([listed, removed], "holder", None, "warning", "/ext/")
 await store.set_role(removed, None)
 out["claims"] = [lines(await store.claim_notice(email, T0, T0 - WINDOW, [])) for email in (listed, removed)]
+# (line, path, kind, team, key): a sign-in window warning, a warning about the key, and a kind the check does not know.
+items = [("w", "/ext/", "holder", None, None), ("w", "/ext/", "holder", None, key_of(listed)), ("w", "/ext/", "unknown", None, None)]
 async with store.notice_lock(listed) as conn:
-    out["listed_now"] = await store.still_eligible(conn, listed, [("w", "/ext/", "holder", None), ("w", "/ext/", "unknown", None)], [])
+    out["listed_now"] = await store.still_eligible(conn, listed, items, [], T0)
 async with store.notice_lock(removed) as conn:
-    out["removed_now"] = await store.still_eligible(conn, removed, [("w", "/ext/", "holder", None)], [])
+    out["removed_now"] = await store.still_eligible(conn, removed, [("w", "/ext/", "holder", None, None)], [], T0)
 """,
     )
     # Removed from the Key Allowlist after the warning was queued: dropped at the claim, and not eligible under the lock.
     assert out["claims"] == [[["warning", "/ext/"]], None]
     # A kind the check does not know is not eligible: it fails closed.
-    assert (out["listed_now"], out["removed_now"]) == ([True, False], [False])
+    assert (out["listed_now"], out["removed_now"]) == ([True, True, False], [False])
+
+
+# Key rows only (no schema is made, and nobody holds their secrets): `add_keys` gives each person a personal key that works
+# at T0, named by `key_of`, expiring 13 days after T0 and created via `via` when given, and a sign-in an hour before T0.
+KEY_ROWS = """
+def key_of(person):
+    return person.split("@")[0].replace("-", "")
+
+
+async def add_keys(people, via=None):
+    conn = await asyncpg.connect(uri)
+    try:
+        for person in people:
+            await conn.execute("INSERT INTO agent_keys.people (email) VALUES ($1) ON CONFLICT DO NOTHING", person)
+            await conn.execute(
+                "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at, via)"
+                " VALUES ($1, $2, 'k', $3, 'p_warned', 'personal', $4, $5)",
+                key_of(person), bytes(32), person, T0 + timedelta(days=13), via,
+            )
+            await conn.execute(
+                "INSERT INTO agent_keys.sign_ins (email, last_seen) VALUES ($1, $2)"
+                " ON CONFLICT (email) DO UPDATE SET last_seen = excluded.last_seen",
+                person, T0 - timedelta(hours=1),
+            )
+    finally:
+        await conn.close()
+"""
+
+
+def test_a_key_warning_goes_out_only_while_its_key_works_in_postgres(hindsight):
+    a, b, c = (f"warned-{who}-{RUN}@example.test" for who in ("a", "b", "c"))
+    for person in (a, b, c):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    out = notice_store(
+        hindsight["name"],
+        f"""
+a, b, c = {a!r}, {b!r}, {c!r}
+people = [a, b, c]
+{KEY_ROWS}
+
+
+class Webex:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, to, text):
+        self.sent.append((to, text))
+
+
+class Racing(PostgresKeyStore):
+    # A store where a's key is revoked, on its own, right after a's notices are claimed: before the final check.
+
+    async def claim_notice(self, recipient, *args):
+        claim = await super().claim_notice(recipient, *args)
+        if claim and recipient == a:
+            await self.revoke_keys(a, T0, key_of(a))
+        return claim
+
+
+await add_keys(people)
+racing, webex = Racing(url), Webex()
+try:
+    # b's key is revoked first, and warnings are queued after: as by a day's run that read the key just before.
+    await racing.revoke_keys(b, T0, key_of(b))
+    for person in people:
+        await racing.queue_notice([person], "holder", None, "key", "/ext/", key_id=key_of(person))
+        await racing.queue_notice([person], "holder", None, "window", "/ext/")
+    await Notices(racing, webex, "keys.example.test", lambda: T0, []).send_due()
+finally:
+    await racing.close()
+out["sent"] = sorted([to, text] for to, text in webex.sent if to in people)
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch(
+        "SELECT recipient, status, detail FROM agent_keys.notice_log WHERE recipient = ANY($1) ORDER BY recipient", people
+    )
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+""",
+    )
+    # c's key works: both warnings go. a's was revoked after the claim: the final check, under a's lock, stops both, as a
+    # holds no other key that works. b's was revoked before its warnings were queued: they are dropped at the claim.
+    assert out["sent"] == [[c, "Hindsight:\n- key\n- window\nSee https://keys.example.test/ext/"]]
+    assert out["log"] == [[a, "skipped", "no longer eligible"], [c, "sent", None]]
+
+
+def test_every_revocation_waits_for_a_message_to_the_holder_in_flight_in_postgres(hindsight):
+    one, own, wp = (f"revoking-{who}-{RUN}@example.test" for who in ("one", "own", "wp"))
+    out = notice_store(
+        hindsight["name"],
+        f"""
+one, own, wp = {one!r}, {own!r}, {wp!r}
+{KEY_ROWS}
+await add_keys([one, own])
+await add_keys([wp], via="ci-delegate")
+
+
+async def waits_for(person, revoke):
+    # Revoke while a message to the person holds their notice lock: [whether the revocation waited for it, how many].
+    async with store.notice_lock(person):
+        task = asyncio.create_task(revoke())
+        await asyncio.sleep(1)
+        waited = not task.done()
+    return [waited, await task]
+
+
+out["one_key"] = await waits_for(one, lambda: store.revoke_keys(one, T0, key_of(one)))
+out["identity"] = await waits_for(own, lambda: store.revoke_keys(own, T0))
+out["kill_switch"] = await waits_for(wp, lambda: store.revoke_workplane_keys(T0))
+""",
+    )
+    # A revocation ends a warning's eligibility, so it waits for a message in flight, as every such change does. Earlier
+    # tests leave other people's WorkPlane keys, which the kill switch takes too.
+    assert (out["one_key"], out["identity"]) == ([True, 1], [True, 1])
+    assert out["kill_switch"][0] is True and out["kill_switch"][1] >= 1
 
 
 def test_the_store_widens_a_notice_queue_an_earlier_release_made_to_take_warnings_in_postgres(hindsight):
@@ -2362,6 +2548,66 @@ finally:
     [(name, check)] = out["after"]
     assert name == "notice_queue_kind_check" and all(f"'{kind}'" in check for kind in ("owner", "admin", "asker", "holder"))
     assert out["queued"] is True
+
+
+def test_the_store_drops_warnings_an_earlier_release_queued_without_their_key_once_in_postgres(hindsight):
+    person = f"upgraded-{RUN}@example.test"
+    out = notice_store(
+        hindsight["name"],
+        f"""
+person = {person!r}
+old, other = "upgradedold{RUN}", "upgradedother{RUN}"
+
+
+class Webex:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, to, text):
+        self.sent.append((to, text))
+
+
+conn = await asyncpg.connect(uri)
+try:
+    # The queue as an earlier release made it, with no key column, holding its warning about the person's old key.
+    await conn.execute("ALTER TABLE agent_keys.notice_queue DROP COLUMN key_id")
+    await conn.execute(
+        "INSERT INTO agent_keys.notice_queue (recipient, kind, line, path) VALUES ($1, 'holder', 'old key', '/ext/')", person
+    )
+    # The person holds two keys that work at T0; the old one is revoked after the warning was queued.
+    await conn.execute("INSERT INTO agent_keys.people (email) VALUES ($1)", person)
+    for key in (old, other):
+        await conn.execute(
+            "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at)"
+            " VALUES ($1, $2, 'k', $3, 'p_upgraded', 'personal', $4)",
+            key, bytes(32), person, T0 + timedelta(days=13),
+        )
+    await conn.execute("INSERT INTO agent_keys.sign_ins (email, last_seen) VALUES ($1, $2)", person, T0 - timedelta(hours=1))
+    await conn.execute("UPDATE agent_keys.keys SET revoked_at = $2 WHERE id = $1", old, T0)
+    # A process starting over it: the store's DDL runs on its first use, then the sweep.
+    webex = Webex()
+    await Notices(store, webex, "keys.example.test", lambda: T0, []).send_due()
+    out["sent"] = [to for to, _ in webex.sent if to == person]
+    out["column"] = await conn.fetchval(
+        "SELECT count(*) FROM information_schema.columns"
+        " WHERE table_schema = 'agent_keys' AND table_name = 'notice_queue' AND column_name = 'key_id'"
+    )
+    # Once only: a warning queued with its key survives the next start.
+    await store.queue_notice([person], "holder", None, "other key", "/ext/", key_id=other)
+    restarted = PostgresKeyStore(url)
+    try:
+        await restarted.queued_recipients()  # its first use runs the DDL again
+    finally:
+        await restarted.close()
+    rows = await conn.fetch("SELECT line, key_id FROM agent_keys.notice_queue WHERE recipient = $1", person)
+    out["after_restart"] = [list(r.values()) for r in rows]
+finally:
+    await conn.close()
+""",
+    )
+    # The old warning names no key, so it would read as a sign-in window warning, which the other key satisfies: dropped.
+    assert out["sent"] == [] and out["column"] == 1
+    assert out["after_restart"] == [["other key", f"upgradedother{RUN}"]]
 
 
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
