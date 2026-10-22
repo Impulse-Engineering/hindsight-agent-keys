@@ -2550,6 +2550,66 @@ finally:
     assert out["queued"] is True
 
 
+def test_the_store_drops_warnings_an_earlier_release_queued_without_their_key_once_in_postgres(hindsight):
+    person = f"upgraded-{RUN}@example.test"
+    out = notice_store(
+        hindsight["name"],
+        f"""
+person = {person!r}
+old, other = "upgradedold{RUN}", "upgradedother{RUN}"
+
+
+class Webex:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, to, text):
+        self.sent.append((to, text))
+
+
+conn = await asyncpg.connect(uri)
+try:
+    # The queue as an earlier release made it, with no key column, holding its warning about the person's old key.
+    await conn.execute("ALTER TABLE agent_keys.notice_queue DROP COLUMN key_id")
+    await conn.execute(
+        "INSERT INTO agent_keys.notice_queue (recipient, kind, line, path) VALUES ($1, 'holder', 'old key', '/ext/')", person
+    )
+    # The person holds two keys that work at T0; the old one is revoked after the warning was queued.
+    await conn.execute("INSERT INTO agent_keys.people (email) VALUES ($1)", person)
+    for key in (old, other):
+        await conn.execute(
+            "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at)"
+            " VALUES ($1, $2, 'k', $3, 'p_upgraded', 'personal', $4)",
+            key, bytes(32), person, T0 + timedelta(days=13),
+        )
+    await conn.execute("INSERT INTO agent_keys.sign_ins (email, last_seen) VALUES ($1, $2)", person, T0 - timedelta(hours=1))
+    await conn.execute("UPDATE agent_keys.keys SET revoked_at = $2 WHERE id = $1", old, T0)
+    # A process starting over it: the store's DDL runs on its first use, then the sweep.
+    webex = Webex()
+    await Notices(store, webex, "keys.example.test", lambda: T0, []).send_due()
+    out["sent"] = [to for to, _ in webex.sent if to == person]
+    out["column"] = await conn.fetchval(
+        "SELECT count(*) FROM information_schema.columns"
+        " WHERE table_schema = 'agent_keys' AND table_name = 'notice_queue' AND column_name = 'key_id'"
+    )
+    # Once only: a warning queued with its key survives the next start.
+    await store.queue_notice([person], "holder", None, "other key", "/ext/", key_id=other)
+    restarted = PostgresKeyStore(url)
+    try:
+        await restarted.queued_recipients()  # its first use runs the DDL again
+    finally:
+        await restarted.close()
+    rows = await conn.fetch("SELECT line, key_id FROM agent_keys.notice_queue WHERE recipient = $1", person)
+    out["after_restart"] = [list(r.values()) for r in rows]
+finally:
+    await conn.close()
+""",
+    )
+    # The old warning names no key, so it would read as a sign-in window warning, which the other key satisfies: dropped.
+    assert out["sent"] == [] and out["column"] == 1
+    assert out["after_restart"] == [["other key", f"upgradedother{RUN}"]]
+
+
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
     # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.

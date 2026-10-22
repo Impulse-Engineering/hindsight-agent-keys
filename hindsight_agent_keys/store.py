@@ -199,8 +199,18 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.reminder_runs (
 ALTER TABLE {SCHEMA}.notice_queue DROP CONSTRAINT IF EXISTS notice_queue_kind_check,
     ADD CONSTRAINT notice_queue_kind_check CHECK (kind IN ('owner', 'admin', 'asker', 'holder'));
 -- The key a 'holder' warning is about, which must still work for it to be sent; NULL for a sign-in window warning, which
--- needs any key of the holder's that works.
-ALTER TABLE {SCHEMA}.notice_queue ADD COLUMN IF NOT EXISTS key_id text;
+-- needs any key of the holder's that works. Added once, under the table's lock so a concurrent start waits and then finds
+-- it: a warning an earlier release queued names no key, and would read as a sign-in window warning, so the run that adds
+-- the column drops every warning then queued, unsent (its key cannot be known, and the day's runs warn of a key once).
+DO $$
+BEGIN
+    LOCK TABLE {SCHEMA}.notice_queue IN ACCESS EXCLUSIVE MODE;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = '{SCHEMA}.notice_queue'::regclass
+                   AND attname = 'key_id' AND NOT attisdropped) THEN
+        ALTER TABLE {SCHEMA}.notice_queue ADD COLUMN key_id text;
+        DELETE FROM {SCHEMA}.notice_queue WHERE kind = 'holder';
+    END IF;
+END $$;
 """
 
 
