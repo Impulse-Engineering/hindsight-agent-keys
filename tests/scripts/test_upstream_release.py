@@ -16,7 +16,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 IMAGE = "ghcr.io/vectorize-io/hindsight"
 PINNED = f"{IMAGE}:0.10.3@sha256:{'b' * 64}"
 DIGEST = f"sha256:{'a' * 64}"
-DOCKERFILE = f"FROM {PINNED}\n\nCOPY hindsight_agent_keys /app/extensions/hindsight_agent_keys\n"
+# Both images build on the one pinned base stage, so one bump moves both.
+DOCKERFILE = f"FROM {PINNED} AS base\n\nFROM base AS ui\n\nFROM base\nCOPY hindsight_agent_keys /app/extensions/hindsight_agent_keys\n"
 GIT_ENV = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_NOSYSTEM": "1",
