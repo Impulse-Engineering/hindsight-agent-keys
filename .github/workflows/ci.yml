@@ -8,7 +8,7 @@ on:
   schedule:
     - cron: "23 7 * * *"
 
-# Every job starts read-only. publish adds packages: write, scan-alert adds issues: write, and verify-published adds packages: read.
+# Every job starts read-only; a job that needs more (publish, verify-published, scan-alert) lists it in its own permissions block.
 permissions:
   contents: read
 
