@@ -1004,9 +1004,12 @@ def test_the_kill_switch_revokes_every_key_created_via_workplane_and_no_other(hi
     assert http(port, "POST", f"/ext/delegated/keys/{earlier}/revoke", body={}, headers=sent)[0] == 200
     revoked_at = f"SELECT revoked_at::text AS at FROM agent_keys.keys WHERE id = '{earlier}'"
     before = query(name, revoked_at)
+    # Earlier tests in this container leave other people's WorkPlane keys active; the kill switch takes them all.
+    active = query(name, "SELECT count(*)::int AS n FROM agent_keys.keys WHERE via IS NOT NULL AND revoked_at IS NULL")[0]["n"]
+    assert active >= 1
     ip = "203.0.113.83"
     status, text = key_page(hindsight, "POST", "/ext/admin/revoke-workplane-keys", ALICE, body={}, headers={"X-Real-IP": ip})
-    assert (status, json.loads(text)) == (200, {"revoked": 1}), text
+    assert (status, json.loads(text)) == (200, {"revoked": active}), text
     assert query(name, revoked_at) == before
     assert [http(port, "GET", "/v1/default/banks", key=k)[0] for k in (own, workplane)] == [200, 401]
     run = run_doc(name, doc_block("docs/operating.md", "where via is not null and revoked_at is null"), "")
