@@ -45,6 +45,9 @@ SIGN_IN_WINDOW = timedelta(days=30)
 # Roles on the Key Allowlist that may create keys; 'requested' may not.
 LISTED = ("member", "admin")
 
+# A Join Request left waiting this long is counted for every admin, not only the Team's owners.
+ADMIN_REVIEW_AFTER = timedelta(days=7)
+
 # Keys created via WorkPlane, per person, apart from their own (store.ACTIVE_KEYS, store.CREATIONS_PER_HOUR).
 # Defaults of the settings HINDSIGHT_API_TENANT_WORKPLANE_ACTIVE_KEYS and ..._WORKPLANE_KEYS_PER_HOUR. An hour may
 # fill the whole cap, so onboarding into many Teams at once is never held up; the rate still bounds a
@@ -671,12 +674,14 @@ class AgentKeysTenantExtension(TenantExtension):
     async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
         return HindsightConfig.get_configurable_fields() - DENIED_BANK_FIELDS
 
-    # --- #1004 ---
+    # --- pending_reviews (#1004) ---
 
     async def pending_reviews(self, email: str) -> dict:
         """What waits for the person to review, as counts only, so no user-written text reaches an agent: the requests
-        to join the Teams they own (every Team, for an admin) and, for an admin, the Key Allowlist requests. Carries
-        the Teams page's link when the key pages are on."""
-        joins, access = await self._store.pending_review_counts(email, admin=await self.role(email) == "admin")
+        to join the Teams they own and, for an admin, those for any other Team left waiting more than
+        ADMIN_REVIEW_AFTER, and the Key Allowlist requests. Carries the Teams page's link when the key pages are on."""
+        joins, access = await self._store.pending_review_counts(
+            email, admin=await self.role(email) == "admin", older_than=self._clock() - ADMIN_REVIEW_AFTER
+        )
         link = {"link": f"https://{self.access_host}/ext/teams"} if self.access_host else {}
         return {"join_requests": joins, "access_requests": access, **link}

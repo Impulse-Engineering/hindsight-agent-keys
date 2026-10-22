@@ -78,6 +78,7 @@ class MemoryStore:
         self.team_roles = {}  # (team, email) -> "owner" | "member"
         self.creators = {}  # team -> email
         self.requests = {}  # (team, email) -> (role, requested_by)
+        self.requested_at = {}  # (team, email) -> when the open request was filed; asking again keeps it
         # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
         self.stale = []
         self.fail = False
@@ -121,6 +122,7 @@ class MemoryStore:
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
         # A direct add settles the person's open request.
         self.requests.pop((team, email), None)
+        self.requested_at.pop((team, email), None)
         return had
 
     async def remove_member(self, team, email):
@@ -131,11 +133,13 @@ class MemoryStore:
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)
         self.requests[team, email] = (role, by)
+        self.requested_at.setdefault((team, email), datetime.now(UTC))
 
     async def add_join_request(self, team, email, role):
         if team not in self.teams_by_schema or (team, email) in self.team_roles or (team, email) in self.requests:
             return False
         self.requests[team, email] = (role, email)
+        self.requested_at[team, email] = datetime.now(UTC)
         return True
 
     async def confirm_member(self, team, email, role):
@@ -147,6 +151,7 @@ class MemoryStore:
     async def decline_member(self, team, email):
         self._change_members(team, lambda roles: None)
         role, _ = self.requests.pop((team, email), (None, None))
+        self.requested_at.pop((team, email), None)
         return role
 
     async def member_requests(self, team):
@@ -290,10 +295,13 @@ class MemoryStore:
             key["revoked_at"] = now
         return len(hits)
 
-    # --- #1004 ---
+    # --- pending_reviews (#1004) ---
 
-    async def pending_review_counts(self, email, *, admin):
-        joins = sum(admin or self.team_roles.get((team, email)) == "owner" for team, _ in self.requests)
+    async def pending_review_counts(self, email, *, admin, older_than):
+        joins = sum(
+            self.team_roles.get((team, email)) == "owner" or (admin and self.requested_at[team, asker] < older_than)
+            for team, asker in self.requests
+        )
         return joins, sum(admin and role == "requested" for role in self.roles.values())
 
 

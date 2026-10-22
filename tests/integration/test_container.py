@@ -660,26 +660,40 @@ def test_agents_manage_teams_over_both_mcp_endpoints_but_only_an_owner_lets_anyo
     ]
 
 
-def test_pending_reviews_counts_the_owners_teams_and_only_an_admin_sees_every_team_and_the_allowlist_requests(
+def test_pending_reviews_counts_the_owners_teams_and_an_admin_also_hears_of_old_requests_and_the_allowlist_requests(
     hindsight, two_people
 ):
-    port, multi = hindsight["port"], MCP_ENDPOINTS[0]
-    pia, quin = "pia@example.test", "quin@example.test"
-    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": pia, "role": "member"})[0] == 204
-    pia_key = personal_key(hindsight, pia)["key"]
-    before = call_tool(port, two_people[ALICE], multi, "pending_reviews")
-    team = call_tool(port, pia_key, multi, "create_team", name="Pia Team")["team"]
-    # An admin files a request for Pia's Team, and Quin asks for a place on the Key Allowlist.
+    name, port, multi = hindsight["name"], hindsight["port"], MCP_ENDPOINTS[0]
+    ned, quin = "ned@example.test", "quin@example.test"
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": ned, "role": "member"})[0] == 204
+    ned_key, erin_key = personal_key(hindsight, ned)["key"], personal_key(hindsight, ERIN)["key"]
+    link = f"https://{ACCESS_HOST}/ext/teams"
+
+    def reviews(key):
+        return call_tool(port, key, multi, "pending_reviews")
+
+    def age(days):
+        query(name, f"UPDATE agent_keys.member_requests SET requested_at = now() - interval '{days} days' WHERE team = '{team}' RETURNING email")
+
+    before = reviews(two_people[ALICE])
+    team = call_tool(port, ned_key, multi, "create_team", name="Ned Team")["team"]
+    # An admin files a request for Ned's Team, and Quin asks for a place on the Key Allowlist.
     call_tool(port, two_people[ALICE], multi, "add_team_member", team=team, email=ERIN)
     assert key_page(hindsight, "POST", "/ext/access-requests", quin, body={})[0] == 204
-    # Pia, no admin, owns one Team with one request: the requests for other Teams, and Quin's, are not hers.
-    link = f"https://{ACCESS_HOST}/ext/teams"
-    assert call_tool(port, pia_key, multi, "pending_reviews") == {"join_requests": 1, "access_requests": 0, "link": link}
-    assert call_tool(port, two_people[ALICE], multi, "pending_reviews") == {
-        "join_requests": before["join_requests"] + 1,
-        "access_requests": before["access_requests"] + 1,
-        "link": link,
-    }
+    # Ned, no admin, owns the Team: the request is for Ned to review, and Quin's is not. It is new, so not yet Alice's.
+    assert reviews(ned_key) == {"join_requests": 1, "access_requests": 0, "link": link}
+    assert reviews(two_people[ALICE]) == {**before, "access_requests": before["access_requests"] + 1}
+    # Alice, an admin, hears of a request for a Team that is not hers once it has waited more than 7 days.
+    age(6)
+    assert reviews(two_people[ALICE]) == {**before, "access_requests": before["access_requests"] + 1}
+    age(8)
+    old = {**before, "join_requests": before["join_requests"] + 1, "access_requests": before["access_requests"] + 1}
+    assert reviews(two_people[ALICE]) == old
+    # Asking again, as the person and as an owner changing the role, leaves the request as old as it was.
+    call_tool(port, erin_key, multi, "request_to_join_team", name="Ned Team")
+    call_tool(port, ned_key, multi, "add_team_member", team=team, email=ERIN, role="owner")
+    assert reviews(two_people[ALICE]) == old
+    assert reviews(ned_key)["join_requests"] == 1
 
 
 @pytest.mark.parametrize("path", MCP_ENDPOINTS)
