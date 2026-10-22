@@ -33,6 +33,7 @@ from hindsight_api.pg0 import resolve_database_url
 
 from hindsight_agent_keys.access import AccessVerifier
 from hindsight_agent_keys.events import EventLog, PostgresEventLog, RateLimit, Throttle
+from hindsight_agent_keys.notices import Notice, Notices, Webex, WebexClient, plain
 from hindsight_agent_keys.store import PostgresKeyStore, Refused
 
 PUBLIC_SCHEMA = "public"
@@ -190,6 +191,7 @@ class AgentKeysTenantExtension(TenantExtension):
         clock: Callable[[], datetime] | None = None,
         events: EventLog | None = None,
         store: PostgresKeyStore | None = None,
+        webex: Webex | None = None,
     ):
         super().__init__(config)
         legacy = config.get("legacy_key") or ""
@@ -225,6 +227,11 @@ class AgentKeysTenantExtension(TenantExtension):
         self._clock = clock or _now
         self._events = events if events is not None else PostgresEventLog()
         self._store = store if store is not None else PostgresKeyStore(self._db_url)
+        # Webex notices go out only with the bot token and the key pages' hostname, which their links name.
+        token = (config.get("webex_bot_token") or "").strip()
+        self.notices = None
+        if token and self.access_host:
+            self.notices = Notices(self._store, webex or WebexClient(token), self.access_host, self._clock, self.bootstrap_admins)
         self._tenants: list[Tenant] | None = None
         # Refusal rows are bounded twice: one a minute per client, and at most
         # 60 a minute in total, so unauthenticated callers cannot grow the log.
@@ -239,8 +246,12 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def on_startup(self) -> None:
         await self._events.start(self.context.get_memory_engine().db_url)
+        if self.notices:
+            self.notices.start()
 
     async def on_shutdown(self) -> None:
+        if self.notices:
+            await self.notices.stop()
         await self._events.stop()
         await self._store.close()
 
@@ -292,6 +303,7 @@ class AgentKeysTenantExtension(TenantExtension):
         """Ask the admins to add a signed-in person; does nothing if they already have a role."""
         if await self.role(email) is None and await self._store.add_request(email):
             await self._record("access_requested", NO_KEY_ID, client_ip, email, email)
+            await self._notify(partial(self._access_requested_notice, email))
 
     async def set_role(self, admin: str, email: str, role: str | None, client_ip: str | None) -> None:
         """An admin makes the person a 'member' or an 'admin' of the Key Allowlist, or removes them (None)."""
@@ -302,6 +314,8 @@ class AgentKeysTenantExtension(TenantExtension):
         old = await self._store.set_role(email, role)
         if old != role:
             await self._record(_role_change(old, role), NO_KEY_ID, client_ip, email, admin)
+            if old == "requested":
+                await self._notify(partial(self._access_decided_notice, email, role))
 
     async def stale_schemas(self) -> list:
         """Personal schemas no valid key has reached for 90 days: schema, owner's email and
@@ -514,6 +528,7 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._require_allowlisted(email)
         if team is not None and await self._store.add_join_request(team, email, role):
             await self._record("join_requested", NO_KEY_ID, client_ip, email, email, team=team)
+            await self._notify(partial(self._join_requested_notice, email, team, role))
 
     async def set_member(
         self, email: str, team: str, member: str, role: str, client_ip: str | None, *, delegated_repeat: bool = False
@@ -526,9 +541,11 @@ class AgentKeysTenantExtension(TenantExtension):
             await self._ask_to_join(email, team, role, client_ip)
             return False
         await self._require_manager(email, team)
-        had = await self._store.set_member(team, member, role)
+        had, asker = await self._store.set_member(team, member, role)
         if not (delegated_repeat and had == role):
             await self._record(f"{role}_added", NO_KEY_ID, client_ip, member, email, team=team)
+        if asker is not None:
+            await self._notify(partial(self._request_decided_notice, team, member, asker, email, "confirmed"))
         return True
 
     async def remove_member(self, email: str, team: str, member: str, client_ip: str | None, *, delegated_repeat: bool = False) -> None:
@@ -548,6 +565,7 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._require_manager(email, team)
         await self._store.request_member(team, member, role, email)
         await self._record(f"{role}_requested", NO_KEY_ID, client_ip, member, email, team=team)
+        await self._notify(partial(self._member_requested_notice, email, team, member, role))
 
     async def confirm_member(
         self, email: str, team: str, member: str, role: str, client_ip: str | None, *, delegated_repeat: bool = False
@@ -569,14 +587,16 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def _answer_request(self, email, team, member, client_ip, answer, outcome, shown=None, delegated_repeat=False) -> None:
         await self._require_manager(email, team)
-        role = await answer(team, member)
-        if role is None:
+        answered = await answer(team, member)  # (the role asked for, who asked), from the decision's own transaction
+        if answered is None:
             if delegated_repeat and (shown is None or await self._store.team_role(team, member) == shown):
                 return
             raise Refused(404, "Nobody asked to add that person to the Team.")
+        role, asker = answered
         if shown not in (None, role):
             raise Refused(409, f"That request now asks for {role}; reload the page.")
         await self._record(f"{role}_{outcome}", NO_KEY_ID, client_ip, member, email, team=team)
+        await self._notify(partial(self._request_decided_notice, team, member, asker, email, outcome))
 
     def _is_legacy(self, key: str) -> bool:
         return bool(key) and self._legacy_digest is not None and hmac.compare_digest(_digest(key), self._legacy_digest)
@@ -670,3 +690,59 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
         return HindsightConfig.get_configurable_fields() - DENIED_BANK_FIELDS
+
+    # --- #1005 ---
+
+    async def webex_notices(self, email: str) -> bool | None:
+        """Whether Webex notices to the person are on (they are, unless the person turned them off); None where they
+        are not set up."""
+        return None if self.notices is None else await self._store.notices_enabled(email)
+
+    async def set_webex_notices(self, email: str, enabled: bool) -> None:
+        """Turn the person's Webex notices on or off. Off waits for a message to them in flight, so after it nothing is sent."""
+        if self.notices is None:
+            raise Refused(404, "Webex notices are not set up.")
+        try:
+            await self._store.set_notices_enabled(email, enabled)
+        except TimeoutError:
+            raise Refused(503, "A message to you is being sent; try again in a moment.") from None
+
+    async def _notify(self, build) -> None:
+        """Queue the notice that `build()` makes, after the change it announces is stored; see Notices.tell."""
+        if self.notices is not None:
+            await self.notices.tell(build)
+
+    async def _team_name(self, team: str) -> str:
+        return plain(await self._store.team_name(team) or "")
+
+    async def _listed_owners(self, team: str, *, but: str | None = None) -> list[str]:
+        """The Team's owners who are on the Key Allowlist, so can answer a request; owners who are off it are not told."""
+        members = await self._store.members(team)
+        return [m["email"] for m in members if m["role"] == "owner" and m["email"] != but and await self.role(m["email"]) in LISTED]
+
+    async def _access_requested_notice(self, email: str) -> Notice:
+        admins = [e for e, role in await self.allowlist() if role == "admin"]
+        return Notice("admin", admins, f"{plain(email)} asked to be added to the Key Allowlist.", "/ext/admin")
+
+    async def _access_decided_notice(self, email: str, role: str | None) -> Notice:
+        what = "declined your request to join" if role is None else "added you to"
+        line = f"An admin {what} the Key Allowlist." + ("" if role is None else " You can create Agent Keys now.")
+        return Notice("asker", [email], line, "/ext/")
+
+    async def _join_requested_notice(self, email: str, team: str, role: str) -> Notice:
+        asked = " as an owner" if role == "owner" else ""
+        line = f'{plain(email)} asked to join your Team "{await self._team_name(team)}"{asked}.'
+        return Notice("owner", await self._listed_owners(team), line, "/ext/teams", team)
+
+    async def _member_requested_notice(self, filer: str, team: str, member: str, role: str) -> Notice:
+        """An owner or an admin asked for someone else to join: the Team's other owners are told."""
+        asked = " as an owner" if role == "owner" else ""
+        line = f'{plain(filer)} asked to add {plain(member)} to your Team "{await self._team_name(team)}"{asked}.'
+        return Notice("owner", await self._listed_owners(team, but=filer), line, "/ext/teams", team)
+
+    async def _request_decided_notice(self, team: str, member: str, asker: str, actor: str, outcome: str) -> Notice:
+        """Tells whoever asked, unless they decided it themselves."""
+        decided = "approved" if outcome == "confirmed" else "declined"
+        asked = "to join" if asker == member else f"to add {plain(member)} to"
+        line = f'Your request {asked} the Team "{await self._team_name(team)}" was {decided}.'
+        return Notice("asker", [] if asker == actor else [asker], line, "/ext/teams")

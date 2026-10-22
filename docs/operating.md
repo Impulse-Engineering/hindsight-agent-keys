@@ -120,6 +120,38 @@ The app ran stock upstream with one key in `HINDSIGHT_CP_DATAPLANE_API_KEY`. Kee
 3. **The image.** `platform_update_app container_image=ghcr.io/impulse-engineering/hindsight-ui@sha256:<digest>`, with the digest `verify-published` passed. This revokes the old approval; the running container keeps serving. Then `platform_approve_image` (platform admin), which deploys it: wait as in [cutover.md](cutover.md), step 2.4. The hostnames keep the same Access application throughout, so nothing opens. A refused start leaves the app down, not open; fix what its log names.
 4. **Check** that each hostname lists the Public Team's banks, then add the other Teams as above. `HINDSIGHT_CP_DATAPLANE_API_KEY` is no longer read; delete it once the image has run without needing to go back. Leave `HINDSIGHT_ENABLE_API` at `false`, or delete it so the image's own `false` applies, and never set it to anything else: upstream's launcher reads it, and the image relies on it to start no API.
 
+## Webex notices
+
+The extension sends Webex direct messages from a bot: to a Team's owners on the Key Allowlist when someone asks to join (or an agent asks for someone to join), to the admins when someone asks for the Key Allowlist, and to the person who asked when their request is decided (README, "Webex notices", has the rules and what an interruption leaves). They are best effort and the pages stay the source of truth, so nothing here is needed for Hindsight to work.
+
+**Setting up** *(not verified)*:
+
+1. **Create the bot** (a Webex developer account in the organization). On developer.webex.com create a bot (**My Webex Apps**, **Create a New App**, **Create a Bot**): its name, username and icon are what people see in their Webex app. The page then shows the bot's access token once. Copy it into the password manager entry for the app; do not paste it into a terminal or a chat. Note the expiry the bot's page shows for the token. If it shows one within a year, add a renewal reminder for the date.
+2. **Set the secret.** `HINDSIGHT_API_TENANT_WEBEX_BOT_TOKEN` is a secret like the pepper: Conductor keeps it in the app's `.env` on the CT, and the image itself holds no `.env` (README, "Startup guard"). Register it with `platform_request_secret`, then set it as [cutover.md](cutover.md), step 4.3, sets the pepper, so the value comes from a file and never appears in a terminal or a chat; trash the file afterwards and empty the Trash. Setting it restarts the app. **Auth state:** down during the restart, then the same image and extension, so nothing opens. The three `ACCESS` settings must be set too (README, "Configuration"); without them nothing is sent.
+3. **Check once on Dev** with a test person who has never messaged the bot: have them ask to join a Team they are not in, or ask for the Key Allowlist, and see the message arrive in their Webex app. It passes on HTTP 200 (`sent` in the send log below) and the message shown in their Webex app. Whether a bot may message a person by email before that person has messaged it is exactly what this checks. Fill in the table below.
+
+**Dev check and token record.** Fill in a row when the check runs, and again each time the token is regenerated.
+
+| Date | Who ran it | Result: HTTP status, and whether the message showed in Webex | Token expiry the bot's page showed |
+| --- | --- | --- | --- |
+| *(not yet run)* | | | |
+
+**Renewing the token.** Before the date in the reminder, regenerate the token on the bot's page and set the secret again as in step 2. Until it is set, messages fail with `HTTP 401` in the send log and nobody is told anything; the pages are unaffected.
+
+**Reading the send log** from the CT: one row per message, newest first, with the person, how many notices it held, `sent`, `failed` or `sending`, and why it failed *(not verified on Dev; runs in the integration tests)*:
+
+```sh
+# CT
+pg psql -X -d hindsight -Atc 'select at, recipient, items, status, detail from agent_keys.notice_log order by id desc limit 20'
+```
+
+- `skipped` means the person turned notices off while their message was being claimed; nothing was sent.
+- `failed` with `HTTP 401` is a wrong or expired token; `HTTP 429, retry after N s` is a rate limit; any other `HTTP` status comes with Webex's reason, such as a person it cannot find by that email. The notices in a failed message are not sent again.
+- `sending` for more than a minute means the process stopped between claiming the message and recording its outcome. The person may or may not have the message, and nothing sends it again; the pages show the request.
+- No row at all for a person who should have been told: they turned notices off, the change was stored but its notice could not be queued (the logs say `agent-keys: could not queue a Webex notice`), or the token is unset.
+
+**People turn them off** with the switch on `/ext/`; there is no admin switch. The pages and the MCP tools are the same either way.
+
 ## Stale personal schemas
 
 `/ext/admin` lists each personal schema that no valid key has reached for 90 days. Nothing is deleted on its own. To purge one, follow the README, ["Stale personal schemas"](../README.md#stale-personal-schemas): take a backup first ([cutover.md](cutover.md), step 1), copy `scripts/purge-schema.sql` onto the CT, and run it for one schema at a time. If it stops after `Unlisted`, read its last error: `no rows returned for \gset` means the schema is in use again and nothing was dropped; any other error means follow the README's recovery, which puts the schema back on the list only if it still exists, then run the script again. If the recovery returns no row because the schema is gone, the purge is done.

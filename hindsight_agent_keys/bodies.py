@@ -43,6 +43,10 @@ class Identity(BaseModel):
     email: Email
 
 
+class NoticePreference(BaseModel):
+    enabled: bool  # whether Webex notices to the person are on
+
+
 async def _or_refused(change: Awaitable):
     """The change's result; a refusal becomes its HTTP status with the reason as detail."""
     try:
