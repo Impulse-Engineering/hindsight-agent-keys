@@ -432,8 +432,8 @@ class AgentKeysTenantExtension(TenantExtension):
         raise Refused(404, "You hold no unrevoked key with that ID.")
 
     async def revoke_identity(self, admin: str, email: str, client_ip: str | None) -> int:
-        """Revoke every key the person holds; returns how many. Admins only. Recorded only when it revoked
-        a key, so a repeat records nothing."""
+        """Revoke every key the person holds, and drop the key warnings queued for them; returns how many. Admins only.
+        Recorded only when it revoked a key, so a repeat records nothing."""
         if await self.role(admin) != "admin":
             raise Refused(403, "Only an admin can revoke an identity.")
         revoked = await self._store.revoke_keys(email, self._clock())
@@ -442,8 +442,8 @@ class AgentKeysTenantExtension(TenantExtension):
         return revoked
 
     async def revoke_workplane_keys(self, admin: str, client_ip: str | None) -> int:
-        """The kill switch: revoke every key created via WorkPlane, whoever holds it; returns how many.
-        Admins only, on the /ext admin pages; no Delegated Request reaches it."""
+        """The kill switch: revoke every key created via WorkPlane, whoever holds it, and drop the key warnings queued for
+        its holders; returns how many. Admins only, on the /ext admin pages; no Delegated Request reaches it."""
         if await self.role(admin) != "admin":
             raise Refused(403, "Only an admin can revoke the keys created via WorkPlane.")
         revoked = await self._store.revoke_workplane_keys(self._clock())

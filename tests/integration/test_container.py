@@ -2390,6 +2390,61 @@ async with store.notice_lock(removed) as conn:
     assert (out["listed_now"], out["removed_now"]) == ([True, False], [False])
 
 
+def test_revoking_an_identity_or_every_workplane_key_drops_the_holders_queued_warnings_under_their_lock_in_postgres(hindsight):
+    wp, own, other = (f"revoked-{who}-{RUN}@example.test" for who in ("wp", "own", "other"))
+    out = notice_store(
+        hindsight["name"],
+        f"""
+wp, own, other = {wp!r}, {own!r}, {other!r}
+people = [wp, own, other]
+conn = await asyncpg.connect(uri)
+# Rows only: no schema is made, and nobody holds the keys' secrets. Only wp's key was created via WorkPlane.
+for person, via in ((wp, "ci-delegate"), (own, None), (other, None)):
+    await conn.execute("INSERT INTO agent_keys.people (email) VALUES ($1)", person)
+    await conn.execute(
+        "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at, via)"
+        " VALUES ($1, $2, 'k', $3, 'p_revoked', 'personal', $4, $5)",
+        person.split("@")[0].replace("-", ""), bytes(32), person, T0 + timedelta(days=13), via,
+    )
+await store.queue_notice(people, "holder", None, "renew", "/ext/")
+await store.queue_notice([wp], "asker", None, "decided", "/ext/teams")
+
+
+async def queued():
+    rows = await conn.fetch(
+        "SELECT recipient, kind FROM agent_keys.notice_queue WHERE recipient = ANY($1) ORDER BY recipient, kind", people
+    )
+    return [[r["recipient"], r["kind"]] for r in rows]
+
+
+async def waits_for(person, revoke):
+    \"\"\"Revoke while a message to the person holds their notice lock: (whether the revocation waited for it, how many).\"\"\"
+    async with store.notice_lock(person):
+        task = asyncio.create_task(revoke())
+        await asyncio.sleep(1)
+        waited = not task.done()
+    return [waited, await task]
+
+
+out["kill_switch"] = await waits_for(wp, lambda: store.revoke_workplane_keys(T0))
+out["after_kill_switch"] = await queued()
+out["identity"] = await waits_for(own, lambda: store.revoke_keys(own, T0))
+out["after_identity"] = await queued()
+out["unrevoked"] = await conn.fetchval(
+    "SELECT array_agg(email) FROM agent_keys.keys WHERE email = ANY($1) AND revoked_at IS NULL", people
+)
+await conn.close()
+""",
+    )
+    # Each waited for the message in flight, then revoked and dropped the warnings of the people whose keys it revoked;
+    # other notices stay. Earlier tests leave other people's WorkPlane keys, which the kill switch takes too.
+    assert out["kill_switch"][0] is True and out["kill_switch"][1] >= 1
+    assert out["after_kill_switch"] == [[other, "holder"], [own, "holder"], [wp, "asker"]]
+    assert out["identity"] == [True, 1]
+    assert out["after_identity"] == [[other, "holder"], [wp, "asker"]]
+    assert out["unrevoked"] == [other]
+
+
 def test_the_store_widens_a_notice_queue_an_earlier_release_made_to_take_warnings_in_postgres(hindsight):
     person = f"widened-{RUN}@example.test"
     out = notice_store(

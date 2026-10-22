@@ -205,7 +205,7 @@ class AgentKeysHttpExtension(HttpExtension):
         @admin_router.post("/revoke-workplane-keys")
         async def revoke_workplane_keys(request: Request, email: str = Depends(admin)):
             """The kill switch for WorkPlane's retain and recall. Here only: no Delegated Request reaches it."""
-            return {"revoked": await memory.tenant_extension.revoke_workplane_keys(email, client_ip(request.headers))}
+            return {"revoked": await _or_refused(memory.tenant_extension.revoke_workplane_keys(email, client_ip(request.headers)))}
 
         # Open Teams (#1002)
 

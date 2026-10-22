@@ -567,17 +567,21 @@ class PostgresKeyStore:
     async def revoke_keys(
         self, email: str, now: datetime, key_id: str | None = None, *, via_workplane: bool = False
     ) -> int:
-        """Revoke one of the person's keys, or with no key ID all of them; returns how many."""
+        """Revoke one of the person's keys, or with no key ID all of them; returns how many. Revoking all of them also drops
+        the warnings queued for the person (`_drop_key_warnings`)."""
         pool = await self._get_pool()
-        rows = await pool.fetch(
-            f"UPDATE {SCHEMA}.keys SET revoked_at = $2"
-            " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) AND (NOT $4::boolean OR via IS NOT NULL)"
-            " RETURNING id",
-            email,
-            now,
-            key_id,
-            via_workplane,
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            if key_id is None:
+                await self._drop_key_warnings(conn, [email])
+            rows = await conn.fetch(
+                f"UPDATE {SCHEMA}.keys SET revoked_at = $2"
+                " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) AND (NOT $4::boolean OR via IS NOT NULL)"
+                " RETURNING id",
+                email,
+                now,
+                key_id,
+                via_workplane,
+            )
         return len(rows)
 
     async def last_sign_in(self, email: str) -> datetime | None:
@@ -621,11 +625,15 @@ class PostgresKeyStore:
             await conn.close()
 
     async def revoke_workplane_keys(self, now: datetime) -> int:
-        """Revoke every unrevoked key created via WorkPlane, whoever holds it; returns how many."""
+        """Revoke every unrevoked key created via WorkPlane, whoever holds it, and drop the warnings queued for its holders
+        (`_drop_key_warnings`); returns how many."""
         pool = await self._get_pool()
-        rows = await pool.fetch(
-            f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            holders = await conn.fetch(f"SELECT DISTINCT email FROM {SCHEMA}.keys WHERE via IS NOT NULL AND revoked_at IS NULL")
+            await self._drop_key_warnings(conn, [r["email"] for r in holders])
+            rows = await conn.fetch(
+                f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
+            )
         return len(rows)
 
     # --- #1002 ---
@@ -838,7 +846,8 @@ class PostgresKeyStore:
     async def _lock_notices(self, conn: asyncpg.Connection, email: str) -> None:
         """Take the person's notice lock until the transaction on `conn` ends. Every change that can end someone's eligibility
         for a notice (a removal or a role change in a Team, a role change on the Key Allowlist) calls this before it changes
-        anything, so it waits for a message to them in flight and a message whose final check comes after the commit sees it.
+        anything, so it waits for a message to them in flight and a message whose final check comes after the commit sees it;
+        so does a revocation that drops their queued warnings (`_drop_key_warnings`).
         It takes the lock on the transaction's own connection, first, so a change holds one pool connection while it waits
         and never waits for a second while it holds the lock.
         Polls, as notice_lock does; Refused(503) if the message does not finish within NOTICE_LOCK_WAIT seconds."""
@@ -848,6 +857,17 @@ class PostgresKeyStore:
             if loop.time() >= deadline:
                 raise Refused(503, "A message to that person is being sent; try again in a moment.")
             await asyncio.sleep(NOTICE_LOCK_POLL)
+
+    async def _drop_key_warnings(self, conn: asyncpg.Connection, emails: list[str]) -> None:
+        """Drop the warnings queued for these people (their 'holder' notices), in the transaction on `conn` that revokes their
+        keys, so none asks them afterwards to renew a key that no longer works. Takes each one's notice lock first, in order
+        (`_lock_notices`), so a message to them in flight is sent before the revocation commits. shortcut: a message claimed
+        just before, whose final check comes after, still goes out (a holder's eligibility is their place on the Key
+        Allowlist, which a revocation keeps), and the queue does not say which key a warning is about, so the kill switch
+        also drops a warning about a holder's own key; make a warning name its key if either matters."""
+        for email in sorted(set(emails)):
+            await self._lock_notices(conn, email)
+        await conn.execute(f"DELETE FROM {SCHEMA}.notice_queue WHERE kind = 'holder' AND recipient = ANY($1::text[])", emails)
 
     async def notices_enabled(self, email: str, conn: asyncpg.Connection | None = None) -> bool:
         """Whether the person has not turned notices off; on `notice_lock`'s connection when the sender holds the lock."""
