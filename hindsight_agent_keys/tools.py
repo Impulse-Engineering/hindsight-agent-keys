@@ -4,8 +4,8 @@ Upstream registers these on both MCP servers, multi-bank (/mcp/) and single-bank
 (/mcp/<bank>/), each with its own instance and no context, so this class holds no
 state and reaches everything through the tenant extension. Only a personal Agent Key
 may use them, and adding someone, or asking to join a Team, only files a request that an owner on the Key Allowlist,
-or an admin, confirms on the Access-protected Teams page or by Delegated Request: an agent never grants anyone
-access on its own, and there is no tool that confirms or declines a request.
+or an admin, confirms on the Access-protected Teams page or by Delegated Request: an agent never adds anyone
+to an existing Team on its own, and there is no tool that confirms or declines a request.
 """
 
 from typing import Literal

@@ -21,6 +21,7 @@ from hindsight_agent_keys.bodies import (
     Member,
     NewKey,
     NewTeam,
+    Openness,
     RoleChange,
     _or_refused,
 )
@@ -198,6 +199,25 @@ def delegated_router(memory) -> APIRouter:
         return {"team": team, "email": body.email}
 
     # Open Teams (#1002)
+
+    @router.post("/teams/{team}/open")
+    async def set_open(team: str, body: Openness, request: Request, email: str = Depends(delegated_person)):
+        """Admins only, as on the Teams page. Answers the state asked for; a repeat records nothing."""
+        await _or_refused(memory.tenant_extension.set_open(email, team, body.open, client_ip(request.headers)))
+        return {"team": team, "open": body.open}
+
+    @router.post("/teams/{team}/join")
+    async def join_team(team: str, request: Request, email: str = Depends(delegated_person)):
+        """Join an Open Team, as on the Teams page; a Team that is not open gets the person's Join Request instead.
+        A repeat answers the person's role now and records nothing."""
+        role = await _or_refused(memory.tenant_extension.join_team(email, team, client_ip(request.headers)))
+        joined = {"team": team, "email": email, "role": role or "member"}
+        return joined if role else {**joined, "status": "pending"}
+
+    @router.get("/open-teams")
+    async def open_teams(email: str = Depends(delegated_person)):
+        """Every Open Team, each with the person's role in it (null if not in it); an empty list unless they are on the Key Allowlist."""
+        return await memory.tenant_extension.open_teams(email)
 
     router.include_router(admin_router)
     return router

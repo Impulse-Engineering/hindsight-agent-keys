@@ -95,6 +95,17 @@ async def test_an_admin_also_hears_of_requests_for_other_teams_left_waiting_more
     assert [await waiting(w, p) for p in (BOB, CAROL, DAVE)] == [(1, 0), (2, 0), (0, 0)]
 
 
+async def test_joining_an_open_team_leaves_nothing_to_review_and_joining_a_closed_one_files_a_request_for_its_owner():
+    w = await world(**PAGES)
+    gina = "gina@example.com"
+    await w.ext.set_role(ALICE, gina, "member", None)
+    await w.ext.set_open(ALICE, w.giraffe, True, None)
+    assert await w.ext.join_team(gina, w.giraffe, None) == "member"
+    assert [await waiting(w, p) for p in (BOB, CAROL)] == [(1, 0), (2, 0)]
+    assert await w.ext.join_team(gina, w.zebra, None) is None
+    assert [await waiting(w, p) for p in (BOB, CAROL)] == [(1, 0), (3, 0)]
+
+
 async def test_asking_again_leaves_the_request_as_old_as_it_was():
     w = await world(**PAGES)
     w.store.requested_at[w.zebra, DAVE] = datetime.now(UTC) - timedelta(days=8)
