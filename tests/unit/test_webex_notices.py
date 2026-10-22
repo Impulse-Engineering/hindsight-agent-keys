@@ -139,19 +139,19 @@ class NoticeStore(MemoryStore):
             self.after_claim(recipient)
         return row["id"], [(line, path, kind, team) for _, kind, team, line, path in mine]
 
-    async def still_eligible(self, recipient, items, admins):
+    async def still_eligible(self, conn, recipient, items, admins):
         return [self._eligible(recipient, kind, team, admins) for _, _, kind, team in items]
 
-    async def finish_notice(self, log_id, status, detail):
+    async def finish_notice(self, log_id, status, detail, conn=None):
         self._break("finish_notice")
         self.log[log_id - 1].update(status=status, detail=detail)
 
     @contextlib.asynccontextmanager
     async def notice_lock(self, email):
         async with self.locks.setdefault(email, asyncio.Lock()):
-            yield
+            yield "the lock's own connection"
 
-    async def notices_enabled(self, email):
+    async def notices_enabled(self, email, conn=None):
         return email not in self.optouts
 
     async def set_notices_enabled(self, email, enabled):

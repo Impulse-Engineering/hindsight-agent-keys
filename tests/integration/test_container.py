@@ -1923,6 +1923,104 @@ out["roles_now"] = [
     assert out["roles_now"] == [None, "member", "member"]
 
 
+def saturated_pool(people, team, with_optout):
+    """A script in which, as the sender begins its final check under the person's notice lock, four changes to that person
+    start waiting for the lock, each holding one of the store's four pool connections; with `with_optout` a fifth waiter is
+    an opt-out. The sender must finish all the same: nothing it does under the lock may wait for a pool connection."""
+    return f"""
+from hindsight_agent_keys import notices as notices_module
+
+people, team, with_optout = {people!r}, {team!r}, {with_optout!r}
+person = people["own2"]
+# The real numbers, scaled to a twentieth so the test is quick; the ratio between them is the real one.
+scale = 0.05
+notices_module.SEND_DEADLINE = notices_module.SEND_DEADLINE * scale
+store_module.NOTICE_LOCK_WAIT = store_module.NOTICE_LOCK_WAIT * scale
+
+
+class Webex:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, to, text):
+        await asyncio.sleep(0.2)  # in flight while the changes wait
+        self.sent.append(to)
+
+
+class Saturated(PostgresKeyStore):
+    waiters = []
+
+    async def still_eligible(self, *args):
+        if not self.waiters:
+            changes = [self.set_role(person, "member") for _ in range(4)]
+            if with_optout:
+                changes.append(self.set_notices_enabled(person, False))
+            self.waiters = [asyncio.create_task(change) for change in changes]
+            await asyncio.sleep(0.3)
+            out["idle"] = (await self._get_pool()).get_idle_size()
+        return await super().still_eligible(*args)
+
+
+saturated, webex = Saturated(url), Webex()
+try:
+    notices = Notices(saturated, webex, "keys.example.test", lambda: T0, [])
+    await saturated.queue_notice([person], "owner", team, "line", "/ext/teams")
+    began = asyncio.get_running_loop().time()
+    await asyncio.wait_for(notices.send_due(), 10)
+    out["send_took"] = asyncio.get_running_loop().time() - began
+    results = await asyncio.gather(*saturated.waiters, return_exceptions=True)
+    out["waiters"] = [type(r).__name__ if isinstance(r, BaseException) else None for r in results]
+    out["sent"] = webex.sent
+    out["enabled_now"] = await saturated.notices_enabled(person)
+    out["send_deadline"] = notices_module.SEND_DEADLINE
+    out["lock_wait"] = store_module.NOTICE_LOCK_WAIT
+finally:
+    await saturated.close()
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch("SELECT status, detail FROM agent_keys.notice_log WHERE recipient = $1", person)
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+"""
+
+
+@pytest.mark.parametrize("with_optout", [False, True])
+def test_changes_waiting_for_the_notice_lock_with_the_pool_full_cannot_starve_the_send_that_holds_it_in_postgres(hindsight, with_optout):
+    people, team = notice_people(hindsight, f"full{int(with_optout)}")
+    out = notice_store(hindsight["name"], saturated_pool(people, team, with_optout))
+    # All four connections were in use by waiters, and the send still finished within its cap and logged its outcome.
+    assert out["idle"] == 0
+    assert out["sent"] == [people["own2"]] and out["log"] == [["sent", None]]
+    assert out["send_took"] < out["send_deadline"] + 0.5
+    # Every waiter then completed: none was refused (503) after waiting out the lock wait.
+    assert out["waiters"] == [None] * (5 if with_optout else 4)
+    assert out["enabled_now"] is (not with_optout)
+
+
+def test_an_opt_out_writes_on_the_locks_own_connection_even_with_the_pool_full_in_postgres(hindsight):
+    people, _ = notice_people(hindsight, "optout")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+person = {people["own3"]!r}
+pool = await store._get_pool()
+held = [await pool.acquire() for _ in range(4)]  # every connection of the pool is in use
+try:
+    try:
+        await asyncio.wait_for(store.set_notices_enabled(person, False), 2)
+        out["opted_out"] = True
+    except TimeoutError:
+        out["opted_out"] = False
+finally:
+    for conn in held:
+        await pool.release(conn)
+out["enabled_now"] = await store.notices_enabled(person)
+""",
+    )
+    assert (out["opted_out"], out["enabled_now"]) == (True, False)
+
+
 def test_a_change_behind_a_send_that_hits_the_deadline_completes_with_no_503_in_postgres(hindsight):
     people, team = notice_people(hindsight, "cap")
     out = notice_store(

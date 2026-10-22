@@ -98,6 +98,11 @@ def _refusal(resp: httpx.Response) -> str:
     return f"HTTP {resp.status_code}{detail}"[:150]
 
 
+def _why(exc: Exception) -> str:
+    """What the send log keeps of a failure: a WebexError's text is safe to store, any other exception is named by its type."""
+    return str(exc) if isinstance(exc, WebexError) else type(exc).__name__
+
+
 class Webex(Protocol):
     async def send_message(self, to_email: str, text: str) -> None: ...
 
@@ -160,27 +165,38 @@ class Notices:
             return
         log_id, items = claim
         try:
-            # The final checks and the send happen under the person's notice lock, and everything that can end their
-            # eligibility (an opt-out, a removal from a Team, a role change) takes that lock before it commits. So a
-            # change that has committed is seen here, and one that has not waits until the message is sent: once it
-            # commits, nothing more is sent to that person for what it ended.
-            async with self._store.notice_lock(to):
-                still = await self._store.still_eligible(to, items, self._admins)
-                items = [item for item, ok in zip(items, still, strict=True) if ok]
-                if not items:
-                    status, detail = "skipped", "no longer eligible"
-                elif not await self._store.notices_enabled(to):
-                    status, detail = "skipped", "turned off"
-                else:
-                    async with asyncio.timeout(SEND_DEADLINE):
-                        await self._webex.send_message(to, self._message(items))
-                    status, detail = "sent", None
+            # The final checks, the send and the outcome in the send log all happen under the person's notice lock, on the
+            # one connection the lock gave and never one from the pool: changes waiting for the lock hold the pool's
+            # connections, so a holder that waited for one could never finish. Everything that can end the person's
+            # eligibility (an opt-out, a removal from a Team, a role change) takes that lock before it commits. So a change
+            # that has committed is seen here, and one that has not waits until the message is sent, at most SEND_DEADLINE:
+            # once it commits, nothing more is sent to that person for what it ended.
+            async with self._store.notice_lock(to) as conn:
+                status, detail = await self._send(conn, to, items)
+                await self._finish(log_id, status, detail, conn)
+        except Exception as exc:  # noqa: BLE001 - the lock could not be taken: logged in the send log, not retried
+            await self._finish(log_id, "failed", _why(exc), None)
+
+    async def _send(self, conn, to: str, items: list[tuple[str, str, str, str | None]]) -> tuple[str, str | None]:
+        """The final checks and the send, under the lock, on its connection: (status, detail) for the send log."""
+        try:
+            still = await self._store.still_eligible(conn, to, items, self._admins)
+            items = [item for item, ok in zip(items, still, strict=True) if ok]
+            if not items:
+                return "skipped", "no longer eligible"
+            if not await self._store.notices_enabled(to, conn):
+                return "skipped", "turned off"
+            async with asyncio.timeout(SEND_DEADLINE):
+                await self._webex.send_message(to, self._message(items))
+            return "sent", None
         except Exception as exc:  # noqa: BLE001 - logged in the send log, not retried
-            # Only a WebexError's text is safe to store; any other exception is named by its type.
-            status, detail = "failed", str(exc) if isinstance(exc, WebexError) else type(exc).__name__
+            return "failed", _why(exc)
+
+    async def _finish(self, log_id: int, status: str, detail: str | None, conn) -> None:
+        if status == "failed":
             logger.warning("agent-keys: a Webex notice was not delivered: %s", detail)
         try:
-            await self._store.finish_notice(log_id, status, detail)
+            await self._store.finish_notice(log_id, status, detail, conn)
         except Exception as exc:  # noqa: BLE001 - the row stays `sending`; the message is not sent again
             logger.warning("agent-keys: could not write the Webex send log: %s", type(exc).__name__)
 

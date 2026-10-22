@@ -703,12 +703,13 @@ class PostgresKeyStore:
             )
         return log_id, [(r["line"], r["path"], r["kind"], r["team"]) for r in rows]
 
-    async def still_eligible(self, recipient: str, items: list[tuple[str, str, str, str | None]], admins: list[str]) -> list[bool]:
-        """For each claimed item, whether the person is still eligible for it now. Called under the person's notice lock,
-        which every change that can end their eligibility takes before it commits, so once one has committed this sees it
-        and, until it has, the change waits for the message that follows."""
-        pool = await self._get_pool()
-        rows = await pool.fetch(
+    async def still_eligible(
+        self, conn: asyncpg.Connection, recipient: str, items: list[tuple[str, str, str, str | None]], admins: list[str]
+    ) -> list[bool]:
+        """For each claimed item, whether the person is still eligible for it now. Called under the person's notice lock, on
+        the connection `notice_lock` gave, which every change that can end their eligibility takes before it commits, so once
+        one has committed this sees it and, until it has, the change waits for the message that follows."""
+        rows = await conn.fetch(
             f"SELECT t.ord FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS t(kind, team, ord) WHERE {NOTICE_ELIGIBLE}",
             recipient,
             admins,
@@ -718,17 +719,20 @@ class PostgresKeyStore:
         yes = {r["ord"] - 1 for r in rows}
         return [i in yes for i in range(len(items))]
 
-    async def finish_notice(self, log_id: int, status: str, detail: str | None) -> None:
-        """Say how the message went: 'sent', 'skipped' (turned off meanwhile), or 'failed' with why."""
-        pool = await self._get_pool()
-        await pool.execute(f"UPDATE {SCHEMA}.notice_log SET status = $2, detail = $3 WHERE id = $1", log_id, status, detail)
+    async def finish_notice(self, log_id: int, status: str, detail: str | None, conn: asyncpg.Connection | None = None) -> None:
+        """Say how the message went: 'sent', 'skipped' (turned off, or no longer eligible, after the claim), or 'failed' with
+        why. On the connection `notice_lock` gave when the sender holds the lock; on the pool's when it never got it."""
+        db = conn or await self._get_pool()
+        await db.execute(f"UPDATE {SCHEMA}.notice_log SET status = $2, detail = $3 WHERE id = $1", log_id, status, detail)
 
     @contextlib.asynccontextmanager
     async def notice_lock(self, email: str):
         """Hold the person's notice lock, across API processes: a message to them is sent under it, and an opt-out is
         written under it (as is every change that can end their eligibility, `_lock_notices`), so those wait for a send
         in flight and a send that starts after one sees it. It takes a connection of its own and polls, as
-        team_name_lock does. TimeoutError after NOTICE_LOCK_WAIT seconds, which is longer than a send can last."""
+        team_name_lock does, and yields it: the holder does everything it does under the lock on that connection and never
+        waits for one from the pool, which changes waiting for this lock can have filled (they hold the pool's connections
+        while they wait). TimeoutError after NOTICE_LOCK_WAIT seconds, which is longer than a send can last."""
         conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
         try:
             loop = asyncio.get_running_loop()
@@ -737,7 +741,7 @@ class PostgresKeyStore:
                 if loop.time() >= deadline:
                     raise TimeoutError
                 await asyncio.sleep(NOTICE_LOCK_POLL)
-            yield
+            yield conn
         finally:
             await conn.close()
 
@@ -745,6 +749,8 @@ class PostgresKeyStore:
         """Take the person's notice lock until the transaction on `conn` ends. Every change that can end someone's eligibility
         for a notice (a removal or a role change in a Team, a role change on the Key Allowlist) calls this before it changes
         anything, so it waits for a message to them in flight and a message whose final check comes after the commit sees it.
+        It takes the lock on the transaction's own connection, first, so a change holds one pool connection while it waits
+        and never waits for a second while it holds the lock.
         Polls, as notice_lock does; Refused(503) if the message does not finish within NOTICE_LOCK_WAIT seconds."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + NOTICE_LOCK_WAIT
@@ -753,15 +759,17 @@ class PostgresKeyStore:
                 raise Refused(503, "A message to that person is being sent; try again in a moment.")
             await asyncio.sleep(NOTICE_LOCK_POLL)
 
-    async def notices_enabled(self, email: str) -> bool:
-        pool = await self._get_pool()
-        return not await pool.fetchval(f"SELECT 1 FROM {SCHEMA}.notice_optouts WHERE email = $1", email)
+    async def notices_enabled(self, email: str, conn: asyncpg.Connection | None = None) -> bool:
+        """Whether the person has not turned notices off; on `notice_lock`'s connection when the sender holds the lock."""
+        db = conn or await self._get_pool()
+        return not await db.fetchval(f"SELECT 1 FROM {SCHEMA}.notice_optouts WHERE email = $1", email)
 
     async def set_notices_enabled(self, email: str, enabled: bool) -> None:
-        """Turn the person's notices on, or off: off waits for a send to them in flight (TimeoutError if it does not end)."""
-        pool = await self._get_pool()
+        """Turn the person's notices on, or off: off waits for a send to them in flight (TimeoutError if it does not end),
+        and writes on the lock's own connection, never a second one from the pool."""
         if enabled:
+            pool = await self._get_pool()
             await pool.execute(f"DELETE FROM {SCHEMA}.notice_optouts WHERE email = $1", email)
             return
-        async with self.notice_lock(email):
-            await pool.execute(f"INSERT INTO {SCHEMA}.notice_optouts (email) VALUES ($1) ON CONFLICT DO NOTHING", email)
+        async with self.notice_lock(email) as conn:
+            await conn.execute(f"INSERT INTO {SCHEMA}.notice_optouts (email) VALUES ($1) ON CONFLICT DO NOTHING", email)
