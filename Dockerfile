@@ -1,7 +1,8 @@
-FROM ghcr.io/vectorize-io/hindsight:0.10.3@sha256:b5da1a9aece1f53a15f12821fb1470f358ed6c74dfaa0c4b1a39c3f3ae93e002
+# Two images from one pin: the API image (the default, last stage) and the UI image (--target ui).
+# scripts/upstream-ref.sh reads this pin, and the upstream-release workflow bumps it for both.
+FROM ghcr.io/vectorize-io/hindsight:0.10.3@sha256:b5da1a9aece1f53a15f12821fb1470f358ed6c74dfaa0c4b1a39c3f3ae93e002 AS base
 
 LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hindsight-agent-keys" \
-      org.opencontainers.image.description="Hindsight with a tenant extension for self-issued Agent Keys" \
       org.opencontainers.image.licenses="MIT"
 
 # Fixed versions over upstream's lockfile, for advisories the scan blocks or reports as High:
@@ -31,6 +32,19 @@ RUN --mount=type=bind,source=docker/system-pins.txt,target=/tmp/system-pins.txt 
     uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
       --python /usr/local/bin/python3 -r /tmp/system-pins.txt
 USER hindsight
+
+# The UI image: upstream's web UI, one process per Team, never the API (README, "The UI image").
+# It keeps the pinned Python fixes above, so the same scan passes on both images.
+FROM base AS ui
+LABEL org.opencontainers.image.description="Hindsight's web UI, one process per Team"
+# Upstream's launcher stays in the image; if an entrypoint override runs it, it starts no API.
+ENV HINDSIGHT_ENABLE_API=false
+COPY docker/ui-start.sh /app/ui-start.sh
+ENTRYPOINT ["/app/ui-start.sh"]
+CMD []
+
+FROM base
+LABEL org.opencontainers.image.description="Hindsight with a tenant extension for self-issued Agent Keys"
 
 COPY hindsight_agent_keys /app/extensions/hindsight_agent_keys
 # The script's executable bit comes from git; COPY keeps it.

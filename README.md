@@ -10,6 +10,8 @@ It knows three kinds of key:
 
 Every other key, and a request with no key, gets 401 on the API and on MCP. There is one exception. Upstream answers an MCP `GET` with no session ID before authentication runs: it is the handshake probe some clients send, and it returns `200 {}` with no data.
 
+The same Dockerfile builds a second image, `hindsight-ui`, which runs upstream's web UI once per Team (see "The UI image").
+
 Upstream serves these routes without a key, and they carry no memory data: `/health`, `/health/ready`, `/health/live`, `/version`, `/metrics`, `/v1/bank-template-schema`, `/docs`, `/redoc` and `/openapi.json`. Upstream also mounts our key pages under `/ext` without authentication; the extension gates them itself.
 
 ## What the image adds to upstream
@@ -155,6 +157,20 @@ Events go to `agent_keys.events` in Hindsight's own database. That schema sits o
 
 The extension connects to the database once, at startup. If that fails it logs a warning and records nothing until the next restart; refusals are still enforced.
 
+## The UI image
+
+`ghcr.io/impulse-engineering/hindsight-ui` runs upstream's web UI and nothing else, built from the same pinned upstream release as the API image (`docker build --target ui`). Upstream's UI sends one key, and a key reaches one Team, so the image starts one UI process per listed Team, each on its own port with its own key. Its entrypoint is `docker/ui-start.sh`. It never starts the API, and it takes no command. The image sets `HINDSIGHT_ENABLE_API=false`, so even an entrypoint override that runs upstream's launcher starts only one UI; never override that variable.
+
+| Variable | Meaning |
+| --- | --- |
+| `HINDSIGHT_UI_TEAMS` | The Teams to serve, as space-separated `<team>:<port>` entries, such as `public:9999 silver-air:10000`. `<team>` is a label the operator picks, which need not be the Team's name on `/ext/teams`: lowercase letters, digits and inner hyphens. A port is 1024 to 65535. |
+| `HINDSIGHT_UI_KEY_<TEAM>` | The key of each listed Team, where `<TEAM>` is its label upper-cased with `-` as `_` (`HINDSIGHT_UI_KEY_SILVER_AIR`): a Team key, or for `public` a Public Team key or the legacy key. Supply it as a secret. |
+| `HINDSIGHT_CP_DATAPLANE_API_URL` | Upstream's setting: the API every UI process calls. |
+
+Before any UI process starts, the script exits with status 78, naming each problem, if `HINDSIGHT_UI_TEAMS` is empty or holds a tab or line break, an entry is malformed, a Team or a port is listed twice, a listed Team's key is unset or empty, or a command is passed. When one UI process exits, the script stops the others and the container exits non-zero (that process's status, or 1 if it was 0), so a platform that restarts on failure restarts the whole set. A stop signal (`SIGTERM` or `SIGINT`), at any point, stops every UI process and exits 0.
+
+Every UI shows its Team's banks to whoever reaches its port, so put each hostname behind Access. Each UI process takes roughly 150 to 200 MB of memory: size the container for the Team count. Adding a Team to a running app is in [docs/operating.md](docs/operating.md), "The UI app".
+
 ## Tests
 
 Unit tests run inside the pinned upstream image, which ships `hindsight_api` and pytest. CI runs them inside the image it built (`UNIT_TEST_IMAGE`), so they also see the image's pinned packages:
@@ -163,10 +179,11 @@ Unit tests run inside the pinned upstream image, which ships `hindsight_api` and
 scripts/unit-tests.sh -v
 ```
 
-Integration tests start the real container on Hindsight's mock LLM, so they need no credentials. They also run the README's purge recovery and the operating guide's check of a revoked identity's keys as written, with an owner whose email holds an apostrophe. They need Docker, pytest and markdown-it-py on the host. The build needs BuildKit (Docker's default builder since 23.0) for the Dockerfile's `RUN --mount`:
+Integration tests start the real container on Hindsight's mock LLM, so they need no credentials, and run the UI image against it with two Teams. They also run the README's purge recovery and the operating guide's check of a revoked identity's keys as written, with an owner whose email holds an apostrophe. They need Docker, pytest and markdown-it-py on the host. The build needs BuildKit (Docker's default builder since 23.0) for the Dockerfile's `RUN --mount`:
 
 ```sh
 docker build -t hindsight-agent-keys:test .
+docker build --target ui -t hindsight-ui:test .
 uv run --no-project --with pytest==9.0.3 --with markdown-it-py==4.2.0 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
@@ -194,8 +211,8 @@ Behind a TLS-inspecting proxy, the vulnerability scan needs that proxy's CA moun
 
 ## CI and publishing
 
-- **Every PR:** lint (ruff, shellcheck, actionlint), script tests, unit tests, integration tests, and a Grype scan. The scan runs as a digest-pinned container against an exported image tar and blocks on critical vulnerabilities that have a fix.
-- **On `main`:** an amd64 image is published to `ghcr.io/impulse-engineering/hindsight-agent-keys:<upstream version>-ak.<run>` (a re-run adds `.<attempt>`), with an SBOM, a GitHub build provenance attestation and a keyless cosign signature. A follow-up job then runs the integration tests and the scan against that exact digest. Approve a digest only once that job has passed.
+- **Every PR:** lint (ruff, shellcheck, actionlint), script tests, unit tests, integration tests, and a Grype scan of both images. The scan runs as a digest-pinned container against an exported image tar and blocks on critical vulnerabilities that have a fix.
+- **On `main`:** two amd64 images are published, `ghcr.io/impulse-engineering/hindsight-agent-keys:<upstream version>-ak.<run>` and `ghcr.io/impulse-engineering/hindsight-ui` with the same tag (a re-run adds `.<attempt>`), each with an SBOM, a GitHub build provenance attestation and a keyless cosign signature. A follow-up job then runs the integration tests and the scan against those exact digests. Approve a digest only once that job has passed.
 - **Daily (scan):** the scan also runs on `main` every morning (UTC), building `main` as a PR does, so an advisory published since the last merge turns `main` red at the next scheduled run, not when it is published, and GitHub can delay or drop a scheduled run under load. A failed run notifies whoever last edited the schedule, as their Actions notification settings allow. GitHub turns the schedule off after 60 days without activity in the repository.
 - **Daily (upstream releases):** the `upstream-release` workflow reads upstream's latest GitHub Release, which is never a draft or a pre-release. If it is newer than the pin and has no PR yet, it opens one PR that pins `ghcr.io/vectorize-io/hindsight:<version>@<digest>` and links the release notes. A release overtaken by a newer one before the next run gets no PR. Closing a PR declines that release; reopen it to take the release up again. Only an exact `vX.Y.Z` release is followed, never a floating tag such as `latest` or `0.10`, or a `-slim` tag. A release tag that is not `vX.Y.Z` fails the run. GitHub holds CI on that PR until a maintainer selects **Approve workflows to run**. Nothing merges automatically; merging publishes the new image as above. It can also be started by hand from the Actions tab, on `main`.
 
@@ -210,6 +227,8 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
+The UI image verifies the same way, with `hindsight-ui` in place of `hindsight-agent-keys` in the image name.
+
 ## Moving a Conductor app onto the image
 
 [docs/cutover.md](docs/cutover.md) is the runbook: back up pg0, upgrade to the stock release this image is built on, then swap the image while the bypass hostname is behind Access. It also covers the rollback.
@@ -220,7 +239,7 @@ cosign verify ghcr.io/impulse-engineering/hindsight-agent-keys@<digest> \
 
 | Symptom | Cause |
 | --- | --- |
-| The container exits with status 78 | The startup guard refused the configuration. Its stderr names each variable to fix. |
+| The container exits with status 78 | The startup guard refused the configuration. Its stderr names each variable to fix. For the UI image, `ui-start: refusing to start:` lines name each problem with its Teams (see "The UI image"). |
 | The legacy key gets 401 | `HINDSIGHT_API_TENANT_LEGACY_KEY` is unset or different, or the legacy key has passed its expiry (`legacy_key_expired` in the event log). |
 | Background tasks in a new personal or Team schema stay `pending` | The log shows `agent-keys: could not list tenants; using the last list`: the database could not be read when the worker refreshed its tenant list, so it keeps the schemas it last listed. It picks up the new schema once the database answers again. |
 | The key page answers 404 | The request's hostname is not `HINDSIGHT_API_TENANT_ACCESS_HOST`, or one of the three `ACCESS` settings is unset. |
