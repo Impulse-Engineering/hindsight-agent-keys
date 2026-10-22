@@ -25,8 +25,9 @@ logger = logging.getLogger(__name__)
 WEBEX_URL = "https://webexapis.com"
 # Each phase of a call to Webex waits this long at most.
 SEND_TIMEOUT = 10.0
-# The whole call, a slow trickle of bytes included; an opt-out waits for a send in flight, so this bounds it.
-SEND_DEADLINE = 15.0
+# The whole call to Webex, every phase and a slow trickle of bytes included, is cut off after this long. A change that ends
+# someone's eligibility waits for a send in flight, so this is the longest it waits (store.NOTICE_LOCK_WAIT is well beyond it).
+SEND_DEADLINE = 10.0
 # At most one message per person in this long; what arrives meanwhile goes out together when it has passed.
 WINDOW = timedelta(minutes=15)
 # Making and queuing a notice waits this long at most, so a slow database never holds up the request that caused it.

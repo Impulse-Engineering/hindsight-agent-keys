@@ -17,8 +17,10 @@ TEAMS_PER_PERSON = 10
 # A creation waits this many seconds, polling this often, for the Team name another creation holds.
 TEAM_NAME_LOCK_WAIT = 60.0
 TEAM_NAME_LOCK_POLL = 0.1
-# An opt-out waits this many seconds, polling this often, for a message to the person in flight (no longer than that).
-NOTICE_LOCK_WAIT = 20.0
+# A change that ends someone's eligibility for a notice, and an opt-out, wait this many seconds, polling this often, for a
+# message to the person in flight. A send is cut off after notices.SEND_DEADLINE (10), so this is three times that: a
+# realistic change never gets 503 behind a send, and 503 means the lock has been held abnormally long.
+NOTICE_LOCK_WAIT = 30.0
 NOTICE_LOCK_POLL = 0.05
 
 

@@ -29,6 +29,7 @@ from test_teams_page import as_person
 from hindsight_agent_keys import notices
 from hindsight_agent_keys.extension import AgentKeysTenantExtension
 from hindsight_agent_keys.notices import WebexError, plain
+from hindsight_agent_keys.store import NOTICE_LOCK_WAIT
 from hindsight_agent_keys.web import AgentKeysHttpExtension
 
 ADMIN = "admin@example.com"  # a bootstrap admin
@@ -796,6 +797,18 @@ async def test_a_message_lists_only_what_the_person_is_still_eligible_for(world)
     [for_alice] = world.heard(ALICE)
     assert '"Platform"' in for_alice and '"Ops"' not in for_alice
     assert [(row["items"], row["status"]) for row in world.store.log if row["recipient"] == ALICE] == [(2, "sent")]
+
+
+async def test_a_send_is_cut_off_at_the_deadline_which_the_lock_wait_is_well_beyond(world, monkeypatch):
+    # The two numbers the README states: a send is cut off after 10 seconds, a change waits up to 30 for the lock.
+    assert (notices.SEND_DEADLINE, NOTICE_LOCK_WAIT) == (10.0, 30.0)
+    monkeypatch.setattr(notices, "SEND_DEADLINE", 0.1)
+    world.webex.gate = asyncio.Event()  # a Webex that never answers
+    world.ask(DAVE)
+    started = time.monotonic()
+    await world.send()
+    assert time.monotonic() - started < 2
+    assert [(row["status"], row["detail"]) for row in world.store.log] == [("failed", "TimeoutError")] * 2
 
 
 # A decision never waits on a notice

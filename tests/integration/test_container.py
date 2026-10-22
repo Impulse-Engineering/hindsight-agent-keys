@@ -1923,6 +1923,63 @@ out["roles_now"] = [
     assert out["roles_now"] == [None, "member", "member"]
 
 
+def test_a_change_behind_a_send_that_hits_the_deadline_completes_with_no_503_in_postgres(hindsight):
+    people, team = notice_people(hindsight, "cap")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+from hindsight_agent_keys import notices as notices_module
+
+people, team = {people!r}, {team!r}
+# The real numbers, scaled to a twentieth so the test is quick; the ratio between them is the real one.
+scale = 0.05
+notices_module.SEND_DEADLINE = notices_module.SEND_DEADLINE * scale
+store_module.NOTICE_LOCK_WAIT = store_module.NOTICE_LOCK_WAIT * scale
+
+
+class Hung:
+    \"\"\"A Webex that never answers.\"\"\"
+
+    def __init__(self):
+        self.started = asyncio.Event()
+
+    async def send_message(self, to, text):
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+hung = Hung()
+notices = Notices(store, hung, "keys.example.test", lambda: T0, [])
+await store.queue_notice([people["own2"]], "owner", team, "line", "/ext/teams")
+sweep = asyncio.create_task(notices.send_due())
+await asyncio.wait_for(hung.started.wait(), 10)
+began = asyncio.get_running_loop().time()
+removal = asyncio.create_task(store.remove_member(team, people["own2"]))
+await asyncio.sleep(0.1)
+out["waited"] = not removal.done()
+await asyncio.wait_for(asyncio.gather(sweep, removal), 10)
+out["waited_for"] = asyncio.get_running_loop().time() - began
+out["refused"] = removal.exception() is not None
+out["send_deadline"] = notices_module.SEND_DEADLINE
+out["lock_wait"] = store_module.NOTICE_LOCK_WAIT
+out["role_now"] = await store.team_role(team, people["own2"])
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch(
+        "SELECT recipient, status, detail FROM agent_keys.notice_log WHERE recipient = $1", people["own2"]
+    )
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+""",
+    )
+    # The removal waited for the send, which was cut off at the deadline, and then went through: no 503.
+    assert (out["waited"], out["refused"], out["role_now"]) == (True, False, None)
+    assert out["send_deadline"] * 0.8 < out["waited_for"] < out["lock_wait"]
+    assert out["lock_wait"] >= 3 * out["send_deadline"]
+    assert out["log"] == [[people["own2"], "failed", "TimeoutError"]]
+
+
 def test_a_change_that_commits_between_the_claim_and_the_send_stops_the_send_in_postgres(hindsight):
     people, team = notice_people(hindsight, "race")
     out = notice_store(
