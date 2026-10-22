@@ -78,6 +78,7 @@ class MemoryStore:
         self.team_roles = {}  # (team, email) -> "owner" | "member"
         self.creators = {}  # team -> email
         self.requests = {}  # (team, email) -> (role, requested_by)
+        self.opened = set()  # the schemas of Open Teams (#1002)
         # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
         self.stale = []
         self.fail = False
@@ -289,6 +290,24 @@ class MemoryStore:
         for key in hits:
             key["revoked_at"] = now
         return len(hits)
+
+    # --- #1002 ---
+
+    async def set_open(self, team, opened):
+        if team not in self.teams_by_schema:
+            raise Refused(404, "There is no such Team.")
+        was = team in self.opened
+        (self.opened.add if opened else self.opened.discard)(team)
+        return was
+
+    async def join_open_team(self, team, email):
+        if team not in self.opened:
+            return None
+        joined = (team, email) not in self.team_roles
+        return self.team_roles.setdefault((team, email), "member"), joined
+
+    async def open_teams(self, email):
+        return [r for r in await self.teams(email, everyone=True) if r["schema"] in self.opened]
 
 
 class Migrations(ExtensionContext):
