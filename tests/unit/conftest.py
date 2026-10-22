@@ -290,6 +290,12 @@ class MemoryStore:
             key["revoked_at"] = now
         return len(hits)
 
+    # --- #1004 ---
+
+    async def pending_review_counts(self, email, *, admin):
+        joins = sum(admin or self.team_roles.get((team, email)) == "owner" for team, _ in self.requests)
+        return joins, sum(admin and role == "requested" for role in self.roles.values())
+
 
 class Migrations(ExtensionContext):
     """Records the schemas Hindsight was asked to create and migrate."""

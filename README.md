@@ -111,10 +111,11 @@ Agents manage Teams with these tools, on the multi-bank endpoint `/mcp/` and on 
 | Tool | What it does |
 | --- | --- |
 | `create_team(name)` | Creates a Team as on the Teams page, with the same limit. Returns its ID (`t_…`), which the other tools take as `team`. |
-| `list_teams()` | The Teams the person is in, admins included (they manage other Teams on the Teams page), each with the person's role, its members and its pending requests. |
+| `list_teams()` | The Teams the person is in, admins included (they manage other Teams on the Teams page), each with the person's role, its members and its pending requests, and `pending_reviews`, the answer of the tool of that name. |
 | `request_to_join_team(name)` | Files the person's own Join Request for the Team with that name, in any case. Answers `{"name": …, "status": "pending"}` whether or not the Team exists. Nobody gains access until an owner on the Key Allowlist, or an admin, confirms it, on the Teams page or by Delegated Request. |
 | `add_team_member(team, email, role)` | Files a pending request to make the person a `member` (the default) or an `owner`. Nobody gains access until an owner on the Key Allowlist, or an admin, confirms it, on the Teams page or by Delegated Request. A person who is not an owner of the Team or an admin may name only themselves, as a `member` or an `owner`: that is a Join Request for that role. |
 | `remove_team_member(team, email)` | Takes the person out of the Team; their Team keys stop on their next request. |
+| `pending_reviews()` | What waits for the person to review, as counts and a link only, never a Team name, an email or other user-written text: `join_requests`, the requests to join the Teams they own (every Team, for an admin), and `access_requests`, the people waiting for a place on the Key Allowlist (an admin's; 0 for anyone else), with `link`, the Teams page (`https://<access host>/ext/teams`; left out while the key pages are off). Its description tells agents to call it at the start of every session and to tell their person when anything waits. |
 
 A refusal is answered as `{"error": "<reason>"}`, as upstream's own tools answer. Only owners on the Key Allowlist and admins can file requests for other people and remove people; anyone on the Key Allowlist can ask to join. A bank whose config sets `mcp_enabled_tools` hides every tool not named there, these included.
 

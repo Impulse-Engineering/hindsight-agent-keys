@@ -522,3 +522,18 @@ class PostgresKeyStore:
             f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
         )
         return len(rows)
+
+    # --- #1004 ---
+
+    async def pending_review_counts(self, email: str, *, admin: bool) -> tuple[int, int]:
+        """What waits for the person: (requests to join the Teams they own, every Team for an admin; the people who
+        asked for a place on the Key Allowlist, for an admin only)."""
+        pool = await self._get_pool()
+        joins, access = await pool.fetchrow(
+            f"SELECT (SELECT count(*) FROM {SCHEMA}.member_requests r WHERE $2::boolean OR EXISTS"
+            f" (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner')),"
+            f" (SELECT count(*) FROM {SCHEMA}.allowlist WHERE $2::boolean AND role = 'requested')",
+            email,
+            admin,
+        )
+        return joins, access

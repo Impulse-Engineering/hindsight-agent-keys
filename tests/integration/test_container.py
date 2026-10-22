@@ -620,6 +620,7 @@ def test_agents_manage_teams_over_both_mcp_endpoints_but_only_an_owner_lets_anyo
     port, key = hindsight["port"], two_people[ALICE]
     multi, single = MCP_ENDPOINTS
     team = call_tool(port, key, multi, "create_team", name="MCP Team")["team"]
+    waiting = call_tool(port, key, multi, "pending_reviews")
     answer = call_tool(port, key, single, "add_team_member", team=team, email=ERIN.upper())
     assert answer == {"team": team, "email": ERIN, "role": "member", "status": "pending"}
     call_tool(port, key, multi, "add_team_member", team=team, email=CAROL, role="owner")
@@ -629,6 +630,11 @@ def test_agents_manage_teams_over_both_mcp_endpoints_but_only_an_owner_lets_anyo
         {"email": CAROL, "role": "owner", "by": ALICE},
         {"email": ERIN, "role": "member", "by": ALICE},
     ]
+    # The count the real query gives: the two requests for a Team the person owns, and nothing but counts and the link.
+    asked = call_tool(port, key, single, "pending_reviews")
+    assert asked == {**waiting, "join_requests": waiting["join_requests"] + 2}
+    assert asked["link"] == f"https://{ACCESS_HOST}/ext/teams"
+    assert call_tool(port, key, multi, "list_teams")["pending_reviews"] == asked
     team_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", ALICE, {"email": CAROL})
 
     # Nobody is in the Team until an owner confirms, on the Teams page, the role the request asks for.
@@ -652,6 +658,28 @@ def test_agents_manage_teams_over_both_mcp_endpoints_but_only_an_owner_lets_anyo
         ("key_created", ERIN, ERIN),
         ("member_removed", ERIN, ALICE),
     ]
+
+
+def test_pending_reviews_counts_the_owners_teams_and_only_an_admin_sees_every_team_and_the_allowlist_requests(
+    hindsight, two_people
+):
+    port, multi = hindsight["port"], MCP_ENDPOINTS[0]
+    pia, quin = "pia@example.test", "quin@example.test"
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": pia, "role": "member"})[0] == 204
+    pia_key = personal_key(hindsight, pia)["key"]
+    before = call_tool(port, two_people[ALICE], multi, "pending_reviews")
+    team = call_tool(port, pia_key, multi, "create_team", name="Pia Team")["team"]
+    # An admin files a request for Pia's Team, and Quin asks for a place on the Key Allowlist.
+    call_tool(port, two_people[ALICE], multi, "add_team_member", team=team, email=ERIN)
+    assert key_page(hindsight, "POST", "/ext/access-requests", quin, body={})[0] == 204
+    # Pia, no admin, owns one Team with one request: the requests for other Teams, and Quin's, are not hers.
+    link = f"https://{ACCESS_HOST}/ext/teams"
+    assert call_tool(port, pia_key, multi, "pending_reviews") == {"join_requests": 1, "access_requests": 0, "link": link}
+    assert call_tool(port, two_people[ALICE], multi, "pending_reviews") == {
+        "join_requests": before["join_requests"] + 1,
+        "access_requests": before["access_requests"] + 1,
+        "link": link,
+    }
 
 
 @pytest.mark.parametrize("path", MCP_ENDPOINTS)

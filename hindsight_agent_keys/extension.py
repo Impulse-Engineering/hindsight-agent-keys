@@ -670,3 +670,13 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
         return HindsightConfig.get_configurable_fields() - DENIED_BANK_FIELDS
+
+    # --- #1004 ---
+
+    async def pending_reviews(self, email: str) -> dict:
+        """What waits for the person to review, as counts only, so no user-written text reaches an agent: the requests
+        to join the Teams they own (every Team, for an admin) and, for an admin, the Key Allowlist requests. Carries
+        the Teams page's link when the key pages are on."""
+        joins, access = await self._store.pending_review_counts(email, admin=await self.role(email) == "admin")
+        link = {"link": f"https://{self.access_host}/ext/teams"} if self.access_host else {}
+        return {"join_requests": joins, "access_requests": access, **link}
