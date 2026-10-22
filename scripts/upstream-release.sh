@@ -41,7 +41,7 @@ fi
 digest=$(docker buildx imagetools inspect "ghcr.io/$UPSTREAM:$version" --format '{{.Manifest.Digest}}')
 new="ghcr.io/$UPSTREAM:$version@$digest"
 git switch --quiet -C "$branch"
-sed "s|^FROM $old\$|FROM $new|" Dockerfile > Dockerfile.new
+sed "s|^FROM $old AS base\$|FROM $new AS base|" Dockerfile > Dockerfile.new
 mv Dockerfile.new Dockerfile
 # upstream-ref.sh accepts only one well-formed tag@digest pin.
 if [ "$(scripts/upstream-ref.sh)" != "$new" ]; then

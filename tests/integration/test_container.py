@@ -1,6 +1,7 @@
 """End-to-end checks against the built image, run from the host with Docker.
 
-IMAGE names the image under test (default hindsight-agent-keys:test). The tests
+IMAGE names the image under test (default hindsight-agent-keys:test), and UI_IMAGE
+the UI image built from the same Dockerfile (default hindsight-ui:test). The tests
 start the real container on Hindsight's mock LLM, so they need no credentials.
 """
 
@@ -24,6 +25,7 @@ from markdown_it import MarkdownIt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 IMAGE = os.environ.get("IMAGE", "hindsight-agent-keys:test")
+UI_IMAGE = os.environ.get("UI_IMAGE", "hindsight-ui:test")
 # The stock image this one is built FROM, read from the Dockerfile pin.
 UPSTREAM = subprocess.run(
     [os.path.join(ROOT, "scripts", "upstream-ref.sh")], capture_output=True, text=True, check=True
@@ -97,7 +99,7 @@ def call_tool(port, key, path, tool, **arguments):
     return json.loads(messages[-1]["result"]["content"][0]["text"])
 
 
-def wait_healthy(port, container):
+def wait_healthy(port, container, path="/health"):
     deadline = time.time() + STARTUP_SECONDS
     while time.time() < deadline:
         state = docker("inspect", "-f", "{{.State.Running}}", container, check=False).stdout.strip()
@@ -105,7 +107,7 @@ def wait_healthy(port, container):
             logs = docker("logs", "--tail", "60", container, check=False)
             pytest.fail(f"{container} stopped during startup:\n{logs.stdout}\n{logs.stderr}")
         try:
-            if http(port, "GET", "/health")[0] == 200:
+            if http(port, "GET", path)[0] == 200:
                 return
         except (urllib.error.URLError, ConnectionError, OSError):
             pass
@@ -910,16 +912,156 @@ def test_the_readmes_purge_recovery_puts_the_schema_back_on_the_list_once(hindsi
     assert query(name, owned) == [{"schema": None}]
 
 
-def test_the_bundled_ui_is_not_listening(hindsight):
+def port_state(container, port):
+    """'open' or 'closed': whether anything in the container listens on the port."""
     probe = (
         "import json, socket\n"
         "s = socket.socket()\n"
         "try:\n"
-        "    s.connect(('127.0.0.1', 9999)); print(json.dumps('open'))\n"
+        f"    s.connect(('127.0.0.1', {port})); print(json.dumps('open'))\n"
         "except OSError:\n"
         "    print(json.dumps('closed'))\n"
     )
-    assert in_container(hindsight["name"], probe) == "closed"
+    return in_container(container, probe)
+
+
+def test_the_bundled_ui_is_not_listening(hindsight):
+    assert port_state(hindsight["name"], 9999) == "closed"
+
+
+def env_args(env):
+    return [arg for k, v in env.items() for arg in ("-e", f"{k}={v}")]
+
+
+def run_ui(env, *command, args=()):
+    """Run the UI image to completion, as a refused configuration does. A UI that starts instead is removed."""
+    name = f"hak-it-ui-run-{secrets.token_hex(4)}"
+    try:
+        return docker("run", "--rm", "--name", name, *args, *env_args(env), UI_IMAGE, *command, check=False, timeout=60)
+    finally:
+        docker("rm", "-f", name, check=False)
+
+
+MALFORMED = ["public", "public:", ":9999", "Public:9999", "-public:9999", "pub_lic:9999", "public:80", "public:1023",
+             "public:65536", "public:09999", "public:9999:1"]
+
+
+@pytest.mark.parametrize(
+    ("teams", "keys", "named"),
+    [
+        ("public:9999 silver-air:10000", {"PUBLIC": "k"}, "HINDSIGHT_UI_KEY_SILVER_AIR"),
+        ("public:9999 silver-air:10000", {"PUBLIC": "k", "SILVER_AIR": ""}, "HINDSIGHT_UI_KEY_SILVER_AIR"),
+        ("public:9999 silver-air:9999", {"PUBLIC": "k", "SILVER_AIR": "k"}, "port 9999 is listed for both"),
+        ("public:9999 public:10000", {"PUBLIC": "k"}, "Team public is listed twice"),
+        ("", {}, "HINDSIGHT_UI_TEAMS is unset or empty"),
+        ("public:9999\nci-team:10000", {"PUBLIC": "k", "CI_TEAM": "k"}, "holds a tab or line break"),
+        *[(entry, {"PUBLIC": "k"}, f"'{entry}' is not <team>:<port>") for entry in MALFORMED],
+    ],
+)
+def test_the_ui_image_refuses_a_missing_key_a_duplicate_and_a_malformed_entry(teams, keys, named):
+    result = run_ui({"HINDSIGHT_UI_TEAMS": teams, **{f"HINDSIGHT_UI_KEY_{k}": v for k, v in keys.items()}})
+    assert result.returncode == 78, result.stderr
+    assert named in result.stderr
+    assert "on port" not in result.stdout
+
+
+def test_the_ui_image_runs_no_other_command():
+    result = run_ui({"HINDSIGHT_UI_TEAMS": "public:9999", "HINDSIGHT_UI_KEY_PUBLIC": "k"}, "/app/start-all.sh")
+    assert result.returncode == 78
+    assert "takes no command" in result.stderr
+
+
+@pytest.fixture(scope="module")
+def two_team_ui(hindsight, ci_team):
+    """The UI image serving the Public Team (the legacy key) on 9999 and the CI Team (a Team key) on 10000.
+    It reaches the API container by name over a network of their own."""
+    name = f"hak-it-ui-{RUN}"
+    ports = {"public": free_port(), "ci-team": free_port()}
+    docker("network", "create", name)
+    try:
+        docker("network", "connect", name, hindsight["name"])
+        env = {
+            "HINDSIGHT_CP_DATAPLANE_API_URL": f"http://{hindsight['name']}:8888",
+            "HINDSIGHT_UI_TEAMS": "public:9999 ci-team:10000",
+            "HINDSIGHT_UI_KEY_PUBLIC": LEGACY,
+            "HINDSIGHT_UI_KEY_CI_TEAM": ci_team["key"],
+        }
+        # As Conductor runs an image app: its own user, no capabilities.
+        args = ["run", "-d", "--name", name, "--network", name, "--user", "1000:1000", "--cap-drop=ALL"]
+        args += ["-p", f"127.0.0.1:{ports['public']}:9999", "-p", f"127.0.0.1:{ports['ci-team']}:10000"]
+        docker(*args, *env_args(env), UI_IMAGE)
+        for port in ports.values():
+            wait_healthy(port, name, "/api/health")
+        yield {"name": name, "ports": ports, "keys": {"public": LEGACY, "ci-team": ci_team["key"]}}
+    finally:
+        docker("rm", "-f", name, check=False)
+        docker("network", "disconnect", "-f", name, hindsight["name"], check=False)
+        docker("network", "rm", name, check=False)
+
+
+def test_the_ui_image_serves_each_team_on_its_own_port_with_its_own_key(hindsight, two_team_ui):
+    for team, key in two_team_ui["keys"].items():
+        assert http(hindsight["port"], "PUT", f"/v1/default/banks/ui-{team}", key=key, body={"mission": "ci"})[0] in (200, 201)
+    listed = {}
+    for team, key in two_team_ui["keys"].items():
+        status, text = http(two_team_ui["ports"][team], "GET", "/api/banks")
+        assert status == 200, text
+        listed[team] = {b["bank_id"] for b in json.loads(text)["banks"]}
+        status, text = http(hindsight["port"], "GET", "/v1/default/banks", key=key)
+        assert status == 200, text
+        assert listed[team] == {b["bank_id"] for b in json.loads(text)["banks"]}
+        assert f"ui-{team}" in listed[team]
+    assert not listed["public"] & listed["ci-team"]
+
+
+def test_the_ui_image_never_starts_the_api(two_team_ui):
+    assert port_state(two_team_ui["name"], 8888) == "closed"
+
+
+def test_upstreams_launcher_in_the_ui_image_starts_no_api():
+    """Even an entrypoint override that runs upstream's launcher starts only its UI, never the API."""
+    name, port = f"hak-it-ui-launcher-{RUN}", free_port()
+    try:
+        docker("run", "-d", "--name", name, "-p", f"127.0.0.1:{port}:9999", "--entrypoint", "/app/start-all.sh",
+               "-e", "HINDSIGHT_API_LLM_PROVIDER=mock", UI_IMAGE)  # an API, if one started, would come up
+        wait_healthy(port, name, "/api/health")
+        assert port_state(name, 8888) == "closed"
+    finally:
+        docker("rm", "-f", name, check=False)
+
+
+def test_one_ui_process_exiting_stops_the_container(two_team_ui):
+    name = two_team_ui["name"]
+    pids = docker("exec", name, "pgrep", "-P", "1").stdout.split()  # the start script's children, one per Team
+    assert len(pids) == 2
+    docker("exec", name, "kill", pids[0])
+    assert docker("wait", name, timeout=60).stdout.strip() != "0"
+    assert "a UI process exited" in docker("logs", name).stderr
+
+
+def test_a_ui_process_exiting_0_still_stops_the_container_with_a_failure(tmp_path):
+    """Conductor restarts an app only on failure, so a UI that exits cleanly must still fail the container."""
+    node = tmp_path / "node"
+    node.write_text('#!/bin/sh\n[ "$PORT" = 10000 ] && exit 0\nexec sleep 60\n')
+    node.chmod(0o755)
+    env = {"PATH": "/fake:/usr/local/bin:/usr/bin:/bin", "HINDSIGHT_UI_TEAMS": "public:9999 ci-team:10000",
+           "HINDSIGHT_UI_KEY_PUBLIC": "k", "HINDSIGHT_UI_KEY_CI_TEAM": "k"}
+    result = run_ui(env, args=["-v", f"{node}:/fake/node:ro"])
+    assert result.returncode == 1, result.stderr
+    assert "a UI process exited with status 0; stopping the others" in result.stderr
+
+
+def test_stopping_the_ui_container_stops_its_processes_and_exits_0():
+    name, port = f"hak-it-ui-stop-{RUN}", free_port()
+    try:
+        docker("run", "-d", "--name", name, "-p", f"127.0.0.1:{port}:9999",
+               "-e", "HINDSIGHT_UI_TEAMS=public:9999", "-e", "HINDSIGHT_UI_KEY_PUBLIC=k", UI_IMAGE)
+        wait_healthy(port, name, "/api/health")
+        # Without the script's own TERM handling, docker stop would kill it after the timeout: exit 137.
+        docker("stop", "-t", "30", name)
+        assert docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip() == "0"
+    finally:
+        docker("rm", "-f", name, check=False)
 
 
 def test_a_restart_reuses_the_event_log(hindsight):
