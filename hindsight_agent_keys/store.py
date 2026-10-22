@@ -324,18 +324,23 @@ class PostgresKeyStore:
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2", team, email)
 
-    async def set_member(self, team: str, email: str, role: str) -> None:
-        """Add the person to the Team or change their role."""
-        await self._change_members(
+    async def set_member(self, team: str, email: str, role: str) -> str | None:
+        """Add the person to the Team or change their role; returns the role they had, None if they were not in it."""
+        return await self._change_members(
             team,
-            f"INSERT INTO {SCHEMA}.members (team, email, role) VALUES ($1, $2, $3)"
-            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role",
+            f"WITH had AS (SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2),"
+            f" put AS (INSERT INTO {SCHEMA}.members (team, email, role) VALUES ($1, $2, $3)"
+            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role)"
+            " SELECT role FROM had",
             email,
             role,
         )
 
-    async def remove_member(self, team: str, email: str) -> None:
-        await self._change_members(team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2", email)
+    async def remove_member(self, team: str, email: str) -> str | None:
+        """Take the person out of the Team; returns the role they had, None if they were not in it."""
+        return await self._change_members(
+            team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2 RETURNING role", email
+        )
 
     async def request_member(self, team: str, email: str, role: str, by: str) -> None:
         """Ask for the person to get this role in the Team; replaces an earlier request for them."""

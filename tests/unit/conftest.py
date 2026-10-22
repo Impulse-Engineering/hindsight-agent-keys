@@ -114,10 +114,14 @@ class MemoryStore:
         return self.team_roles.get((team, email))
 
     async def set_member(self, team, email, role):
+        had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
+        return had
 
     async def remove_member(self, team, email):
+        had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.pop((team, email), None))
+        return had
 
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)

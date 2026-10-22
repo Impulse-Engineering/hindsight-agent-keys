@@ -14,7 +14,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from hindsight_agent_keys.access import ACCESS_JWT_HEADER
-from hindsight_agent_keys.bodies import NewKey, _or_refused
+from hindsight_agent_keys.bodies import (
+    FormerMember,
+    Member,
+    NewKey,
+    NewTeam,
+    _or_refused,
+)
 from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
 
 DELEGATED_JWT_HEADER = "x-delegated-access-jwt"
@@ -90,6 +96,48 @@ def delegated_router(memory) -> APIRouter:
     # Admin (#1003)
 
     # Teams (#1000)
+
+    @router.post("/teams")
+    async def create_team(body: NewTeam, request: Request, email: str = Depends(delegated_person)):
+        """A Team with the person as its first owner. The name of a Team they own answers that Team, creating nothing."""
+        creation = memory.tenant_extension.create_team(email, body.name, client_ip(request.headers), repeat_ok=True)
+        return {"team": await _or_refused(creation), "name": body.name}
+
+    @router.post("/teams/{team}/keys")
+    async def create_team_key(
+        team: str,
+        body: NewKey,
+        request: Request,
+        idempotency_key: Annotated[str, Header(min_length=1, max_length=200)],
+        email: str = Depends(delegated_person),
+    ):
+        """A key for a Team the person is in (`public` is the Public Team), marked as created via WorkPlane;
+        shown and repeated as a personal key is."""
+        creation = memory.tenant_extension.create_team_key(
+            email, team, body.name, client_ip(request.headers), via=request.state.delegate, idempotency_key=idempotency_key
+        )
+        key_id, key = await _or_refused(creation)
+        shown = {"key": key} if key else {}
+        return JSONResponse({"id": key_id, "name": body.name, **shown}, headers={"Cache-Control": "no-store"})
+
+    # The person must own the Team (on the Key Allowlist) or be an admin. Anyone else is refused (403): a
+    # non-owner's add becomes a Join Request in #1001.
+
+    @router.post("/teams/{team}/members")
+    async def set_member(team: str, body: Member, request: Request, email: str = Depends(delegated_person)):
+        """Add the member, or change their role. A repeat changes nothing."""
+        change = memory.tenant_extension.set_member(
+            email, team, body.email, body.role, client_ip(request.headers), repeat_ok=True
+        )
+        await _or_refused(change)
+        return {"team": team, "email": body.email, "role": body.role}
+
+    @router.delete("/teams/{team}/members")
+    async def remove_member(team: str, body: FormerMember, request: Request, email: str = Depends(delegated_person)):
+        """Their Team keys stop on their next request. A repeat changes nothing."""
+        removal = memory.tenant_extension.remove_member(email, team, body.email, client_ip(request.headers), repeat_ok=True)
+        await _or_refused(removal)
+        return {"team": team, "email": body.email}
 
     # Join Requests (#1001)
 
