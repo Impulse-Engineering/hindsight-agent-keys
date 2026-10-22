@@ -87,7 +87,7 @@ Tables in `agent_keys`: `people` (email, schema, empty until the person's first 
 Only people on the Key Allowlist can create Agent Keys. The bootstrap admins in `AGENT_KEYS_ADMIN_EMAILS` are always on it; everyone else has a row in `agent_keys.allowlist` with the role `member`, `admin`, or `requested` (asked to join, not yet on the list).
 
 - **Asking to join:** a signed-in person who is not on the list sees a button on `/ext/` that files a request. Asking again changes nothing.
-- **Admins** (bootstrap admins and anyone granted admin rights) manage the list at `https://<access host>/ext/admin`: add people by email, approve or decline requests, grant and remove admin rights, and remove people. The same page revokes an identity (see "Personal Agent Keys"), lists stale personal schemas (see "Stale personal schemas"), and holds the kill switch: it revokes every key created via WorkPlane, whoever holds it, and leaves keys created on the page working (`docs/operating.md`, "Kill switch"). Everyone else gets 403 on every `/ext/admin` route. The bootstrap admins cannot be changed there (409); edit the secret instead.
+- **Admins** (bootstrap admins and anyone granted admin rights) manage the list at `https://<access host>/ext/admin`: add people by email, approve or decline requests, grant and remove admin rights, and remove people. The same page revokes an identity (see "Personal Agent Keys"), lists stale personal schemas (see "Stale personal schemas"), and holds the kill switch: it revokes every key created via WorkPlane, whoever holds it, and leaves keys created on the page working. It does not stop WorkPlane creating new keys while WorkPlane's service token works, so delete the token in Access first, then press it, and press it again a minute later for a creation that was already under way (`docs/operating.md`, "Kill switch"). A repeat revokes only keys not yet revoked. Everyone else gets 403 on every `/ext/admin` route. The bootstrap admins cannot be changed there (409); edit the secret instead.
 - **Removing someone** stops them creating keys and disables the keys they hold: every request with a key checks its owner is still on the list. Their keys are not deleted, so adding them back makes the keys work again. It also stops them acting as a Team owner (adding or removing members, asking for people to join, confirming or declining requests, creating Team keys) until they are added back. Their Teams, ownership and memberships are kept, and they can still list and revoke their own keys and ask to be added back.
 - **Logging:** every change is an event (see "The event log").
 
@@ -136,7 +136,7 @@ A Delegate (WorkPlane, the organization's agent) acts for a person signed in to 
 | `POST /ext/delegated/keys/<id>/renew` | Renews one of them for 90 days from now, as the key page does, with the same refusals. Answers `{"id": …, "expires_at": …}`. |
 | `POST /ext/delegated/keys/<id>/revoke` | Revokes one of them. Answers `{"id": …, "state": "revoked"}`, a repeat too. |
 | `POST /ext/delegated/admin/people` | Changes someone's place on the Key Allowlist, as `/ext/admin` does: takes `{"email": …, "role": …}`, the role `member`, `admin` or `null` (which removes them, or declines their request). Answers `{"email": …, "role": …}` with their role now; a repeat changes and records nothing. The bootstrap admins cannot be changed (409). |
-| `POST /ext/delegated/admin/revoke-identity` | Revokes every key the person `{"email": …}` holds, whoever created them, as `/ext/admin` does. Answers `{"revoked": …}`, the number this request revoked, so a repeat answers 0. |
+| `POST /ext/delegated/admin/revoke-identity` | Revokes every key the person `{"email": …}` holds, whoever created them, as `/ext/admin` does. Answers `{"email": …, "revoked": …, "active": …}`: how many keys this request revoked, and how many of the person's keys are active now. A repeat revokes and records nothing. |
 
 The key routes reach only the person's own keys created via WorkPlane: never their key page keys (404), nor anyone else's. Keys created via WorkPlane are listed on the person's key page, where they can renew and revoke them. Each person may hold 25 active keys created via WorkPlane, and WorkPlane may create 25 an hour for them (`HINDSIGHT_API_TENANT_WORKPLANE_ACTIVE_KEYS` and `..._KEYS_PER_HOUR`), counted apart from the person's own 10 and 5, in the database under the same per-person lock, so concurrent creations stop at the cap (429).
 
@@ -200,7 +200,7 @@ Kinds:
 - `key_created`
 - `key_renewed`
 - `key_revoked`
-- `identity_revoked`
+- `identity_revoked`: an admin revoked every key a person held; recorded only when that revoked at least one
 - `workplane_keys_revoked`: an admin used the kill switch on `/ext/admin`; every key created via WorkPlane was revoked
 - Key Allowlist changes:
   - `access_requested`

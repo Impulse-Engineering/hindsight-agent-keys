@@ -46,7 +46,7 @@ Every change is an event in `agent_keys.events` (README, "The event log").
 
 For someone who leaves, or whose keys must stop now:
 
-1. On `/ext/admin`, enter their email to revoke their identity. Every key they hold, personal and Team, is revoked and fails on its next request, including inside an open MCP session. The event log records `identity_revoked` with you as `actor`.
+1. On `/ext/admin`, enter their email to revoke their identity. Every key they hold, personal and Team, is revoked and fails on its next request, including inside an open MCP session. If that revoked any key, the event log records `identity_revoked` with you as `actor`.
 2. Remove them from the Key Allowlist on the same page. Otherwise they can create new keys.
 3. Remove them from their Teams on `/ext/teams`; admins see every Team there. Otherwise adding them back to the Key Allowlist later would give their new Team keys access again, and an owner would manage the Team again.
 
@@ -65,14 +65,15 @@ An admin signed in to WorkPlane can also do steps 1 and 2 through it, for keys o
 
 ## Kill switch
 
-For a compromised or misbehaving WorkPlane: stop everything it does in Hindsight at once. Do both steps, in this order, or WorkPlane creates new keys for the people signed in to it as fast as step 2 revokes them.
+For a compromised or misbehaving WorkPlane: stop everything it does in Hindsight at once. Do the steps in this order. Revoking the keys (step 2) stops their retain and recall, but not WorkPlane creating new keys for the people who use it: only deleting its service token (step 1) stops that.
 
 1. **Stop Delegated Requests in Access** (a Cloudflare Zero Trust admin). Under **Access controls** > **Service credentials** > **Service Tokens**, delete WorkPlane's service token, the one whose client ID is `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID`; a deleted token cannot be recovered. Then edit the delegation application and select **Revoke existing tokens**, which ends the sessions Access already issued to it. **Auth state:** from then on Access refuses every Delegated Request, so WorkPlane can neither manage access nor create keys, but the keys it created still retain and recall until step 2.
 2. **Revoke every key created via WorkPlane** (an admin). On `/ext/admin`, under **Kill switch**, press **Revoke every key created via WorkPlane**. Every such key, personal or Team, whoever holds it, is revoked in one transaction and fails on its next request, including inside an open MCP session. Keys people created on `/ext/` keep working. The event log records `workplane_keys_revoked` with you as `actor`. No Delegated Request can do this, even an admin's, so it never depends on WorkPlane.
+3. **Press it again a minute later.** A key creation that had already passed Hindsight's checks when step 1 took effect can still be stored after the first press. The second press revokes it. Pressing again is safe: it revokes only keys not yet revoked, and answers how many, normally 0.
 
-If step 1 has to wait for an Access admin, do step 2 at once and again after step 1: in between, WorkPlane can still create keys for the people who use it.
+If step 1 has to wait for an Access admin, do step 2 at once, then steps 1 to 3 as soon as you can: until step 1, WorkPlane can still create keys for the people who use it.
 
-To check from the CT, this prints the number of keys created via WorkPlane that are not revoked, 0 after step 2 *(not verified on Dev; runs in the integration tests)*:
+To check from the CT, this prints the number of keys created via WorkPlane that are not revoked, 0 after step 3 *(not verified on Dev; runs in the integration tests)*:
 
 ```sh
 # CT

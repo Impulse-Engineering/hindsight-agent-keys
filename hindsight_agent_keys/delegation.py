@@ -108,9 +108,12 @@ def delegated_router(memory) -> APIRouter:
 
     @admin_router.post("/revoke-identity")
     async def revoke_identity(body: Identity, request: Request, email: str = Depends(delegated_admin)):
-        """The admin exception: every key the person holds, whoever created it, as /ext/admin/revoke-identity does."""
-        revocation = memory.tenant_extension.revoke_identity(email, body.email, client_ip(request.headers))
-        return {"revoked": await _or_refused(revocation)}
+        """The admin exception: every key the person holds, whoever created it, as /ext/admin/revoke-identity does.
+        Answers how many this request revoked and how many of their keys are active now, a repeat too."""
+        keys = memory.tenant_extension
+        revoked = await _or_refused(keys.revoke_identity(email, body.email, client_ip(request.headers)))
+        active = sum(k["state"] == "active" for k in await keys.list_keys(body.email))
+        return {"email": body.email, "revoked": revoked, "active": active}
 
     # Teams (#1000)
 
