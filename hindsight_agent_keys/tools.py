@@ -3,8 +3,9 @@
 Upstream registers these on both MCP servers, multi-bank (/mcp/) and single-bank
 (/mcp/<bank>/), each with its own instance and no context, so this class holds no
 state and reaches everything through the tenant extension. Only a personal Agent Key
-may use them, and adding someone only files a request that an owner on the Key Allowlist, or an admin, confirms
-on the Access-protected Teams page: an agent never grants anyone access on its own.
+may use them, and adding someone, or asking to join a Team, only files a request that an owner on the Key Allowlist,
+or an admin, confirms on the Access-protected Teams page or by Delegated Request: an agent never grants anyone
+access on its own, and there is no tool that confirms or declines a request.
 """
 
 from typing import Literal
@@ -52,10 +53,22 @@ class AgentKeysMcpExtension(MCPExtension):
                 return {"error": str(refusal)}
 
         @mcp.tool()
+        async def request_to_join_team(name: Name) -> dict:
+            """Ask to join a Team you are not in, by the Team's name (any case). Needs you on the Key Allowlist.
+            The answer is the same whether or not such a Team exists. You gain no access until an owner of the Team,
+            or an admin, confirms it, on the Teams page (/ext/teams) or through WorkPlane."""
+            try:
+                await memory.tenant_extension.request_to_join(await person(), name, ip())
+            except Refused as refusal:
+                return {"error": str(refusal)}
+            return {"name": name, "status": "pending"}
+
+        @mcp.tool()
         async def add_team_member(team: str, email: Email, role: Literal["member", "owner"] = "member") -> dict:
             """Ask for someone to join a Team you own while on the Key Allowlist (or any Team, as an admin),
-            as a member or an owner, by email.
-            Nobody gains access until an owner of the Team on the Key Allowlist, or an admin, confirms it on the Teams page (/ext/teams)."""
+            as a member or an owner, by email. If you do not own the Team, you may ask only for yourself.
+            Nobody gains access until an owner of the Team on the Key Allowlist, or an admin, confirms it, on the Teams page
+            (/ext/teams) or through WorkPlane."""
             try:
                 await memory.tenant_extension.request_member(await person(), team, email, role, ip())
             except Refused as refusal:

@@ -18,6 +18,7 @@ from hindsight_agent_keys.access import ACCESS_JWT_HEADER
 from hindsight_agent_keys.bodies import (
     FormerMember,
     Identity,
+    JoinRequest,
     Member,
     NewKey,
     NewTeam,
@@ -156,11 +157,18 @@ class AgentKeysHttpExtension(HttpExtension):
             key_id, key = await _or_refused(creation)
             return JSONResponse({"id": key_id, "name": body.name, "key": key}, headers={"Cache-Control": "no-store"})
 
+        @router.post("/join-requests")
+        async def ask_to_join(body: JoinRequest, request: Request, email: str = Depends(person)):
+            """Ask the Team's owners to let the person in; the answer is the same whether the Team exists."""
+            await _or_refused(memory.tenant_extension.request_to_join(email, body.name, client_ip(request.headers)))
+            return {"name": body.name, "status": "pending"}
+
         @router.post("/teams/{team}/members")
         async def set_member(team: str, body: Member, request: Request, email: str = Depends(person)):
+            """A person who manages nothing here may add only themselves, which files a Join Request for the role given."""
             change = memory.tenant_extension.set_member(email, team, body.email, body.role, client_ip(request.headers))
-            await _or_refused(change)
-            return {"team": team, "email": body.email, "role": body.role}
+            added = {"team": team, "email": body.email, "role": body.role}
+            return added if await _or_refused(change) else {**added, "status": "pending"}
 
         @router.delete("/teams/{team}/members")
         async def remove_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
@@ -169,14 +177,15 @@ class AgentKeysHttpExtension(HttpExtension):
 
         @router.post("/teams/{team}/confirmations")
         async def confirm_member(team: str, body: Member, request: Request, email: str = Depends(person)):
-            """Confirm a pending request to add someone, filed by an agent over MCP, for the role the page showed."""
+            """Confirm a pending request to add someone, filed by an agent over MCP or by the person (a Join Request),
+            for the role the page showed."""
             change = memory.tenant_extension.confirm_member(email, team, body.email, body.role, client_ip(request.headers))
             await _or_refused(change)
             return {"team": team, "email": body.email, "role": body.role}
 
         @router.delete("/teams/{team}/requests")
         async def decline_member(team: str, body: FormerMember, request: Request, email: str = Depends(person)):
-            """Decline a pending request to add someone, filed by an agent over MCP."""
+            """Decline a pending request to add someone, filed by an agent over MCP or by the person (a Join Request)."""
             await _or_refused(memory.tenant_extension.decline_member(email, team, body.email, client_ip(request.headers)))
             return {"team": team, "email": body.email}
 
@@ -391,7 +400,8 @@ def teams_html(email: str, teams: list[dict]) -> str:
 KEY_FORM = """<form data-url="{url}/keys" data-method="POST">
 <label>Key name <input name="name" required maxlength="100"></label> <button>{label}</button></form>"""
 
-# Shown to members too; the server refuses changes from anyone but admins and owners on the Key Allowlist.
+# Shown to members too; the server refuses changes from anyone but admins and owners on the Key Allowlist,
+# except that a person adding themselves as a member only files a Join Request.
 MEMBER_FORMS = """<form data-url="{url}/members" data-method="POST">
 <label>Email <input name="email" type="email" required></label>
 <label>Role <select name="role"><option>member</option><option>owner</option></select></label>
@@ -399,8 +409,8 @@ MEMBER_FORMS = """<form data-url="{url}/members" data-method="POST">
 <form data-url="{url}/members" data-method="DELETE">
 <label>Email <input name="email" type="email" required></label> <button>Remove</button></form>"""
 
-# A request an agent filed over MCP lets nobody in until an owner on the Key Allowlist, or an admin, presses Confirm,
-# which sends the role shown, so a request changed since is refused rather than granted.
+# A request an agent filed over MCP, or a person filed for themselves (a Join Request), lets nobody in until an owner on
+# the Key Allowlist, or an admin, presses Confirm, which sends the role shown, so a request changed since is refused rather than granted.
 REQUEST_FORMS = """<form data-url="{url}/confirmations" data-method="POST">
 <input type="hidden" name="email" value="{email}"><input type="hidden" name="role" value="{role}"><button>Confirm</button></form>
 <form data-url="{url}/requests" data-method="DELETE">
@@ -418,6 +428,10 @@ $public
 <h2>Create a Team</h2>
 <form data-url="/ext/teams" data-method="POST">
 <label>Team name <input name="name" required maxlength="100"></label> <button>Create</button></form>
+<h2>Ask to join a Team</h2>
+<p>Name a Team you are not in. Its owners, or an admin, decide; this page answers the same whether or not the Team exists.</p>
+<form data-url="/ext/join-requests" data-method="POST">
+<label>Team name <input name="name" required maxlength="100"></label> <button>Ask to join</button></form>
 $teams
 <script>
 for (const form of document.querySelectorAll("form[data-url]")) {
@@ -434,6 +448,8 @@ for (const form of document.querySelectorAll("form[data-url]")) {
       result.textContent = "Refused: " + JSON.stringify(body.detail);
     } else if (body.key) {
       result.textContent = "Your new key, shown only now. Copy it: " + body.key;
+    } else if (body.status === "pending") {
+      result.textContent = "Asked. You gain no access until an owner of the Team, or an admin, confirms it.";
     } else {
       location.reload();
     }

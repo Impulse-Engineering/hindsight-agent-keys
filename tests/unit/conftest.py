@@ -119,6 +119,8 @@ class MemoryStore:
     async def set_member(self, team, email, role):
         had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
+        # A direct add settles the person's open request.
+        self.requests.pop((team, email), None)
         return had
 
     async def remove_member(self, team, email):
@@ -130,11 +132,16 @@ class MemoryStore:
         self._change_members(team, lambda roles: None)
         self.requests[team, email] = (role, by)
 
+    async def add_join_request(self, team, email, role):
+        if team not in self.teams_by_schema or (team, email) in self.team_roles or (team, email) in self.requests:
+            return False
+        self.requests[team, email] = (role, email)
+        return True
+
     async def confirm_member(self, team, email, role):
         asked, _ = self.requests.get((team, email), (None, None))
         if asked == role:
             await self.set_member(team, email, role)
-            del self.requests[team, email]
         return asked
 
     async def decline_member(self, team, email):

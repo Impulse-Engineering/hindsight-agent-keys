@@ -123,6 +123,7 @@ TOOL_CALLS = [
     ("list_teams", {}),
     ("add_team_member", {"email": CAROL, "role": "owner"}),
     ("remove_team_member", {"email": BOB}),
+    ("request_to_join_team", {"name": "Platform"}),
 ]
 
 

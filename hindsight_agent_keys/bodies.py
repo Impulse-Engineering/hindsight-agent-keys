@@ -21,6 +21,10 @@ class NewTeam(BaseModel):
     name: Name
 
 
+class JoinRequest(BaseModel):
+    name: Name  # the Team's name, in any case
+
+
 class Member(BaseModel):
     email: Email
     role: Literal["owner", "member"]

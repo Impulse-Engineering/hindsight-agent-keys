@@ -203,16 +203,21 @@ def key_page(hindsight, method, path, email, host=ACCESS_HOST, body=None, header
     return http(hindsight["port"], method, path, body=body, headers={**sent, **(headers or {})})
 
 
-def delegated(hindsight, method, path, email, body=None, delegate=None, person=None, headers=None):
-    """A Delegated Request: WorkPlane's service-token JWT, as Access forwards it, and the person's own JWT.
-    `delegate` and `person` override that credential's claims; None drops one. `headers` are added."""
+def delegated_headers(hindsight, email, delegate=None, person=None):
+    """A Delegated Request's headers: WorkPlane's service-token JWT, as Access forwards it, and the person's own JWT.
+    `delegate` and `person` override that credential's claims; None drops one. Minted once, they serve many requests."""
     service = {"common_name": DELEGATE_ID, "sub": "", "aud": [DELEGATION_AUD], **(delegate or {})}
     signed_in = {"email": email, "aud": [WORKPLANE_AUD], **(person or {})}
-    sent = {
+    return {
         "Host": DELEGATION_HOST,
         "Cf-Access-Jwt-Assertion": access_token(hindsight["name"], **service),
         "X-Delegated-Access-Jwt": access_token(hindsight["name"], **signed_in),
     }
+
+
+def delegated(hindsight, method, path, email, body=None, delegate=None, person=None, headers=None):
+    """A Delegated Request for the person; `headers` are added to those `delegated_headers` makes."""
+    sent = delegated_headers(hindsight, email, delegate, person)
     return http(hindsight["port"], method, path, body=body, headers={**sent, **(headers or {})})
 
 
@@ -1305,6 +1310,186 @@ def test_the_kill_switch_revokes_every_key_created_via_workplane_and_no_other(hi
     assert query(name, f"SELECT kind, email, actor, channel FROM agent_keys.events WHERE client_ip = '{ip}'") == [
         {"kind": "workplane_keys_revoked", "email": None, "actor": ALICE, "channel": "ext"}
     ]
+
+
+def test_join_requests_are_filed_by_name_on_every_channel_and_a_delegate_answers_them(hindsight):
+    port, name = hindsight["port"], hindsight["name"]
+    vera, walt, xena, yuri, tim, uma, zed = (f"{n}@example.test" for n in ("vera", "walt", "xena", "yuri", "tim", "uma", "zed"))
+    for person in (vera, walt, xena, yuri, tim, uma, zed):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+
+    def send(method, path, email, body=None):
+        status, text = delegated(hindsight, method, f"/ext/delegated{path}", email, body=body)
+        return status, json.loads(text) if text.startswith(("{", "[")) else text
+
+    team = send("POST", "/teams", vera, {"name": "Join Team"})[1]["team"]
+    members = f"/teams/{team}/members"
+    asked = {"name": "join team", "status": "pending"}
+    requests = f"SELECT email, role, requested_by FROM agent_keys.member_requests WHERE team = '{team}' ORDER BY email"
+    # By Delegated Request, a repeat and a missing Team answering alike; on the Teams page and over MCP, spelled in any case.
+    assert send("POST", "/join-requests", walt, {"name": "join team"}) == (200, asked)
+    assert send("POST", "/join-requests", walt, {"name": " JOIN TEAM "}) == (200, {**asked, "name": "JOIN TEAM"})
+    assert send("POST", "/join-requests", walt, {"name": "no such team"}) == (200, {**asked, "name": "no such team"})
+    status, text = key_page(hindsight, "POST", "/ext/join-requests", xena, body={"name": "Join Team"})
+    assert (status, json.loads(text)) == (200, {**asked, "name": "Join Team"}), text
+    yuri_key = personal_key(hindsight, yuri)["key"]
+    assert call_tool(port, yuri_key, MCP_ENDPOINTS[0], "request_to_join_team", name="join team") == asked
+    # A non-owner's direct add of themselves is the same request; for a Team that does not exist, nothing is stored.
+    assert send("POST", members, tim, {"email": tim, "role": "member"}) == (
+        200, {"team": team, "email": tim, "role": "member", "status": "pending"}
+    )
+    assert send("POST", "/teams/t_0000000000000000/members", tim, {"email": tim, "role": "member"})[0] == 200
+    assert send("POST", members, tim, {"email": walt, "role": "member"})[0] == 403
+    # As an owner it is a request for that role. Asking again, for the other role, leaves the first request as it is.
+    assert send("POST", members, uma, {"email": uma, "role": "owner"}) == (
+        200, {"team": team, "email": uma, "role": "owner", "status": "pending"}
+    )
+    assert send("POST", members, tim, {"email": tim, "role": "owner"})[1]["status"] == "pending"
+    # An owner's own request for zed, asked over MCP, is not replaced by zed asking for himself, again and again.
+    vera_key = personal_key(hindsight, vera)["key"]
+    answer = call_tool(port, vera_key, MCP_ENDPOINTS[0], "add_team_member", team=team, email=zed, role="owner")
+    assert answer["status"] == "pending"
+    for _ in range(2):
+        assert send("POST", "/join-requests", zed, {"name": "join team"}) == (200, asked)
+    pending = {
+        walt: ("member", walt), xena: ("member", xena), yuri: ("member", yuri), tim: ("member", tim),
+        uma: ("owner", uma), zed: ("owner", vera),
+    }
+    assert query(name, requests) == [
+        {"email": e, "role": r, "requested_by": by} for e, (r, by) in sorted(pending.items())
+    ]
+    assert query(name, "SELECT count(*)::int AS n FROM agent_keys.member_requests WHERE team = 't_0000000000000000'") == [{"n": 0}]
+
+    # An owner's direct add settles the person's request, so confirming it later cannot change the role given.
+    assert send("POST", members, vera, {"email": yuri, "role": "owner"})[0] == 200
+    assert query(name, f"SELECT role FROM agent_keys.members WHERE team = '{team}' AND email = '{yuri}'") == [{"role": "owner"}]
+    del pending[yuri]
+    assert [r["email"] for r in query(name, requests)] == sorted(pending)
+    # Only the owner answers, as a Delegated Request or on the Teams page, and a repeat changes nothing.
+    assert send("POST", f"/teams/{team}/confirmations", walt, {"email": walt, "role": "member"})[0] == 403
+    for _ in range(2):
+        assert send("POST", f"/teams/{team}/confirmations", vera, {"email": walt, "role": "member"})[0] == 200
+        assert send("DELETE", f"/teams/{team}/requests", vera, {"email": tim})[0] == 200
+    # Someone in the Team already asking again, by name or by adding themselves, in either role, is a no-op.
+    events = f"SELECT count(*)::int AS n FROM agent_keys.events WHERE team = '{team}' AND kind = 'join_requested'"
+    before = query(name, events)
+    assert send("POST", "/join-requests", walt, {"name": "join team"}) == (200, asked)
+    for role in ("member", "owner"):
+        assert send("POST", members, walt, {"email": walt, "role": role}) == (
+            200, {"team": team, "email": walt, "role": role, "status": "pending"}
+        )
+    assert query(name, events) == before
+    assert walt not in [r["email"] for r in query(name, requests)]
+    # Uma asked for the owner role: a confirmation of the member role the page did not show is refused.
+    assert send("POST", f"/teams/{team}/confirmations", vera, {"email": uma, "role": "member"})[0] == 409
+    assert send("POST", f"/teams/{team}/confirmations", vera, {"email": uma, "role": "owner"})[0] == 200
+    assert send("POST", f"/teams/{team}/confirmations", vera, {"email": zed, "role": "owner"})[0] == 200
+    status, text = key_page(hindsight, "POST", f"/ext/teams/{team}/confirmations", vera, body={"email": xena, "role": "member"})
+    assert status == 200, text
+    assert query(name, requests) == []
+    sql = f"SELECT email, role FROM agent_keys.members WHERE team = '{team}' ORDER BY email"
+    assert query(name, sql) == [
+        {"email": e, "role": r}
+        for e, r in sorted([(vera, "owner"), (walt, "member"), (xena, "member"), (yuri, "owner"), (uma, "owner"), (zed, "owner")])
+    ]
+    assert key_page(hindsight, "POST", f"/ext/teams/{team}/keys", walt, body={"name": "ci"})[0] == 200
+    sql = f"SELECT kind, email, actor, channel FROM agent_keys.events WHERE team = '{team}' AND kind LIKE 'join_%' ORDER BY id"
+    assert [(r["kind"], r["email"], r["actor"], r["channel"]) for r in query(name, sql)] == [
+        ("join_requested", walt, walt, "delegated"),
+        ("join_requested", xena, xena, "ext"),
+        ("join_requested", yuri, yuri, "mcp"),
+        ("join_requested", tim, tim, "delegated"),
+        ("join_requested", uma, uma, "delegated"),
+    ]
+
+
+def test_concurrent_approvals_direct_adds_and_requests_for_one_person_yield_one_membership(hindsight):
+    port, name = hindsight["port"], hindsight["name"]
+    nina, owen, pat = (f"{n}@example.test" for n in ("nina", "owen", "pat"))
+    for person in (nina, owen, pat):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    # Minted once per person, so the requests below reach the server together.
+    nina_sent, owen_sent, pat_sent = (delegated_headers(hindsight, person) for person in (nina, owen, pat))
+    status, text = http(port, "POST", "/ext/delegated/teams", body={"name": "Race Team"}, headers=nina_sent)
+    assert status == 200, text
+    team = json.loads(text)["team"]
+    base = f"/ext/delegated/teams/{team}"
+    assert http(port, "POST", "/ext/delegated/join-requests", body={"name": "race team"}, headers=pat_sent)[0] == 200
+    assert http(port, "POST", f"{base}/members", body={"email": owen, "role": "owner"}, headers=nina_sent)[0] == 200
+    calls = [
+        ("POST", f"{base}/confirmations", {"email": pat, "role": "member"}, nina_sent),
+        ("POST", f"{base}/confirmations", {"email": pat, "role": "member"}, owen_sent),
+        ("POST", f"{base}/members", {"email": pat, "role": "member"}, nina_sent),
+        ("POST", f"{base}/members", {"email": pat, "role": "member"}, owen_sent),
+        ("POST", "/ext/delegated/join-requests", {"name": "race team"}, pat_sent),
+        ("POST", f"{base}/members", {"email": pat, "role": "member"}, pat_sent),
+    ] * 3
+
+    def request(call):
+        method, path, body, sent = call
+        return http(port, method, path, body=body, headers=sent)[0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        assert list(pool.map(request, calls)) == [200] * len(calls)
+    sql = f"SELECT role FROM agent_keys.members WHERE team = '{team}' AND email = '{pat}'"
+    assert query(name, sql) == [{"role": "member"}]
+    assert query(name, f"SELECT count(*)::int AS n FROM agent_keys.member_requests WHERE team = '{team}'") == [{"n": 0}]
+
+
+HOLD_TEAM_LOCK = """
+import asyncio
+import asyncpg
+from pg0 import Pg0
+async def main():
+    conn = await asyncpg.connect(Pg0(name="hindsight").info().uri)
+    async with conn.transaction():
+        # Not FOR UPDATE: that would also hold up the foreign keys of every member and request row, which need no Team lock.
+        await conn.fetchval("SELECT 1 FROM agent_keys.teams WHERE schema = $1 FOR NO KEY UPDATE", TEAM)
+        open("/tmp/held-" + TEAM, "w").close()
+        await asyncio.sleep(HOLD)
+    await conn.close()
+asyncio.run(main())
+"""
+
+
+def test_approving_declining_and_asking_to_join_wait_for_the_teams_lock(hindsight):
+    port, name = hindsight["port"], hindsight["name"]
+    ivy, jon, kai, mia = (f"{n}@example.test" for n in ("ivy", "jon", "kai", "mia"))
+    for person in (ivy, jon, kai, mia):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    ivy_sent, jon_sent, kai_sent, mia_sent = (delegated_headers(hindsight, person) for person in (ivy, jon, kai, mia))
+    status, text = http(port, "POST", "/ext/delegated/teams", body={"name": "Lock Team"}, headers=ivy_sent)
+    assert status == 200, text
+    team = json.loads(text)["team"]
+    for sent in (jon_sent, mia_sent):
+        assert http(port, "POST", "/ext/delegated/join-requests", body={"name": "lock team"}, headers=sent)[0] == 200
+    hold = 8
+    docker("exec", "-d", name, PYTHON, "-c", f"TEAM = {team!r}\nHOLD = {hold}\n{HOLD_TEAM_LOCK}")
+    deadline = time.time() + 30
+    while docker("exec", name, "test", "-e", f"/tmp/held-{team}", check=False).returncode:
+        assert time.time() < deadline, "the lock was never taken"
+        time.sleep(0.2)
+    started = time.time()
+
+    def answer(call):
+        method, path, body, sent = call
+        status = http(port, method, path, body=body, headers=sent)[0]
+        return status, time.time() - started
+
+    calls = [
+        ("POST", f"/ext/delegated/teams/{team}/confirmations", {"email": jon, "role": "member"}, ivy_sent),
+        ("DELETE", f"/ext/delegated/teams/{team}/requests", {"email": mia}, ivy_sent),
+        ("POST", "/ext/delegated/join-requests", {"name": "lock team"}, kai_sent),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        answers = list(pool.map(answer, calls))
+    # Each answered, and only once the holder let go.
+    assert [status for status, _ in answers] == [200] * len(calls), answers
+    assert min(waited for _, waited in answers) >= hold - 4, answers
+    assert query(name, f"SELECT email, role FROM agent_keys.members WHERE team = '{team}' ORDER BY email") == [
+        {"email": ivy, "role": "owner"}, {"email": jon, "role": "member"}
+    ]
+    assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": kai}]
 
 
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
