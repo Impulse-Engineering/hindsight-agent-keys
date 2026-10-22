@@ -1,6 +1,8 @@
 """Stand-ins for what the extension talks to: its database, Hindsight's migrations,
 the event log, and a Cloudflare Access team that serves signing keys and signs JWTs."""
 
+import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -80,6 +82,7 @@ class MemoryStore:
         self.stale = []
         self.fail = False
         self.idempotency = {}  # (delegate, email, key) -> body_sha256, key_id, created_at
+        self.name_locks = {}  # lower-cased Team name -> asyncio.Lock
 
     async def stale_schemas(self):
         return self.stale
@@ -114,10 +117,14 @@ class MemoryStore:
         return self.team_roles.get((team, email))
 
     async def set_member(self, team, email, role):
+        had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
+        return had
 
     async def remove_member(self, team, email):
+        had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.pop((team, email), None))
+        return had
 
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)
@@ -258,6 +265,17 @@ class MemoryStore:
 
     async def last_sign_in(self, email):
         return self.sign_ins.get(email)
+
+    async def team_name(self, team):
+        return self.teams_by_schema.get(team)
+
+    async def team_creator(self, team):
+        return self.creators.get(team)
+
+    @contextlib.asynccontextmanager
+    async def team_name_lock(self, name):
+        async with self.name_locks.setdefault(name.strip().lower(), asyncio.Lock()):
+            yield
 
     async def revoke_workplane_keys(self, now):
         hits = [k for k in self.keys.values() if k["via"] is not None and k["revoked_at"] is None]

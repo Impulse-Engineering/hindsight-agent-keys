@@ -203,9 +203,9 @@ def key_page(hindsight, method, path, email, host=ACCESS_HOST, body=None, header
     return http(hindsight["port"], method, path, body=body, headers={**sent, **(headers or {})})
 
 
-def delegated(hindsight, method, path, email, body=None, delegate=None, person=None):
+def delegated(hindsight, method, path, email, body=None, delegate=None, person=None, headers=None):
     """A Delegated Request: WorkPlane's service-token JWT, as Access forwards it, and the person's own JWT.
-    `delegate` and `person` override that credential's claims; None drops one."""
+    `delegate` and `person` override that credential's claims; None drops one. `headers` are added."""
     service = {"common_name": DELEGATE_ID, "sub": "", "aud": [DELEGATION_AUD], **(delegate or {})}
     signed_in = {"email": email, "aud": [WORKPLANE_AUD], **(person or {})}
     sent = {
@@ -213,7 +213,7 @@ def delegated(hindsight, method, path, email, body=None, delegate=None, person=N
         "Cf-Access-Jwt-Assertion": access_token(hindsight["name"], **service),
         "X-Delegated-Access-Jwt": access_token(hindsight["name"], **signed_in),
     }
-    return http(hindsight["port"], method, path, body=body, headers=sent)
+    return http(hindsight["port"], method, path, body=body, headers={**sent, **(headers or {})})
 
 
 def personal_key(hindsight, email, name="ci"):
@@ -1124,6 +1124,152 @@ def test_concurrent_delegated_creations_stop_at_the_workplane_cap(hindsight):
     for action in ("renew", "revoke"):
         assert http(port, "POST", f"/ext/delegated/keys/{own['id']}/{action}", body={}, headers=sent)[0] == 404
     personal_key(hindsight, kim)
+
+
+def test_a_delegate_creates_a_team_adds_a_member_and_their_workplane_team_key_stops_when_they_are_removed(hindsight):
+    port, name = hindsight["port"], hindsight["name"]
+    olga, mina, nora = (f"{n}@example.test" for n in ("olga", "mina", "nora"))
+    # On the Key Allowlist, and not admins.
+    for person in (olga, mina, nora):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+
+    def send(method, path, email, body=None, **headers):
+        status, text = delegated(hindsight, method, f"/ext/delegated{path}", email, body=body, headers=headers)
+        return status, json.loads(text) if text.startswith(("{", "[")) else text
+
+    status, made = send("POST", "/teams", olga, {"name": "WP Team"})
+    assert status == 200, made
+    team = made["team"]
+    # A repeat answers the Team the person created and owns, as stored, and creates no second.
+    assert send("POST", "/teams", olga, {"name": "wp team"}) == (200, {"team": team, "name": "WP Team"})
+    assert query(name, "SELECT count(*) AS n FROM agent_keys.teams WHERE lower(name) = 'wp team'") == [{"n": 1}]
+    members, creation = f"/teams/{team}/members", f"/teams/{team}/keys"
+    for _ in range(2):
+        assert send("POST", members, olga, {"email": mina, "role": "member"}) == (
+            200, {"team": team, "email": mina, "role": "member"}
+        )
+    # A member adds nobody, and someone outside the Team gets no key for it.
+    assert send("POST", members, mina, {"email": nora, "role": "member"})[0] == 403
+    assert send("POST", creation, nora, {"name": "wp"}, **{"Idempotency-Key": "n1"})[0] == 403
+
+    status, created = send("POST", creation, mina, {"name": "wp"}, **{"Idempotency-Key": "m1"})
+    assert status == 200, created
+    key = created["key"]
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
+    assert send("POST", creation, mina, {"name": "wp"}, **{"Idempotency-Key": "m1"}) == (
+        200, {"id": created["id"], "name": "wp"}
+    )
+    for path in MCP_ENDPOINTS:
+        assert "personal Agent Key" in call_tool(port, key, path, "create_team", name="Not allowed")["error"]
+    # The owner has no claim on a member's key, on either channel.
+    assert send("GET", "/keys", olga) == (200, [])
+    status, listed = key_page(hindsight, "GET", "/ext/keys", olga)
+    assert (status, json.loads(listed)) == (200, [])
+    for action in ("renew", "revoke"):
+        assert send("POST", f"/keys/{created['id']}/{action}", olga, {})[0] == 404
+        assert key_page(hindsight, "POST", f"/ext/keys/{created['id']}/{action}", olga, body={})[0] == 404
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
+
+    for _ in range(2):
+        assert send("DELETE", members, olga, {"email": mina}) == (200, {"team": team, "email": mina})
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
+    rows = query(
+        name, f"SELECT kind, email, actor, channel, delegate FROM agent_keys.events WHERE team = '{team}' ORDER BY id"
+    )
+    assert [(r["kind"], r["email"], r["actor"], r["channel"], r["delegate"]) for r in rows] == [
+        (kind, email, actor, "delegated", DELEGATE_ID)
+        for kind, email, actor in (
+            ("team_created", olga, olga),
+            ("member_added", mina, olga),
+            ("key_created", mina, mina),
+            ("member_removed", mina, olga),
+        )
+    ]
+
+
+def test_concurrent_identical_delegated_adds_removals_and_team_key_creations_change_the_team_once(hindsight):
+    port, name, otto, pia = hindsight["port"], hindsight["name"], "otto@example.test", "pia@example.test"
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": otto, "role": "member"})[0] == 204
+    # Minted once, so the requests below reach the server together.
+    sent = {
+        "Host": DELEGATION_HOST,
+        "Cf-Access-Jwt-Assertion": access_token(name, common_name=DELEGATE_ID, sub="", aud=[DELEGATION_AUD]),
+        "X-Delegated-Access-Jwt": access_token(name, email=otto, aud=[WORKPLANE_AUD]),
+    }
+    status, text = http(port, "POST", "/ext/delegated/teams", body={"name": "Concurrent Team"}, headers=sent)
+    assert status == 200, text
+    team = json.loads(text)["team"]
+
+    def change(method, body):
+        def request(_):
+            return http(port, method, f"/ext/delegated/teams/{team}/members", body=body, headers=sent)[0]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            assert list(pool.map(request, range(8))) == [200] * 8
+
+    def recorded():
+        return [r["kind"] for r in query(name, f"SELECT kind FROM agent_keys.events WHERE email = '{pia}' ORDER BY id")]
+
+    change("POST", {"email": pia, "role": "member"})
+    assert query(name, f"SELECT role FROM agent_keys.members WHERE team = '{team}' AND email = '{pia}'") == [{"role": "member"}]
+    assert recorded() == ["member_added"]
+    change("DELETE", {"email": pia})
+    assert query(name, f"SELECT role FROM agent_keys.members WHERE team = '{team}' AND email = '{pia}'") == []
+    assert recorded() == ["member_added", "member_removed"]
+
+    # Eight identical Team key creations (one idempotency key) make one key; the rest answer its ID without the key.
+    def create_key(_):
+        path, headers = f"/ext/delegated/teams/{team}/keys", {**sent, "Idempotency-Key": "otto-1"}
+        return http(port, "POST", path, body={"name": "wp"}, headers=headers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        answers = list(pool.map(create_key, range(8)))
+    assert [status for status, _ in answers] == [200] * 8, answers
+    created = [json.loads(text) for _, text in answers]
+    assert (len({c["id"] for c in created}), sum("key" in c for c in created)) == (1, 1), created
+    sql = f"SELECT kind FROM agent_keys.events WHERE team = '{team}' AND kind = 'key_created'"
+    assert query(name, sql) == [{"kind": "key_created"}]
+
+
+def test_concurrent_identical_delegated_team_creations_answer_one_team_and_migrate_once(hindsight):
+    port, name, quinn, rae = hindsight["port"], hindsight["name"], "quinn@example.test", "rae@example.test"
+    for person in (quinn, rae):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+
+    def sent_for(email):
+        # Minted once, so the creations below reach the server together.
+        return {
+            "Host": DELEGATION_HOST,
+            "Cf-Access-Jwt-Assertion": access_token(name, common_name=DELEGATE_ID, sub="", aud=[DELEGATION_AUD]),
+            "X-Delegated-Access-Jwt": access_token(name, email=email, aud=[WORKPLANE_AUD]),
+        }
+
+    def team_schemas():
+        return query(name, "SELECT count(*) AS n FROM information_schema.schemata WHERE schema_name LIKE 't\\_%'")[0]["n"]
+
+    quinns, raes, before = sent_for(quinn), sent_for(rae), team_schemas()
+
+    def create(n):
+        # Every spelling of the name is one name.
+        body = {"name": ["Racing Team", " racing team"][n % 2]}
+        return http(port, "POST", "/ext/delegated/teams", body=body, headers=quinns)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        answers = list(pool.map(create, range(8)))
+    assert [status for status, _ in answers] == [200] * 8, answers
+    (team,) = {json.loads(text)["team"] for _, text in answers}
+    # Each answers the stored name, whichever spelling created the Team.
+    stored = query(name, "SELECT schema, name FROM agent_keys.teams WHERE lower(name) = 'racing team'")
+    assert stored == [{"schema": team, "name": stored[0]["name"]}]
+    assert {json.loads(text)["name"] for _, text in answers} == {stored[0]["name"]}
+    events = query(name, f"SELECT kind FROM agent_keys.events WHERE team = '{team}'")
+    assert [e["kind"] for e in events] == ["team_created"]
+    # Only the Team's schema was migrated: no loser migrated a schema of its own and left it unlisted.
+    assert team_schemas() == before + 1
+    # Someone else finds the name taken, and migrates nothing.
+    status, text = http(port, "POST", "/ext/delegated/teams", body={"name": "RACING TEAM"}, headers=raes)
+    assert (status, json.loads(text)["detail"]) == (409, "A Team with that name exists.")
+    assert team_schemas() == before + 1
 
 
 def test_the_kill_switch_revokes_every_key_created_via_workplane_and_no_other(hindsight):

@@ -1,6 +1,7 @@
 """Agent Keys and the people who hold them, kept in the extension's own schema."""
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 
@@ -13,6 +14,9 @@ CREATIONS_PER_HOUR = 5
 ACTIVE_KEYS = 10
 # Each Team is a migrated schema, and agents can create them.
 TEAMS_PER_PERSON = 10
+# A creation waits this many seconds, polling this often, for the Team name another creation holds.
+TEAM_NAME_LOCK_WAIT = 60.0
+TEAM_NAME_LOCK_POLL = 0.1
 
 # Idempotent and outside upstream's Alembic history, like the event log.
 # A key stores only an HMAC of the whole key, never the key.
@@ -324,18 +328,23 @@ class PostgresKeyStore:
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2", team, email)
 
-    async def set_member(self, team: str, email: str, role: str) -> None:
-        """Add the person to the Team or change their role."""
-        await self._change_members(
+    async def set_member(self, team: str, email: str, role: str) -> str | None:
+        """Add the person to the Team or change their role; returns the role they had, None if they were not in it."""
+        return await self._change_members(
             team,
-            f"INSERT INTO {SCHEMA}.members (team, email, role) VALUES ($1, $2, $3)"
-            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role",
+            f"WITH had AS (SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2),"
+            f" put AS (INSERT INTO {SCHEMA}.members (team, email, role) VALUES ($1, $2, $3)"
+            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role)"
+            " SELECT role FROM had",
             email,
             role,
         )
 
-    async def remove_member(self, team: str, email: str) -> None:
-        await self._change_members(team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2", email)
+    async def remove_member(self, team: str, email: str) -> str | None:
+        """Take the person out of the Team; returns the role they had, None if they were not in it."""
+        return await self._change_members(
+            team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2 RETURNING role", email
+        )
 
     async def request_member(self, team: str, email: str, role: str, by: str) -> None:
         """Ask for the person to get this role in the Team; replaces an earlier request for them."""
@@ -446,6 +455,41 @@ class PostgresKeyStore:
         """When the person last signed in through Access, as `signed_in` recorded it."""
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT last_seen FROM {SCHEMA}.sign_ins WHERE email = $1", email)
+
+    async def team_name(self, team: str) -> str | None:
+        """The Team's name as it was created, None if there is no such Team."""
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT name FROM {SCHEMA}.teams WHERE schema = $1", team)
+
+    async def team_creator(self, team: str) -> str | None:
+        """The email of the person who created the Team, None if there is no such Team."""
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT created_by FROM {SCHEMA}.teams WHERE schema = $1", team)
+
+    @contextlib.asynccontextmanager
+    async def team_name_lock(self, name: str):
+        """Hold a lock on the Team name, in any case, across API processes. It takes a connection of its own,
+        not one of the pool's, so waiting for it, or a migration under it, never starves the key lookups.
+        A waiter gives up after TEAM_NAME_LOCK_WAIT seconds with Refused(503) and closes its connection, so each
+        waiter behind a stuck holder holds a connection for at most that long; how many wait is not capped. A holder
+        that stops, mid-migration say, frees the lock as its connection closes."""
+        conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
+        try:
+            # Postgres's own lower(), the one the unique index on the name uses. A waiter polls: a statement left
+            # waiting for the lock holds a transaction open, and the migration under the lock creates indexes
+            # concurrently, which waits for every open transaction to finish, so a blocked waiter would deadlock it.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + TEAM_NAME_LOCK_WAIT
+            while not await conn.fetchval(
+                "SELECT pg_try_advisory_lock(hashtext(lower($1)))", f"{SCHEMA}.team_name:{name.strip()}"
+            ):
+                if loop.time() >= deadline:
+                    raise Refused(503, "Another request is still creating a Team with that name; try again in a minute.")
+                await asyncio.sleep(TEAM_NAME_LOCK_POLL)
+            yield
+        finally:
+            # Closing the connection releases the lock, on a failure too.
+            await conn.close()
 
     async def revoke_workplane_keys(self, now: datetime) -> int:
         """Revoke every unrevoked key created via WorkPlane, whoever holds it; returns how many."""

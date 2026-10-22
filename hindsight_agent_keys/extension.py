@@ -423,33 +423,53 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._record("workplane_keys_revoked", NO_KEY_ID, client_ip, actor=admin)
         return revoked
 
-    async def create_team_key(self, email: str, team: str, name: str, client_ip: str | None) -> tuple[str, str]:
-        """Create a key for a Team the person is in, or for the Public Team (`public`).
-        Returns (key ID, key); the key is never stored."""
+    async def create_team_key(
+        self, email: str, team: str, name: str, client_ip: str | None, *, via: str | None = None, idempotency_key: str | None = None
+    ) -> tuple[str, str | None]:
+        """Create a key for a Team the person is in, or for the Public Team (`public`), marked as created
+        via WorkPlane if `via` names the Delegate. Returns (key ID, key); the key is never stored. A repeat
+        of the Delegate's `idempotency_key` within 24 hours returns (the key ID it created, None)."""
         if self._pepper is None:
             raise Refused(503, "Key creation is not configured.")
         await self._require_allowlisted(email)
         if team != PUBLIC_SCHEMA and await self._store.team_role(team, email) is None:
             raise Refused(403, "You are not in that Team.")
         await self._store.add_person(email, None)
-        return await self._add_key(email, team, "team", name, client_ip)
+        return await self._add_key(email, team, "team", name, client_ip, via=via, idempotency_key=idempotency_key)
 
-    async def create_team(self, email: str, name: str, client_ip: str | None) -> str:
-        """Create a Team with the person as its first owner. Returns the Team's schema."""
+    async def create_team(self, email: str, name: str, client_ip: str | None, *, delegated_repeat: bool = False) -> str:
+        """Create a Team with the person as its first owner. Returns the Team's schema. With `delegated_repeat`
+        (a Delegated Request), the name of a Team the person created and still owns returns its schema and
+        changes nothing."""
         await self._require_allowlisted(email)
         if name.lower() == PUBLIC_SCHEMA:
             raise Refused(409, "The name public is reserved for the Public Team.")
-        # Checked before migrating, so a taken name or a person at the limit leaves no schema behind.
-        if await self._store.team_schema(name) is not None:
-            raise Refused(409, "A Team with that name exists.")
-        await self._store.check_team_limit(email)
-        schema = "t_" + secrets.token_hex(8)
-        await self.context.run_migration(schema)
-        # shortcut: a concurrent create with the same name, or past the limit, leaves this schema
-        # empty and unlisted; serialise creation if that ever shows up.
-        await self._store.create_team(schema, name, email)
+        # One creation of a name at a time, across API processes: a concurrent one waits here, then finds the
+        # Team the first stored and is answered or refused without migrating, or finds none and creates it.
+        async with self._store.team_name_lock(name):
+            # Checked before migrating, so a taken name or a person at the limit leaves no schema behind.
+            taken = await self._store.team_schema(name)
+            if taken is not None:
+                # A repeat is the creator's own request again; a co-owner asking for the name finds it taken.
+                if (
+                    delegated_repeat
+                    and await self._store.team_creator(taken) == email
+                    and await self._store.team_role(taken, email) == "owner"
+                ):
+                    return taken
+                raise Refused(409, "A Team with that name exists.")
+            await self._store.check_team_limit(email)
+            schema = "t_" + secrets.token_hex(8)
+            await self.context.run_migration(schema)
+            # shortcut: concurrent creations by one person past the limit leave this schema empty and
+            # unlisted; serialise a person's creations around the migration if that ever shows up.
+            await self._store.create_team(schema, name, email)
         await self._record("team_created", NO_KEY_ID, client_ip, email, email, team=schema)
         return schema
+
+    async def team_name(self, team: str) -> str | None:
+        """The Team's name as it was created. For a caller that just created the Team or was told it is theirs."""
+        return await self._store.team_name(team)
 
     async def teams(self, email: str) -> list[dict]:
         """The person's Teams, or every Team for an admin, each with the person's role, its members
@@ -477,17 +497,23 @@ class AgentKeysTenantExtension(TenantExtension):
         # An owner cut off from the Key Allowlist keeps the Team and returns to managing it when added back.
         await self._require_allowlisted(email)
 
-    async def set_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
-        """As an admin, or an owner on the Key Allowlist, add `member` to the Team as "owner" or "member", or change their role."""
+    async def set_member(
+        self, email: str, team: str, member: str, role: str, client_ip: str | None, *, delegated_repeat: bool = False
+    ) -> None:
+        """As an admin, or an owner on the Key Allowlist, add `member` to the Team as "owner" or "member", or change their role.
+        With `delegated_repeat` (a Delegated Request), a repeat that leaves their role as it was records nothing."""
         await self._require_manager(email, team)
-        await self._store.set_member(team, member, role)
-        await self._record(f"{role}_added", NO_KEY_ID, client_ip, member, email, team=team)
+        had = await self._store.set_member(team, member, role)
+        if not (delegated_repeat and had == role):
+            await self._record(f"{role}_added", NO_KEY_ID, client_ip, member, email, team=team)
 
-    async def remove_member(self, email: str, team: str, member: str, client_ip: str | None) -> None:
-        """As an admin, or an owner on the Key Allowlist, take `member` out of the Team."""
+    async def remove_member(self, email: str, team: str, member: str, client_ip: str | None, *, delegated_repeat: bool = False) -> None:
+        """As an admin, or an owner on the Key Allowlist, take `member` out of the Team. With `delegated_repeat`
+        (a Delegated Request), a removal of someone who was not in the Team records nothing."""
         await self._require_manager(email, team)
-        await self._store.remove_member(team, member)
-        await self._record("member_removed", NO_KEY_ID, client_ip, member, email, team=team)
+        had = await self._store.remove_member(team, member)
+        if not (delegated_repeat and had is None):
+            await self._record("member_removed", NO_KEY_ID, client_ip, member, email, team=team)
 
     async def request_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
         """As an admin, or an owner on the Key Allowlist, ask for `member` to become an "owner" or "member" of the Team.
