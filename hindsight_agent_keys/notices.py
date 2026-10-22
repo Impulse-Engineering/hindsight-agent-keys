@@ -17,7 +17,7 @@ import logging
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterable
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import NamedTuple, Protocol
 
@@ -39,8 +39,11 @@ QUEUE_DEADLINE = 2.0
 SWEEP_EVERY = 30.0
 # A message lists this many notices and counts the rest, so it stays short whatever the backlog.
 MAX_LINES = 10
-# A day's reminders are queued by the first sweep after this hour (UTC) of it, or after a start that finds them not queued.
-DAY_STARTS = timedelta(hours=13)
+# A day's (UTC) reminders are queued by the first sweep at or after this hour (UTC) on it, or by an earlier one that day
+# when the day before was not run (a start after a missed day), and never within MIN_GAP of the run before: so nobody is
+# reminded of the same request twice within MIN_GAP, and a missed day runs once.
+DAY_STARTS = 13
+MIN_GAP = timedelta(hours=20)
 
 # An address that is shown as it is. Webex may turn one into a mailto link, which is fine.
 _ADDRESS = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
@@ -115,8 +118,8 @@ class Webex(Protocol):
 class Notice(NamedTuple):
     """One line for each of the recipients, and the page it links to. `kind` is who they are to it, which the store
     checks again when it takes the notice to send: an "owner" of `team` who is on the Key Allowlist, an "admin", the
-    "asker" of a request that was decided, or the "holder" of keys running out (a decision or a warning is about the
-    person's own request or keys, so nothing needs checking)."""
+    "holder" of keys running out who is on the Key Allowlist, or the "asker" of a request that was decided (a decision
+    is about their own request, so nothing needs checking)."""
 
     kind: str
     recipients: list[str]
@@ -165,20 +168,24 @@ class Notices:
         self._wake.set()
 
     async def remind(self) -> None:
-        """Queue the day's reminders unless some process has. The store records the day in the transaction that queues
-        them, so a day runs once across processes and restarts, and a stop before it commits leaves the day to the next
-        sweep. A day starts at DAY_STARTS. Never raises an Exception: a run that fails is logged and the next sweep tries
+        """Queue the day's reminders when they are due (DAY_STARTS) unless some process has. The store records the day in
+        the transaction that queues them, so a day runs once across processes and restarts, and a stop before it commits
+        leaves the day to the next sweep. Never raises an Exception: a run that fails is logged and the next sweep tries
         it again."""
-        now = self._clock()
-        day = (now - DAY_STARTS).date()
-        if self._reminders is None or day == self._reminded:
+        now = self._clock().astimezone(UTC)
+        if self._reminders is None or now.date() == self._reminded:
             return
+
+        def is_due(last: datetime | None, ran_before: bool) -> bool:
+            return (last is None or now - last >= MIN_GAP) and (now.hour >= DAY_STARTS or not ran_before)
+
         try:
-            await self._store.run_reminders(day, now, partial(self._reminders, now))
+            ran = await self._store.run_reminders(now.date(), now, is_due, partial(self._reminders, now))
         except Exception:  # the next sweep tries again
             logger.warning("agent-keys: the daily Webex reminders failed", exc_info=True)
             return
-        self._reminded = day
+        if ran:
+            self._reminded = now.date()
 
     async def send_due(self) -> None:
         """One sweep: send each person's queued notices as one message unless they heard within WINDOW.

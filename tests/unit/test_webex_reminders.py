@@ -38,7 +38,15 @@ def admins(monkeypatch):
 
 @pytest.fixture
 async def world(team):
-    return await World(team).start()
+    """The extension at 13:00 UTC, when a day's reminders are due, so a test's daily steps fall at the same time of day."""
+    world = await World(team).start()
+    world.clock.later(hours=1)
+    return world
+
+
+def at(world, hour):
+    """The clock at this hour (UTC) of its day."""
+    world.clock.now = world.clock.now.replace(hour=hour, minute=0)
 
 
 async def remind(world):
@@ -189,7 +197,7 @@ async def test_a_key_holder_is_warned_once_when_their_sign_in_window_comes_withi
     await remind(world)  # the first run
     for person in (DAVE, GINA, HANK):  # GINA holds only a revoked key, HANK none
         world.store.sign_ins[person] = world.clock.now
-    world.clock.later(days=23, minutes=-1)
+    world.clock.later(days=22, minutes=30)
     await remind(world)
     assert world.webex.sent == []
     world.clock.later(days=1)
@@ -246,31 +254,110 @@ async def test_reminders_honour_the_opt_out_the_15_minute_window_and_the_send_lo
     assert [(row["recipient"], row["status"]) for row in world.store.log] == [(BOB, "sent"), (BOB, "sent")]
 
 
-# Once a day, across processes and restarts
+async def _warned(world):
+    """DAVE and GINA hold keys that work; the day's run, 76 days on, queues a warning to each (not yet sent)."""
+    await world.ext.create_personal_key(DAVE, "laptop", None)
+    await world.ext.create_personal_key(GINA, "tablet", None)
+    await remind(world)  # the first run
+    world.clock.later(days=76)
+    for person in (DAVE, GINA):
+        world.store.sign_ins[person] = world.clock.now
+    await world.ext.notices.remind()
 
 
-async def test_the_days_reminders_are_queued_once_across_restarts_and_processes_and_a_missed_day_runs_once_on_start(world):
+async def test_a_warning_queued_for_someone_since_removed_from_the_key_allowlist_is_dropped_unsent(world):
+    await _warned(world)
+    await world.ext.set_role(ADMIN, GINA, None, None)
+    await world.send()
+    assert [to for to, _ in world.webex.sent] == [DAVE]
+    assert world.store.queue == []
+
+
+async def test_a_key_holder_removed_from_the_key_allowlist_between_the_claim_and_the_send_is_not_sent_to(world):
+    await _warned(world)
+    world.store.after_claim = lambda person: world.store.roles.pop(person) if person == GINA else None
+    await world.send()
+    assert [to for to, _ in world.webex.sent] == [DAVE]
+    assert [(row["recipient"], row["status"], row["detail"]) for row in world.store.log] == [
+        (DAVE, "sent", None),
+        (GINA, "skipped", "no longer eligible"),
+    ]
+
+
+# Once a day, across processes and restarts, and never twice within 20 hours
+
+
+async def test_the_days_reminders_are_queued_once_across_restarts_and_processes(world):
     world.ask(DAVE)
-    await settled(world)  # 12:15 UTC
+    await settled(world)  # 13:15 UTC
     aged(world, DAVE, days=4)
     await remind(world)
     assert sorted(to for to, _ in world.webex.sent) == [ALICE, BOB]
     # Later the same day, in this process, a second one and after a restart: the day was run.
-    world.clock.later(minutes=30)
+    world.clock.later(hours=10)
     other = world.restarted()
     await world.ext.notices.remind()
     await other.ext.notices.remind()
     await world.restarted().ext.notices.remind()
     await world.send()
     assert len(world.webex.sent) == 2
-    # A day starts at 13:00 UTC: the first sweep after it runs the new day's.
-    world.clock.later(minutes=15)
+    # The next day, nothing before 13:00 UTC, since the day before was run; then the day's, once.
+    world.clock.later(hours=13, minutes=44)  # 12:59 UTC the next day
     await remind(other)
+    assert len(world.webex.sent) == 2
+    world.clock.later(minutes=1)
+    await remind(other)  # the process that found it not yet due runs it now
     assert len(world.webex.sent) == 4
-    # Stopped for two days: the first sweep after the start runs once, not once for each day missed.
-    world.clock.later(days=2)
     await remind(world.restarted())
-    assert len(world.webex.sent) == 6 and "has waited 6 days" in world.webex.sent[-1][1]
+    assert len(world.webex.sent) == 4
+
+
+async def test_a_first_start_before_13_utc_runs_at_once_and_not_again_at_13(world):
+    at(world, 10)
+    world.ask(DAVE)
+    await settled(world)  # 10:15 UTC
+    aged(world, DAVE, days=4)
+    await remind(world)
+    assert len(world.webex.sent) == 2
+    # Not a second reminder of the same request three hours later.
+    at(world, 13)
+    await remind(world.restarted())
+    assert len(world.webex.sent) == 2
+    world.clock.later(days=1)
+    await remind(world)
+    assert len(world.webex.sent) == 4 and "has waited 5 days" in world.webex.sent[-1][1]
+
+
+async def test_a_missed_week_runs_once_at_the_start_and_not_again_that_day(world):
+    world.ask(DAVE)
+    await settled(world)  # 13:15 UTC
+    aged(world, DAVE, days=4)
+    await remind(world)
+    # Stopped for a week, started again at 10:15 UTC: one run, not one for each day missed, and none at 13:00.
+    world.clock.later(days=7, hours=-3)
+    await remind(world.restarted())
+    assert len(world.heard(ALICE)) == 2 and "has waited 10 days" in world.heard(ALICE)[-1]
+    world.clock.later(hours=3)
+    await remind(world.restarted())
+    assert len(world.heard(ALICE)) == 2
+    world.clock.later(days=1)
+    await remind(world)
+    assert len(world.heard(ALICE)) == 3
+
+
+async def test_a_run_late_in_the_day_is_followed_by_the_next_no_sooner_than_20_hours_later(world):
+    at(world, 20)
+    world.ask(DAVE)
+    await settled(world)  # 20:15 UTC
+    aged(world, DAVE, days=4)
+    await remind(world)
+    assert len(world.webex.sent) == 2
+    world.clock.later(hours=16, minutes=45)  # 13:00 UTC the next day
+    await remind(world)
+    assert len(world.webex.sent) == 2
+    world.clock.later(hours=3, minutes=15)  # 20 hours after the last run
+    await remind(world)
+    assert len(world.webex.sent) == 4
 
 
 @pytest.mark.parametrize("where", ["after the day is recorded", "between choosing and queuing", "partway through queuing"])

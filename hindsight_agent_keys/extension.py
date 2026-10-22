@@ -49,8 +49,8 @@ LISTED = ("member", "admin")
 # A Join Request left waiting this long is counted for every admin, not only the Team's owners.
 ADMIN_REVIEW_AFTER = timedelta(days=7)
 
-# A request left waiting longer than this is in a daily Webex reminder to those who can answer it; a Join Request,
-# after ADMIN_REVIEW_AFTER, to every admin too.
+# A request left waiting longer than this is in a daily Webex reminder to those who can answer it; a request to join a
+# Team (a Join Request or one an agent filed), after ADMIN_REVIEW_AFTER, to every admin too, as pending_reviews counts it.
 REMIND_AFTER = timedelta(days=3)
 # A key's holder is warned once when a key that works comes within this long of expiring,
 KEY_WARNING = timedelta(days=14)
@@ -807,8 +807,9 @@ class AgentKeysTenantExtension(TenantExtension):
 
     def _reminders(self, now: datetime, due: dict) -> list[Notice]:
         """The day's reminders, from what store.run_reminders read (`due`). Daily, while it waits: a request untouched
-        more than REMIND_AFTER, to whoever can answer it, and a Join Request, after ADMIN_REVIEW_AFTER, to every admin too.
-        Once, when it came due since the previous day was run (`due["last"]`, None before the first run): a warning to
+        more than REMIND_AFTER, to whoever can answer it, and a request to join a Team (a Join Request or one an agent
+        filed), after ADMIN_REVIEW_AFTER, to every admin too. Once, when it came due since the previous run (`due["last"]`,
+        None before the first run): a warning to
         the holder of a key that works and expires within KEY_WARNING, and to someone holding one whose sign-in window
         closes within SIGN_IN_WARNING."""
         roles = {r["email"]: r["role"] for r in due["allowlist"]}
@@ -822,7 +823,8 @@ class AgentKeysTenantExtension(TenantExtension):
             return at <= now and (due["last"] is None or at > due["last"])
 
         def works(key) -> bool:
-            """What `principal` checks of an unrevoked, unexpired key."""
+            # The rule `principal` applies to a key on each request (with `find_key`'s columns), which the stale_schemas
+            # view also counts by: a change to one belongs in the others.
             seen = signed_in.get(key["email"])
             team = key["kind"] == "team" and key["schema"] != PUBLIC_SCHEMA
             return listed(key["email"]) and seen is not None and now - seen < SIGN_IN_WINDOW and (not team or key["team_role"])

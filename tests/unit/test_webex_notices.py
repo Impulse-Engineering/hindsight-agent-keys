@@ -109,8 +109,10 @@ class NoticeStore(MemoryStore):
         if name in self.break_on:
             raise self.break_on[name]
 
-    async def run_reminders(self, day, now, build):
+    async def run_reminders(self, day, now, is_due, build):
         if day in self.runs:
+            return True
+        if not is_due(max(self.runs.values(), default=None), day - timedelta(days=1) in self.runs):
             return False
         # One transaction in Postgres: a stop anywhere in it leaves the queue and the days run as they were.
         queue, runs = list(self.queue), dict(self.runs)
@@ -168,7 +170,9 @@ class NoticeStore(MemoryStore):
         listed = recipient in admins or self.roles.get(recipient) in ("member", "admin")
         if kind == "owner":
             return listed and self.team_roles.get((team, recipient)) == "owner"
-        return kind != "admin" or recipient in admins or self.roles.get(recipient) == "admin"
+        if kind == "admin":
+            return recipient in admins or self.roles.get(recipient) == "admin"
+        return listed if kind == "holder" else kind == "asker"
 
     async def claim_notice(self, recipient, now, since, admins):
         if any(row["recipient"] == recipient and row["at"] > since for row in self.log):
