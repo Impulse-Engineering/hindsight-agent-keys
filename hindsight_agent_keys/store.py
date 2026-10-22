@@ -3,7 +3,7 @@
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import date, datetime
 
 import asyncpg
 
@@ -124,11 +124,11 @@ ALTER TABLE {SCHEMA}.teams ADD COLUMN IF NOT EXISTS open boolean NOT NULL DEFAUL
 ALTER TABLE {SCHEMA}.member_requests ADD COLUMN IF NOT EXISTS requested_at timestamptz NOT NULL DEFAULT now();
 -- #1005: Webex notices. A notice waits here, one line for one person, until the person may be messaged again.
 -- `kind` is who the recipient is to the notice, checked again when it is taken to be sent: an 'owner' of `team`
--- (on the Key Allowlist), an 'admin', or the 'asker' of a request that was decided.
+-- (on the Key Allowlist), an 'admin', the 'asker' of a request that was decided, or the 'holder' of keys running out.
 CREATE TABLE IF NOT EXISTS {SCHEMA}.notice_queue (
     id bigserial PRIMARY KEY,
     recipient text NOT NULL,
-    kind text NOT NULL CHECK (kind IN ('owner', 'admin', 'asker')),
+    kind text NOT NULL CHECK (kind IN ('owner', 'admin', 'asker', 'holder')),
     team text,
     line text NOT NULL,
     path text NOT NULL
@@ -150,6 +150,13 @@ CREATE INDEX IF NOT EXISTS notice_log_recipient_idx ON {SCHEMA}.notice_log (reci
 -- #1005: people who turned Webex notices off.
 CREATE TABLE IF NOT EXISTS {SCHEMA}.notice_optouts (
     email text PRIMARY KEY
+);
+-- #1006: when a 'requested' row was filed, so admins are reminded of one left waiting. Rows there before count from then.
+ALTER TABLE {SCHEMA}.allowlist ADD COLUMN IF NOT EXISTS requested_at timestamptz NOT NULL DEFAULT now();
+-- #1006: each day whose reminders were queued, written in the transaction that queues them, so a day runs once.
+CREATE TABLE IF NOT EXISTS {SCHEMA}.reminder_runs (
+    day date PRIMARY KEY,
+    at timestamptz NOT NULL
 );
 """
 
@@ -654,11 +661,13 @@ class PostgresKeyStore:
 
     # --- #1005 ---
 
-    async def queue_notice(self, recipients: list[str], kind: str, team: str | None, line: str, path: str) -> None:
+    async def queue_notice(
+        self, recipients: list[str], kind: str, team: str | None, line: str, path: str, conn: asyncpg.Connection | None = None
+    ) -> None:
         """Queue one line, linking to `path` on the key pages, for each recipient, who is `kind` to it ('owner' of
-        `team`, 'admin' or 'asker')."""
-        pool = await self._get_pool()
-        await pool.execute(
+        `team`, 'admin', 'asker' or 'holder'). On `conn`, inside its transaction, when given."""
+        db = conn or await self._get_pool()
+        await db.execute(
             f"INSERT INTO {SCHEMA}.notice_queue (recipient, kind, team, line, path)"
             " SELECT r, $2, $3, $4, $5 FROM unnest($1::text[]) r",
             recipients,
@@ -667,6 +676,46 @@ class PostgresKeyStore:
             line,
             path,
         )
+
+    async def run_reminders(self, day: date, now: datetime, build: Callable[[dict], list]) -> bool:
+        """Queue the reminders of `day` unless a process has (Notices.remind). One transaction records the day, reads what
+        reminders are made of, and queues the notices `build(due)` makes, so a stop anywhere in it leaves the day not run and
+        nothing queued. A second process running the same day waits for the first's transaction at the day's row, then finds
+        the day run. False, reading and queuing nothing, if it was. `due` holds `last`, when the previous day was run (None
+        before the first), and every row of `allowlist`, `sign_ins` and `requests` (with the Team's name, the person's role
+        in it now, `has`, and its owners), and of `keys` that are unrevoked and unexpired at `now` (with their Team's name and
+        their holder's role in it, `team_role`)."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            last = await conn.fetchval(f"SELECT max(at) FROM {SCHEMA}.reminder_runs")
+            if not await conn.fetchval(
+                f"INSERT INTO {SCHEMA}.reminder_runs (day, at) VALUES ($1, $2) ON CONFLICT (day) DO NOTHING RETURNING true",
+                day,
+                now,
+            ):
+                return False
+            due = {
+                "last": last,
+                "allowlist": await conn.fetch(f"SELECT email, role, requested_at FROM {SCHEMA}.allowlist ORDER BY email"),
+                "sign_ins": await conn.fetch(f"SELECT email, last_seen FROM {SCHEMA}.sign_ins ORDER BY email"),
+                "requests": await conn.fetch(
+                    f"SELECT r.team, t.name, r.email, r.role, r.requested_by, r.requested_at, m.role AS has,"
+                    f" ARRAY(SELECT o.email FROM {SCHEMA}.members o WHERE o.team = r.team AND o.role = 'owner' ORDER BY o.email)"
+                    f" AS owners FROM {SCHEMA}.member_requests r JOIN {SCHEMA}.teams t ON t.schema = r.team"
+                    f" LEFT JOIN {SCHEMA}.members m ON m.team = r.team AND m.email = r.email"
+                    " ORDER BY r.requested_at, r.team, r.email"
+                ),
+                "keys": await conn.fetch(
+                    f"SELECT k.email, k.name, k.kind, k.schema, k.expires_at, t.name AS team_name, m.role AS team_role"
+                    f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.teams t ON t.schema = k.schema"
+                    f" LEFT JOIN {SCHEMA}.members m ON m.team = k.schema AND m.email = k.email"
+                    " WHERE k.revoked_at IS NULL AND k.expires_at > $1 ORDER BY k.expires_at, k.id",
+                    now,
+                ),
+            }
+            for notice in build(due):
+                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path, conn)
+        return True
 
     async def queued_recipients(self) -> list[str]:
         pool = await self._get_pool()

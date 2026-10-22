@@ -2159,6 +2159,147 @@ await store.finish_notice(claim[0], "sent", None)
     assert any(line.split("|")[1:4] == [person, "1", "sent"] for line in run.stdout.splitlines()), run.stdout
 
 
+# The day's reminders (#1006): the real extension builds them, over stores of their own as separate API processes would
+# have, at a clock the script sets. Only this test runs them (the container has no bot token), so the days run are its own.
+REMINDER_RUNS = """
+from hindsight_agent_keys.extension import AgentKeysTenantExtension
+
+joiner, late, fresh, asker, holder = (f"remind-{who}-{RUN}@example.test" for who in ("joiner", "late", "fresh", "asker", "holder"))
+mine = [*people.values(), joiner, late, fresh, asker, holder]
+CONFIG = {
+    "access_team_domain": "http://127.0.0.1:8999",
+    "access_aud": "ci-access-aud",
+    "access_host": "keys.example.test",
+    "webex_bot_token": "unused",
+}
+now0 = datetime.now(UTC)
+clock = [now0]
+stores = []
+
+
+class Stopped(Exception):
+    pass
+
+
+class StopsQueuing(PostgresKeyStore):
+    \"\"\"A run that stops partway through queuing the day's reminders: at the second notice.\"\"\"
+
+    calls = 0
+
+    async def queue_notice(self, *args):
+        self.calls += 1
+        if self.calls == 2:
+            raise Stopped
+        await super().queue_notice(*args)
+
+
+def process(store_class=PostgresKeyStore):
+    \"\"\"A new API process: an extension over a store, and pool, of its own. Nothing it queues is sent.\"\"\"
+    stores.append(store_class(url))
+    return AgentKeysTenantExtension(CONFIG, store=stores[-1], clock=lambda: clock[0], webex=object())
+
+
+async def step(*processes):
+    \"\"\"The processes' sweeps, at once: what they queued for this test's people, and how many days have been run.\"\"\"
+    mark = await conn.fetchval("SELECT coalesce(max(id), 0) FROM agent_keys.notice_queue")
+    await asyncio.gather(*(p.notices.remind() for p in processes))
+    rows = await conn.fetch("SELECT recipient, kind, line FROM agent_keys.notice_queue WHERE id > $1", mark)
+    queued = sorted([r["recipient"], r["kind"], r["line"]] for r in rows if r["recipient"] in mine and (RUN in r["line"] or r["kind"] == "holder"))
+    return [queued, await conn.fetchval("SELECT count(*) FROM agent_keys.reminder_runs")]
+
+
+conn = await asyncpg.connect(uri)
+try:
+    for person, days in ((joiner, 4), (late, 8), (fresh, 2)):
+        await conn.execute(
+            "UPDATE agent_keys.member_requests SET requested_at = $3 WHERE team = $1 AND email = $2",
+            team, person, now0 - timedelta(days=days),
+        )
+    # own2 owns the Team and still has a request open for a member's place, as joining an Open Team can leave one.
+    await conn.execute(
+        "INSERT INTO agent_keys.member_requests (team, email, role, requested_by, requested_at) VALUES ($1, $2, 'member', $3, $4)",
+        team, people["own2"], people["own1"], now0 - timedelta(days=10),
+    )
+    await conn.execute("UPDATE agent_keys.allowlist SET requested_at = $2 WHERE email = $1", asker, now0 - timedelta(days=4))
+    # The holder's keys (rows only: no schema is made, and nobody holds their secrets), and a window closing in 6.5 days.
+    await conn.execute("INSERT INTO agent_keys.people (email) VALUES ($1)", holder)
+    for key, days, revoked in (("soon", 13, None), ("later", 20, None), ("revoked", 5, now0)):
+        await conn.execute(
+            "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at, revoked_at)"
+            " VALUES ($1, $2, $3, $4, 'p_reminders', 'personal', $5, $6)",
+            f"{key}{RUN}", bytes(32), f"{key}-{RUN}", holder, now0 + timedelta(days=days), revoked,
+        )
+    await conn.execute("INSERT INTO agent_keys.sign_ins (email, last_seen) VALUES ($1, $2)", holder, now0 - timedelta(days=23.5))
+
+    first = process()
+    out["first"] = await step(first)
+    out["same_day"] = await step(first, process())
+    clock[0] = now0 + timedelta(days=1)
+    out["two_at_once"] = await step(process(), process())
+    clock[0] = now0 + timedelta(days=2)
+    out["stopped"] = await step(process(StopsQueuing))
+    out["after_the_stop"] = await step(process())
+    clock[0] = now0 + timedelta(days=9)
+    await conn.execute("UPDATE agent_keys.sign_ins SET last_seen = $2 WHERE email = $1", holder, clock[0] - timedelta(hours=1))
+    out["a_week_later"] = await step(process())
+finally:
+    await conn.close()
+    for opened in stores:
+        await opened.close()
+"""
+
+
+def test_the_days_reminders_are_queued_once_across_processes_and_a_stop_partway_queues_nothing_in_postgres(hindsight):
+    people, team = notice_people(hindsight, "remind")
+    name = f"Notices remind {RUN}"
+    joiner, late, fresh, asker, holder = (f"remind-{who}-{RUN}@example.test" for who in ("joiner", "late", "fresh", "asker", "holder"))
+    for person in (joiner, late, fresh, holder):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    for person in (joiner, late, fresh):
+        assert key_page(hindsight, "POST", "/ext/join-requests", person, body={"name": name})[0] == 200
+    assert key_page(hindsight, "POST", "/ext/access-requests", asker, body={})[0] == 204
+    out = notice_store(hindsight["name"], f"people, team, RUN = {people!r}, {team!r}, {RUN!r}\n" + REMINDER_RUNS)
+    owners, admins = [people[o] for o in ("own1", "own2", "own3")], [people["adm1"], people["adm2"]]
+
+    def owners_hear(person, waited):
+        return [[o, "owner", f'{person} has waited {waited} days to join your Team "{name}".'] for o in owners]
+
+    def admins_hear(person, waited):
+        return [[a, "admin", f'{person} has waited {waited} days to join the Team "{name}".'] for a in admins]
+
+    def allowlist(asked):
+        return [[a, "admin", f"{asker} has waited {asked} days for a place on the Key Allowlist."] for a in admins]
+
+    def undated(step):
+        return sorted([to, kind, re.sub(r", on \d{4}-\d\d-\d\d", "", line)] for to, kind, line in step[0]), step[1]
+
+    renew = "Renew it on your key page."
+    # Requests older than 3 days to the owners, older than 7 to the admins too; never own2's (own2 owns the Team).
+    assert undated(out["first"]) == (sorted([
+        *owners_hear(joiner, 4), *owners_hear(late, 8), *admins_hear(late, 8), *allowlist(4),
+        [holder, "holder", f'Your Agent Key "soon-{RUN}" expires in 13 days. {renew}'],
+        [holder, "holder", "Your Agent Keys stop working in 7 days, unless you sign in again: open your key page."],
+    ]), 1)
+    # The same day, in the same process and in a restarted one: nothing more.
+    assert out["same_day"] == [[], 1]
+    # The next day, two processes at once: one queues the day's reminders, and the warnings are not repeated. The
+    # request filed 2 days before the first run has waited exactly 3 days: not yet.
+    assert undated(out["two_at_once"]) == (sorted([
+        *owners_hear(joiner, 5), *owners_hear(late, 9), *admins_hear(late, 9), *allowlist(5),
+    ]), 2)
+    # A run that stops partway through queuing leaves nothing queued and the day not run; the next sweep runs it once.
+    assert out["stopped"] == [[], 2]
+    assert undated(out["after_the_stop"]) == (sorted([
+        *owners_hear(joiner, 6), *owners_hear(late, 10), *admins_hear(late, 10), *allowlist(6), *owners_hear(fresh, 4),
+    ]), 3)
+    # A week missed: one run, which warns of the key that came within 14 days of expiring since the last.
+    assert undated(out["a_week_later"]) == (sorted([
+        *owners_hear(joiner, 13), *admins_hear(joiner, 13), *owners_hear(late, 17), *admins_hear(late, 17),
+        *owners_hear(fresh, 11), *admins_hear(fresh, 11), *allowlist(13),
+        [holder, "holder", f'Your Agent Key "later-{RUN}" expires in 11 days. {renew}'],
+    ]), 4)
+
+
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
     # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.

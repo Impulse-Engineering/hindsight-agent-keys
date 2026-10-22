@@ -1,8 +1,10 @@
-"""Webex direct messages to people about requests that wait for them or were decided (README, "Webex notices").
+"""Webex direct messages to people about requests that wait for them or were decided, and about keys and sign-in windows
+running out (README, "Webex notices").
 
-A hook queues a one-line notice for each person it concerns, after the change it announces is stored. A sweep in
-the background sends each person's queued lines as one message, at most one message per person per WINDOW. All
-state is in the database, so every API process and every restart sees the same queue and the same window.
+A hook queues a one-line notice for each person it concerns, after the change it announces is stored. Once a day the
+background task queues the day's reminders the same way. A sweep in the background sends each person's queued lines as
+one message, at most one message per person per WINDOW. All state is in the database, so every API process and every
+restart sees the same queue, the same window and the same days run.
 
 No notice code runs before the change it announces, and none can stall it: queuing happens after the commit and
 adds at most QUEUE_DEADLINE to the request, whatever the database or Webex are doing. A message is sent at most
@@ -15,7 +17,8 @@ import logging
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from functools import partial
 from typing import NamedTuple, Protocol
 
 import httpx
@@ -36,6 +39,8 @@ QUEUE_DEADLINE = 2.0
 SWEEP_EVERY = 30.0
 # A message lists this many notices and counts the rest, so it stays short whatever the backlog.
 MAX_LINES = 10
+# A day's reminders are queued by the first sweep after this hour (UTC) of it, or after a start that finds them not queued.
+DAY_STARTS = timedelta(hours=13)
 
 # An address that is shown as it is. Webex may turn one into a mailto link, which is fine.
 _ADDRESS = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
@@ -109,8 +114,9 @@ class Webex(Protocol):
 
 class Notice(NamedTuple):
     """One line for each of the recipients, and the page it links to. `kind` is who they are to it, which the store
-    checks again when it takes the notice to send: an "owner" of `team` who is on the Key Allowlist, an "admin", or
-    the "asker" of a request that was decided (a decision is about their own request, so nothing needs checking)."""
+    checks again when it takes the notice to send: an "owner" of `team` who is on the Key Allowlist, an "admin", the
+    "asker" of a request that was decided, or the "holder" of keys running out (a decision or a warning is about the
+    person's own request or keys, so nothing needs checking)."""
 
     kind: str
     recipients: list[str]
@@ -121,14 +127,25 @@ class Notice(NamedTuple):
 
 class Notices:
     """Queue notices and send them. `webex` is the one external call; `store` is the PostgresKeyStore; `admins` are
-    the bootstrap admins, who are admins whatever the Key Allowlist says."""
+    the bootstrap admins, who are admins whatever the Key Allowlist says; `reminders(now, due)` makes the day's
+    reminders from what the store reads for them (none without it)."""
 
-    def __init__(self, store, webex: Webex, host: str, clock: Callable[[], datetime], admins: Iterable[str]):
+    def __init__(
+        self,
+        store,
+        webex: Webex,
+        host: str,
+        clock: Callable[[], datetime],
+        admins: Iterable[str],
+        reminders: Callable[[datetime, dict], list[Notice]] | None = None,
+    ):
         self._store = store
         self._webex = webex
         self._host = host
         self._clock = clock
         self._admins = sorted(admins)
+        self._reminders = reminders
+        self._reminded: date | None = None  # the last day this process found run
         self._wake = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -146,6 +163,22 @@ class Notices:
             logger.warning("agent-keys: could not queue a Webex notice: %s", type(exc).__name__)
             return
         self._wake.set()
+
+    async def remind(self) -> None:
+        """Queue the day's reminders unless some process has. The store records the day in the transaction that queues
+        them, so a day runs once across processes and restarts, and a stop before it commits leaves the day to the next
+        sweep. A day starts at DAY_STARTS. Never raises an Exception: a run that fails is logged and the next sweep tries
+        it again."""
+        now = self._clock()
+        day = (now - DAY_STARTS).date()
+        if self._reminders is None or day == self._reminded:
+            return
+        try:
+            await self._store.run_reminders(day, now, partial(self._reminders, now))
+        except Exception:  # the next sweep tries again
+            logger.warning("agent-keys: the daily Webex reminders failed", exc_info=True)
+            return
+        self._reminded = day
 
     async def send_due(self) -> None:
         """One sweep: send each person's queued notices as one message unless they heard within WINDOW.
@@ -219,6 +252,7 @@ class Notices:
         while True:
             # Cleared first, so a notice queued during the sweep wakes the next one.
             self._wake.clear()
+            await self.remind()
             await self.send_due()
             # Not wait_for: on Python 3.11 it can swallow the cancellation of stop() when a notice arrives
             # at the same moment, and the loop would then run on.
