@@ -37,7 +37,8 @@ WINDOW = timedelta(minutes=15)
 QUEUE_DEADLINE = 2.0
 # The sweep runs when a notice is queued and at least this often (seconds).
 SWEEP_EVERY = 30.0
-# A message lists this many notices and counts the rest, so it stays short whatever the backlog.
+# A message lists this many notices and counts the rest, so with its `Hindsight:` header and its `See` line of page links
+# it is at most MAX_LINES + 3 lines whatever the backlog.
 MAX_LINES = 10
 # A day's (UTC) reminders are queued by the first sweep at or after this hour (UTC) on it, or by an earlier one that day
 # when the day before was not run (a start after a missed day), and never within MIN_GAP of the run before: so nobody is
