@@ -100,6 +100,7 @@ class NoticeStore(MemoryStore):
         self.break_on = {}  # method name -> exception it raises
         self.hang = 0.0  # seconds queue_notice takes
         self.opts_out_after_claim = None  # a person whose opt-out commits right after their notices are claimed
+        self.after_claim = None  # called with the person, right after their notices are claimed: a change committing then
 
     def _break(self, name):
         if name in self.break_on:
@@ -133,7 +134,12 @@ class NoticeStore(MemoryStore):
         self.log.append(row)
         if self.opts_out_after_claim == recipient:
             self.optouts.add(recipient)
-        return row["id"], [(line, path) for _, _, _, line, path in mine]
+        if self.after_claim:
+            self.after_claim(recipient)
+        return row["id"], [(line, path, kind, team) for _, kind, team, line, path in mine]
+
+    async def still_eligible(self, recipient, items, admins):
+        return [self._eligible(recipient, kind, team, admins) for _, _, kind, team in items]
 
     async def finish_notice(self, log_id, status, detail):
         self._break("finish_notice")
@@ -738,6 +744,58 @@ async def test_joining_an_open_team_tells_nobody_but_joining_a_closed_one_files_
     assert (resp.status_code, resp.json()["role"]) == (200, "member")
     await world.send()
     assert world.webex.sent == [] and world.store.queue == []
+
+
+@pytest.mark.parametrize("change", ["leaves the Team", "is demoted to a member of it"])
+async def test_an_owner_who_loses_the_team_between_the_claim_and_the_send_is_not_sent_to(world, change):
+    world.ask(DAVE)
+
+    def lose(person):
+        if person == ALICE:
+            if change == "leaves the Team":
+                world.store.team_roles.pop((world.schema, ALICE))
+            else:
+                world.store.team_roles[world.schema, ALICE] = "member"
+
+    world.store.after_claim = lose
+    await world.send()
+    assert [to for to, _ in world.webex.sent] == [BOB]
+    assert [(row["recipient"], row["status"], row["detail"]) for row in world.store.log] == [
+        (ALICE, "skipped", "no longer eligible"),
+        (BOB, "sent", None),
+    ]
+
+
+async def test_an_owner_who_loses_the_key_allowlist_or_an_admin_who_is_demoted_between_the_claim_and_the_send_is_not_sent_to(world):
+    world.ask(DAVE)
+    world.post(ERIN, "/access-requests", {})
+
+    def lose(person):
+        if person == ALICE:
+            world.store.roles.pop(ALICE)
+        elif person == FRANK:
+            world.store.roles[FRANK] = "member"
+
+    world.store.after_claim = lose
+    await world.send()
+    assert sorted(to for to, _ in world.webex.sent) == [ADMIN, BOB]
+    assert {row["recipient"]: row["status"] for row in world.store.log} == {
+        ADMIN: "sent",
+        ALICE: "skipped",
+        BOB: "sent",
+        FRANK: "skipped",
+    }
+
+
+async def test_a_message_lists_only_what_the_person_is_still_eligible_for(world):
+    ops = await world.ext.create_team(ALICE, "Ops", None)
+    world.ask(DAVE)
+    world.ask(DAVE, "Ops")
+    world.store.after_claim = lambda person: world.store.team_roles.pop((ops, ALICE)) if person == ALICE else None
+    await world.send()
+    [for_alice] = world.heard(ALICE)
+    assert '"Platform"' in for_alice and '"Ops"' not in for_alice
+    assert [(row["items"], row["status"]) for row in world.store.log if row["recipient"] == ALICE] == [(2, "sent")]
 
 
 # A decision never waits on a notice

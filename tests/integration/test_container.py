@@ -1682,6 +1682,7 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 from pg0 import Pg0
 from hindsight_agent_keys import store as store_module
+from hindsight_agent_keys.notices import Notices
 from hindsight_agent_keys.store import PostgresKeyStore
 
 T0 = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
@@ -1689,7 +1690,7 @@ WINDOW = timedelta(minutes=15)
 
 
 def lines(claim):
-    return claim and [list(item) for item in claim[1]]
+    return claim and [list(item[:2]) for item in claim[1]]  # (line, path)
 
 
 async def main():
@@ -1854,6 +1855,138 @@ out["left"] = [r for r in await store.queued_recipients() if r in (*people.value
         "boot": [["a", "/ext/admin"]],
     }
     assert out["left"] == []
+
+
+def notice_people(hindsight, label):
+    """Fresh people on the Key Allowlist: three owners of a new Team, and two admins; returns (people, team)."""
+    people = {name: f"{label}-{name}-{RUN}@example.test" for name in ("own1", "own2", "own3", "adm1", "adm2")}
+    for name, email in people.items():
+        role = "admin" if name.startswith("adm") else "member"
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": email, "role": role})[0] == 204
+    team = team_page(hindsight, "POST", "/ext/teams", people["own1"], {"name": f"Notices {label} {RUN}"})["team"]
+    for name in ("own2", "own3"):
+        team_page(hindsight, "POST", f"/ext/teams/{team}/members", people["own1"], {"email": people[name], "role": "owner"})
+    return people, team
+
+
+def test_a_change_that_ends_someones_eligibility_waits_for_their_message_in_flight_in_postgres(hindsight):
+    people, team = notice_people(hindsight, "wait")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+people, team = {people!r}, {team!r}
+
+
+class Slow:
+    \"\"\"A Webex whose message stays in flight until the test lets it go.\"\"\"
+
+    def __init__(self):
+        self.sent = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_message(self, to, text):
+        self.started.set()
+        await self.release.wait()
+        self.sent.append(to)
+
+
+async def held(person, kind, change):
+    slow = Slow()
+    notices = Notices(store, slow, "keys.example.test", lambda: T0, [])
+    await store.queue_notice([person], kind, team if kind == "owner" else None, "line", "/ext/teams")
+    sweep = asyncio.create_task(notices.send_due())
+    await asyncio.wait_for(slow.started.wait(), 10)
+    changing = asyncio.create_task(change())
+    await asyncio.sleep(0.5)
+    waited = not changing.done()
+    slow.release.set()
+    await asyncio.wait_for(asyncio.gather(sweep, changing), 10)
+    return [waited, slow.sent]
+
+
+out["removal"] = await held(people["own2"], "owner", lambda: store.remove_member(team, people["own2"]))
+out["demotion"] = await held(people["own3"], "owner", lambda: store.set_member(team, people["own3"], "member"))
+out["lost_admin"] = await held(people["adm1"], "admin", lambda: store.set_role(people["adm1"], "member"))
+out["roles_now"] = [
+    await store.team_role(team, people["own2"]),
+    await store.team_role(team, people["own3"]),
+    await store.role(people["adm1"]),
+]
+""",
+    )
+    p = people
+    # Each change waited for the message to its person, which went out; then the change took effect.
+    assert out["removal"] == [True, [p["own2"]]]
+    assert out["demotion"] == [True, [p["own3"]]]
+    assert out["lost_admin"] == [True, [p["adm1"]]]
+    assert out["roles_now"] == [None, "member", "member"]
+
+
+def test_a_change_that_commits_between_the_claim_and_the_send_stops_the_send_in_postgres(hindsight):
+    people, team = notice_people(hindsight, "race")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+people, team = {people!r}, {team!r}
+
+
+class Webex:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, to, text):
+        self.sent.append((to, text))
+
+
+class Racing(PostgresKeyStore):
+    \"\"\"A store where, right after a person's notices are claimed, an admin's change to them commits.\"\"\"
+
+    async def claim_notice(self, recipient, *args):
+        claim = await super().claim_notice(recipient, *args)
+        if claim and recipient == people["own2"]:
+            await self.remove_member(team, recipient)
+        if claim and recipient == people["own3"]:
+            await self.set_member(team, recipient, "member")
+        if claim and recipient == people["adm1"]:
+            await self.set_role(recipient, None)
+        return claim
+
+
+racing, webex = Racing(url), Webex()
+try:
+    notices = Notices(racing, webex, "keys.example.test", lambda: T0, [])
+    # own1 is still an owner and adm2 still an admin: they are the control.
+    for who in ("own1", "own2", "own3"):
+        await racing.queue_notice([people[who]], "owner", team, who, "/ext/teams")
+    for who in ("adm1", "adm2"):
+        await racing.queue_notice([people[who]], "admin", None, who, "/ext/admin")
+    await notices.send_due()
+finally:
+    await racing.close()
+out["sent"] = sorted(to for to, _ in webex.sent)
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch(
+        "SELECT recipient, status, detail FROM agent_keys.notice_log WHERE recipient = ANY($1) ORDER BY recipient",
+        list(people.values()),
+    )
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+""",
+    )
+    p = people
+    assert out["sent"] == sorted([p["own1"], p["adm2"]])
+    assert out["log"] == sorted(
+        [
+            [p["own1"], "sent", None],
+            [p["own2"], "skipped", "no longer eligible"],
+            [p["own3"], "skipped", "no longer eligible"],
+            [p["adm1"], "skipped", "no longer eligible"],
+            [p["adm2"], "sent", None],
+        ]
+    )
 
 
 def test_the_operating_guides_send_log_check_lists_what_was_sent(hindsight):

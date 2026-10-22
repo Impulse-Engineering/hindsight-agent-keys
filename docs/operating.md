@@ -124,7 +124,7 @@ The app ran stock upstream with one key in `HINDSIGHT_CP_DATAPLANE_API_KEY`. Kee
 
 ## Webex notices
 
-The extension sends Webex direct messages from a bot: to a Team's owners on the Key Allowlist when someone asks to join (or an agent asks for someone to join), to the admins when someone asks for the Key Allowlist, and to the person who asked when their request is decided (README, "Webex notices", has the rules and what an interruption leaves). They are best effort and the pages stay the source of truth, so nothing here is needed for Hindsight to work.
+The extension sends Webex direct messages from a bot: to a Team's owners on the Key Allowlist when someone asks to join, to the other owners on the Key Allowlist when an owner or an admin (an agent) asks for someone else to join, to the admins when someone asks for the Key Allowlist, and to the person who asked when their request is decided, unless they made the decision themselves (README, "Webex notices", has the rules and what an interruption leaves). They are best effort and the pages stay the source of truth, so nothing here is needed for Hindsight to work.
 
 **Setting up** *(not verified)*:
 
@@ -138,19 +138,19 @@ The extension sends Webex direct messages from a bot: to a Team's owners on the 
 | --- | --- | --- | --- |
 | *(not yet run)* | | | |
 
-**Renewing the token.** Before the date in the reminder, regenerate the token on the bot's page and set the secret again as in step 2. Until it is set, messages fail with `HTTP 401` in the send log and nobody is told anything; the pages are unaffected.
+**Renewing the token.** Before the date in the reminder, regenerate the token on the bot's page and set the secret again as in step 2. If the token is wrong or has expired, messages fail with `HTTP 401` in the send log and nobody is told anything; the pages are unaffected. With no token set at all, nothing is queued and the send log gets no rows.
 
-**Reading the send log** from the CT: one row per message, newest first, with the person, how many notices it held, `sent`, `failed` or `sending`, and why it failed *(not verified on Dev; runs in the integration tests)*:
+**Reading the send log** from the CT: one row per claimed message, newest first, with the person, how many notices it held, its status (`sent`, `skipped`, `failed` or `sending`), and why it was not sent *(not verified on Dev; runs in the integration tests)*:
 
 ```sh
 # CT
 pg psql -X -d hindsight -Atc 'select at, recipient, items, status, detail from agent_keys.notice_log order by id desc limit 20'
 ```
 
-- `skipped` means the person turned notices off while their message was being claimed; nothing was sent.
+- `skipped` means nothing was sent: the person turned notices off after their message was claimed, or (`no longer eligible`) lost what made it theirs to read, such as owning the Team or being an admin, before it went.
 - `failed` with `HTTP 401` is a wrong or expired token; `HTTP 429, retry after N s` is a rate limit; any other `HTTP` status comes with Webex's reason, such as a person it cannot find by that email. The notices in a failed message are not sent again.
-- `sending` for more than a minute means the process stopped between claiming the message and recording its outcome. The person may or may not have the message, and nothing sends it again; the pages show the request.
-- No row at all for a person who should have been told: they turned notices off, the change was stored but its notice could not be queued (the logs say `agent-keys: could not queue a Webex notice`), or the token is unset.
+- `sending` for more than a minute means the process stopped between claiming the message and recording its outcome, or the outcome could not be written (the logs say `agent-keys: could not write the Webex send log`). The person may or may not have the message, and nothing sends it again; the pages show the request.
+- No row at all for a person who should have been told: they turned notices off, they were not eligible when the message was claimed (no longer an owner on the Key Allowlist, or an admin), the change was stored but its notice could not be queued (the logs say `agent-keys: could not queue a Webex notice`), or the token is unset and nothing is queued.
 
 **People turn them off** with the switch on `/ext/`; there is no admin switch. The pages and the MCP tools are the same either way.
 

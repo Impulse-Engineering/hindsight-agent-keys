@@ -21,6 +21,23 @@ TEAM_NAME_LOCK_POLL = 0.1
 NOTICE_LOCK_WAIT = 20.0
 NOTICE_LOCK_POLL = 0.05
 
+
+def _notice_lock_key(email: str) -> str:
+    """The key of the lock a message to the person is sent under, and every change that can end their eligibility for
+    a notice is made under (`notice_lock`, `_lock_notices`): one key, so the two exclude each other."""
+    return f"{SCHEMA}.notice_send:{email}"
+
+
+# Whether a queued notice (t.kind, t.team) is still the person's ($1) to read, given the bootstrap admins ($2), who are
+# admins whatever the allowlist says. 'member' and 'admin' are extension.LISTED, the roles that may create keys.
+NOTICE_ELIGIBLE = (
+    "CASE t.kind"
+    f" WHEN 'owner' THEN EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = t.team AND m.email = $1 AND m.role = 'owner')"
+    f"   AND ($1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role IN ('member', 'admin')))"
+    f" WHEN 'admin' THEN $1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role = 'admin')"
+    " ELSE true END"
+)
+
 # Idempotent and outside upstream's Alembic history, like the event log.
 # A key stores only an HMAC of the whole key, never the key.
 DDL = f"""
@@ -116,8 +133,8 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.notice_queue (
 );
 CREATE INDEX IF NOT EXISTS notice_queue_recipient_idx ON {SCHEMA}.notice_queue (recipient, id);
 -- #1005: the send log, one row per message. 'sending' is written when the notices are claimed, before the call to Webex,
--- and is still there if the process stopped before or just after it; 'skipped' is a message not sent because the person
--- turned notices off after the claim. shortcut: never pruned, at most 96 rows a day for each
+-- and is still there if the process stopped before or just after it, or the outcome could not be written; 'skipped' is
+-- a message not sent because the person turned notices off, or was no longer eligible, after the claim. shortcut: never pruned, at most 96 rows a day for each
 -- person; delete old rows when the table is large enough to matter.
 CREATE TABLE IF NOT EXISTS {SCHEMA}.notice_log (
     id bigserial PRIMARY KEY,
@@ -293,6 +310,7 @@ class PostgresKeyStore:
         """Set the person's role, or remove them with None; returns the role they had."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
+            await self._lock_notices(conn, email)
             old = await conn.fetchval(f"SELECT role FROM {SCHEMA}.allowlist WHERE email = $1 FOR UPDATE", email)
             if role is None:
                 await conn.execute(f"DELETE FROM {SCHEMA}.allowlist WHERE email = $1", email)
@@ -378,6 +396,7 @@ class PostgresKeyStore:
             " SELECT (SELECT role FROM had) AS had, (SELECT requested_by FROM settled) AS asked_by",
             email,
             role,
+            who=email,
             row=True,
         )
         return row["had"], row["asked_by"]
@@ -385,7 +404,7 @@ class PostgresKeyStore:
     async def remove_member(self, team: str, email: str) -> str | None:
         """Take the person out of the Team; returns the role they had, None if they were not in it."""
         return await self._change_members(
-            team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2 RETURNING role", email
+            team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2 RETURNING role", email, who=email
         )
 
     async def request_member(self, team: str, email: str, role: str, by: str) -> None:
@@ -397,6 +416,7 @@ class PostgresKeyStore:
             email,
             role,
             by,
+            who=None,
         )
 
     async def add_join_request(self, team: str, email: str, role: str) -> bool:
@@ -413,6 +433,7 @@ class PostgresKeyStore:
                     " ON CONFLICT (team, email) DO NOTHING RETURNING true",
                     email,
                     role,
+                    who=None,
                 )
             )
         except Refused as refusal:
@@ -432,6 +453,7 @@ class PostgresKeyStore:
             " SELECT role, requested_by FROM asked",
             email,
             role,
+            who=email,
             row=True,
         )
         return None if row is None else (row["role"], row["requested_by"])
@@ -442,6 +464,7 @@ class PostgresKeyStore:
             team,
             f"DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 RETURNING role, requested_by",
             email,
+            who=None,
             row=True,
         )
         return None if row is None else (row["role"], row["requested_by"])
@@ -452,11 +475,15 @@ class PostgresKeyStore:
             f"SELECT email, role, requested_by FROM {SCHEMA}.member_requests WHERE team = $1 ORDER BY email", team
         )
 
-    async def _change_members(self, team: str, sql: str, *args: str, row: bool = False):
+    async def _change_members(self, team: str, sql: str, *args: str, who: str | None, row: bool = False):
         """Run one change to the Team's members and return its first value (with `row`, its first row, None if it
-        returned none); Refused(404) if there is no such Team, Refused(409) if the change would leave it without an owner."""
+        returned none); Refused(404) if there is no such Team, Refused(409) if the change would leave it without an owner.
+        `who` is the person whose place in the Team the change may end (a removal, or a role change), whose notice lock it
+        takes first (`_lock_notices`); None for a change that only files or drops a request and cannot."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
+            if who is not None:
+                await self._lock_notices(conn, who)
             # Locking the Team makes concurrent changes see each other's owners.
             if await conn.fetchval(f"SELECT 1 FROM {SCHEMA}.teams WHERE schema = $1 FOR UPDATE", team) is None:
                 raise Refused(404, "There is no such Team.")
@@ -645,26 +672,22 @@ class PostgresKeyStore:
 
     async def claim_notice(
         self, recipient: str, now: datetime, since: datetime, admins: list[str]
-    ) -> tuple[int, list[tuple[str, str]]] | None:
+    ) -> tuple[int, list[tuple[str, str, str, str | None]]] | None:
         """Take everything queued for the person that they are still eligible for and log it as one message `sending`:
-        (log ID, [(line, path)]). Eligible is still what the notice made them: an owner of its Team who is on the Key
-        Allowlist, or an admin (`admins` are the bootstrap admins, always admins); the rest is dropped. None, taking
+        (log ID, [(line, path, kind, team)]). Eligible is still what the notice made them (NOTICE_ELIGIBLE): an owner of its
+        Team who is on the Key Allowlist, or an admin (`admins` are the bootstrap admins); the rest is dropped. None, taking
         nothing, if they were messaged after `since` (it stays queued) or have nothing left to be told; their queue is
         emptied, and nothing logged, if they turned notices off. One transaction, one at a time per person across
-        processes: a stop inside it rolls it back and the queue is as it was."""
+        processes: a stop inside it rolls it back and the queue is as it was. The sender checks eligibility again under
+        the person's notice lock, just before it sends (`still_eligible`)."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{SCHEMA}.notices:{recipient}")
             if await conn.fetchval(f"SELECT 1 FROM {SCHEMA}.notice_log WHERE recipient = $1 AND at > $2", recipient, since):
                 return None
-            # The roles are extension.LISTED, those that may create keys. A 'requested' person is not on the Key Allowlist.
             rows = await conn.fetch(
                 f"WITH taken AS (DELETE FROM {SCHEMA}.notice_queue WHERE recipient = $1 RETURNING id, kind, team, line, path)"
-                " SELECT line, path FROM taken t WHERE CASE t.kind"
-                f" WHEN 'owner' THEN EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = t.team AND m.email = $1 AND m.role = 'owner')"
-                f"   AND ($1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role IN ('member', 'admin')))"
-                f" WHEN 'admin' THEN $1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role = 'admin')"
-                " ELSE true END ORDER BY id",
+                f" SELECT line, path, kind, team FROM taken t WHERE {NOTICE_ELIGIBLE} ORDER BY id",
                 recipient,
                 admins,
             )
@@ -676,7 +699,22 @@ class PostgresKeyStore:
                 now,
                 len(rows),
             )
-        return log_id, [(r["line"], r["path"]) for r in rows]
+        return log_id, [(r["line"], r["path"], r["kind"], r["team"]) for r in rows]
+
+    async def still_eligible(self, recipient: str, items: list[tuple[str, str, str, str | None]], admins: list[str]) -> list[bool]:
+        """For each claimed item, whether the person is still eligible for it now. Called under the person's notice lock,
+        which every change that can end their eligibility takes before it commits, so once one has committed this sees it
+        and, until it has, the change waits for the message that follows."""
+        pool = await self._get_pool()
+        rows = await pool.fetch(
+            f"SELECT t.ord FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS t(kind, team, ord) WHERE {NOTICE_ELIGIBLE}",
+            recipient,
+            admins,
+            [item[2] for item in items],
+            [item[3] for item in items],
+        )
+        yes = {r["ord"] - 1 for r in rows}
+        return [i in yes for i in range(len(items))]
 
     async def finish_notice(self, log_id: int, status: str, detail: str | None) -> None:
         """Say how the message went: 'sent', 'skipped' (turned off meanwhile), or 'failed' with why."""
@@ -686,20 +724,32 @@ class PostgresKeyStore:
     @contextlib.asynccontextmanager
     async def notice_lock(self, email: str):
         """Hold the person's notice lock, across API processes: a message to them is sent under it, and an opt-out is
-        written under it, so an opt-out waits for a send in flight and a send that starts after one sees it. It takes
-        a connection of its own and polls, as team_name_lock does. TimeoutError after NOTICE_LOCK_WAIT seconds, which
-        is longer than a send can last."""
+        written under it (as is every change that can end their eligibility, `_lock_notices`), so those wait for a send
+        in flight and a send that starts after one sees it. It takes a connection of its own and polls, as
+        team_name_lock does. TimeoutError after NOTICE_LOCK_WAIT seconds, which is longer than a send can last."""
         conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
         try:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + NOTICE_LOCK_WAIT
-            while not await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", f"{SCHEMA}.notice_send:{email}"):
+            while not await conn.fetchval("SELECT pg_try_advisory_lock(hashtext($1))", _notice_lock_key(email)):
                 if loop.time() >= deadline:
                     raise TimeoutError
                 await asyncio.sleep(NOTICE_LOCK_POLL)
             yield
         finally:
             await conn.close()
+
+    async def _lock_notices(self, conn: asyncpg.Connection, email: str) -> None:
+        """Take the person's notice lock until the transaction on `conn` ends. Every change that can end someone's eligibility
+        for a notice (a removal or a role change in a Team, a role change on the Key Allowlist) calls this before it changes
+        anything, so it waits for a message to them in flight and a message whose final check comes after the commit sees it.
+        Polls, as notice_lock does; Refused(503) if the message does not finish within NOTICE_LOCK_WAIT seconds."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + NOTICE_LOCK_WAIT
+        while not await conn.fetchval("SELECT pg_try_advisory_xact_lock(hashtext($1))", _notice_lock_key(email)):
+            if loop.time() >= deadline:
+                raise Refused(503, "A message to that person is being sent; try again in a moment.")
+            await asyncio.sleep(NOTICE_LOCK_POLL)
 
     async def notices_enabled(self, email: str) -> bool:
         pool = await self._get_pool()

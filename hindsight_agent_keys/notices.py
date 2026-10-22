@@ -6,7 +6,8 @@ state is in the database, so every API process and every restart sees the same q
 
 No notice code runs before the change it announces, and none can stall it: queuing happens after the commit and
 adds at most QUEUE_DEADLINE to the request, whatever the database or Webex are doing. A message is sent at most
-once and never retried.
+once and never retried. The one wait the other way round is deliberate: a change that ends someone's eligibility for
+a notice waits for a message to them in flight (SEND_DEADLINE at most), so that nothing is sent to them after it commits.
 """
 
 import asyncio
@@ -143,7 +144,8 @@ class Notices:
     async def send_due(self) -> None:
         """One sweep: send each person's queued notices as one message unless they heard within WINDOW.
         A message is claimed in the database before it is sent (the claim is its send log row, `sending`) and
-        its outcome is written after, so a stop in between leaves a `sending` row and never a second message."""
+        its outcome is written after, so a stop in between, or an outcome that cannot be written, leaves a `sending`
+        row and never a second message."""
         try:
             for recipient in await self._store.queued_recipients():
                 await self._deliver(recipient)
@@ -157,15 +159,21 @@ class Notices:
             return
         log_id, items = claim
         try:
-            # The person's lock is held across the send, so an opt-out waits for a message in flight and, once it
-            # commits, the check here finds it: nothing is sent to someone who has turned notices off.
+            # The final checks and the send happen under the person's notice lock, and everything that can end their
+            # eligibility (an opt-out, a removal from a Team, a role change) takes that lock before it commits. So a
+            # change that has committed is seen here, and one that has not waits until the message is sent: once it
+            # commits, nothing more is sent to that person for what it ended.
             async with self._store.notice_lock(to):
-                if await self._store.notices_enabled(to):
+                still = await self._store.still_eligible(to, items, self._admins)
+                items = [item for item, ok in zip(items, still, strict=True) if ok]
+                if not items:
+                    status, detail = "skipped", "no longer eligible"
+                elif not await self._store.notices_enabled(to):
+                    status, detail = "skipped", "turned off"
+                else:
                     async with asyncio.timeout(SEND_DEADLINE):
                         await self._webex.send_message(to, self._message(items))
                     status, detail = "sent", None
-                else:
-                    status, detail = "skipped", "turned off"
         except Exception as exc:  # noqa: BLE001 - logged in the send log, not retried
             # Only a WebexError's text is safe to store; any other exception is named by its type.
             status, detail = "failed", str(exc) if isinstance(exc, WebexError) else type(exc).__name__
@@ -175,10 +183,10 @@ class Notices:
         except Exception as exc:  # noqa: BLE001 - the row stays `sending`; the message is not sent again
             logger.warning("agent-keys: could not write the Webex send log: %s", type(exc).__name__)
 
-    def _message(self, items: list[tuple[str, str]]) -> str:
-        shown = [f"- {line}" for line, _ in items[:MAX_LINES]]
+    def _message(self, items: list[tuple[str, str, str, str | None]]) -> str:
+        shown = [f"- {item[0]}" for item in items[:MAX_LINES]]
         more = [f"...and {len(items) - MAX_LINES} more."] if len(items) > MAX_LINES else []
-        pages = dict.fromkeys(f"https://{self._host}{path}" for _, path in items)
+        pages = dict.fromkeys(f"https://{self._host}{item[1]}" for item in items)
         return "\n".join(["Hindsight:", *shown, *more, "See " + " and ".join(pages)])
 
     def start(self) -> None:
