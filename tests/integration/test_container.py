@@ -610,7 +610,8 @@ def test_a_team_keeps_an_owner_and_a_unique_name_and_public_is_reserved(hindsigh
         status, text = key_page(hindsight, "POST", "/ext/teams", BOB, body={"name": name})
         assert status == 409, text
     status, page = key_page(hindsight, "GET", "/ext/teams", BOB)
-    assert status == 200 and "CI Team" in page and f"{ALICE} (owner)" in page and f"{BOB} (member)" in page
+    assert status == 200 and "CI Team" in page and f'{ALICE}</span><span class="pill admin">owner' in page
+    assert f'{BOB}</span><span class="pill member">member' in page
 
 
 MCP_ENDPOINTS = ["/mcp/", f"/mcp/{BANK}/"]
@@ -855,7 +856,7 @@ def test_a_stale_personal_schema_is_reported_to_admins_and_purged_only_by_the_op
                     f" WHERE email = '{gina}' RETURNING email")
         status, text = key_page(hindsight, "GET", "/ext/admin", ALICE)
         assert status == 200, text
-        return re.findall(r"<tr><td>([^<]*)</td><td>([^<]*)</td><td>[^<]*</td></tr>", text.partition("Stale personal schemas")[2])
+        return re.findall(r"<tr><td>([^<]*)</td><td>([^<]*)</td><td>.*?</td></tr>", text.partition("Stale personal schemas")[2])
 
     assert (schema, gina) not in reported()
     assert (schema, gina) not in reported(expired_days_ago=89)

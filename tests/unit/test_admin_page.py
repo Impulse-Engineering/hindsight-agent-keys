@@ -103,7 +103,9 @@ def test_admins_see_each_stale_personal_schema_with_its_owner_and_last_key_activ
         {"schema": "p_00000000000000bb", "email": "keyless@example.com", "last_active": None},
     ]
     text = client.get("/ext/admin", headers=signed_in(team, email=ADMIN)).text
-    assert "<tr><td>p_00000000000000aa</td><td>&lt;b&gt;gone&lt;/b&gt;@example.com</td><td>2026-01-02 03:04 UTC</td></tr>" in text
+    days = (datetime.now(UTC) - datetime(2026, 1, 2, 3, 4, tzinfo=UTC)).days
+    shown = f'<span title="02 Jan 2026">{days} days ago</span>'
+    assert f"<tr><td>p_00000000000000aa</td><td>&lt;b&gt;gone&lt;/b&gt;@example.com</td><td>{shown}</td></tr>" in text
     assert "<tr><td>p_00000000000000bb</td><td>keyless@example.com</td><td>never had a key</td></tr>" in text
 
 
