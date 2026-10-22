@@ -219,6 +219,31 @@ async def test_a_retry_after_an_unrecorded_change_answers_the_current_state_and_
     assert [m["email"] for m in (await ext.teams(ALICE))[0]["members"]] == [ALICE, BOB]
 
 
+async def test_a_creation_that_stops_before_the_team_is_stored_leaves_an_unlisted_schema_and_a_repeat_creates_the_team(
+    team, monkeypatch
+):
+    client, ext, events = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    stores = ext._store.create_team
+
+    async def stops(schema, name, owner):
+        raise OSError("the process stopped after migrating")
+
+    monkeypatch.setattr(ext._store, "create_team", stops)
+    with pytest.raises(OSError):
+        send(client, team, "POST", TEAMS, {"name": "Platform"})
+    (migrated,) = ext.context.schemas
+    monkeypatch.setattr(ext._store, "create_team", stores)
+    made = send(client, team, "POST", TEAMS, {"name": "Platform"})
+    assert made.status_code == 200, made.text
+    schema = made.json()["team"]
+    # The repeat creates the Team under a new schema. The first stays migrated, and no Team, person or worker lists it.
+    assert (ext.context.schemas, schema != migrated) == ([migrated, schema], True)
+    assert [t["team"] for t in await ext.teams(ALICE)] == [schema]
+    assert migrated not in [t.schema for t in await ext.list_tenants()]
+    assert logged(events) == [("team_created", ALICE, ALICE, "delegated", DELEGATE_ID)]
+
+
 async def test_team_creation_keeps_the_teams_pages_terms(team):
     client, ext, _ = delegated_app(team)
     ext._store.roles[ALICE] = "member"
@@ -245,22 +270,24 @@ async def test_a_member_change_needs_an_email_and_a_role_of_member_or_owner(team
 
 
 class LockedElsewhere:
-    """A connection whose try-lock never succeeds: another request holds the Team name."""
+    """A connection whose try-lock fails while another request holds the Team name: for good, or until the
+    holder's connection closes after `frees_after` polls, which frees the lock."""
 
-    def __init__(self):
+    def __init__(self, frees_after=None):
         self.polls = 0
         self.closed = False
+        self.frees_after = frees_after
 
     async def fetchval(self, *args):
         self.polls += 1
-        return False
+        return self.frees_after is not None and self.polls > self.frees_after
 
     async def close(self):
         self.closed = True
 
 
-async def test_a_waiter_for_a_team_name_is_refused_after_a_deadline_and_gives_back_its_connection(monkeypatch):
-    conn = LockedElsewhere()
+def waiting_on(monkeypatch, conn):
+    """A store whose Team name lock takes `conn`, and gives up after 0.2 seconds."""
 
     async def connect(dsn):
         return conn
@@ -271,9 +298,14 @@ async def test_a_waiter_for_a_team_name_is_refused_after_a_deadline_and_gives_ba
     monkeypatch.setattr(store.asyncpg, "connect", connect)
     monkeypatch.setattr(store, "TEAM_NAME_LOCK_WAIT", 0.2)
     monkeypatch.setattr(store, "TEAM_NAME_LOCK_POLL", 0.01)
+    return store.PostgresKeyStore(db_url)
+
+
+async def test_a_waiter_for_a_team_name_is_refused_after_a_deadline_and_gives_back_its_connection(monkeypatch):
+    conn = LockedElsewhere()
 
     async def wait_for_the_name():
-        async with store.PostgresKeyStore(db_url).team_name_lock("Platform"):
+        async with waiting_on(monkeypatch, conn).team_name_lock("Platform"):
             raise AssertionError("the lock is held elsewhere")
 
     # Bounded here too, so a waiter that never gives up fails this test rather than hangs it.
@@ -281,6 +313,14 @@ async def test_a_waiter_for_a_team_name_is_refused_after_a_deadline_and_gives_ba
         await asyncio.wait_for(wait_for_the_name(), timeout=5)
     assert (refusal.value.status, "try again" in str(refusal.value)) == (503, True)
     assert (conn.closed, conn.polls > 1) == (True, True)
+
+
+async def test_a_waiter_takes_the_team_name_once_its_holder_stops_and_gives_it_back_after(monkeypatch):
+    # The holder stopped mid-migration: Postgres frees a session's advisory lock when its connection closes.
+    conn = LockedElsewhere(frees_after=3)
+    async with waiting_on(monkeypatch, conn).team_name_lock("Platform"):
+        assert (conn.polls, conn.closed) == (4, False)
+    assert conn.closed
 
 
 def test_a_creation_whose_name_is_busy_for_too_long_answers_503_and_migrates_nothing(team, monkeypatch):
@@ -324,6 +364,37 @@ async def test_concurrent_creations_of_one_name_migrate_once_and_the_loser_finds
     )
     assert (isinstance(first, str), (type(second), second.status)) == (True, (Refused, 409))
     assert len(ext.context.schemas) == 2
+
+
+class StopsMidMigration(SlowMigrations):
+    """The first migration stops part way, as when its process dies, and leaves the schema unlisted."""
+
+    def __init__(self):
+        super().__init__()
+        self.stopped = False
+
+    async def run_migration(self, schema):
+        if not self.stopped:
+            self.stopped = True
+            await asyncio.sleep(0)
+            raise OSError("the process stopped mid-migration")
+        await super().run_migration(schema)
+
+
+async def test_a_waiter_creates_the_team_itself_when_the_name_holder_stops_mid_migration(team):
+    _, ext, events = delegated_app(team)
+    ext.set_context(StopsMidMigration())
+    ext._store.roles.update({ALICE: "member", BOB: "member"})
+    first, waiter = await asyncio.gather(
+        ext.create_team(ALICE, "Platform", None, delegated_repeat=True),
+        ext.create_team(BOB, "platform", None, delegated_repeat=True),
+        return_exceptions=True,
+    )
+    assert type(first) is OSError
+    # The name came free when the holder stopped; the waiter found no Team, so it migrated and stored its own.
+    assert (ext.context.schemas, await ext._store.team_schema("Platform")) == ([waiter], waiter)
+    assert ext._store.team_roles == {(waiter, BOB): "owner"}
+    assert [(r["kind"], r["email"]) for r in events.rows] == [("team_created", BOB)]
 
 
 async def test_a_repeated_team_key_creation_returns_the_same_id_without_the_key(team):

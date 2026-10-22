@@ -444,8 +444,8 @@ class AgentKeysTenantExtension(TenantExtension):
         await self._require_allowlisted(email)
         if name.lower() == PUBLIC_SCHEMA:
             raise Refused(409, "The name public is reserved for the Public Team.")
-        # One creation of a name at a time, across API processes: the first migrates and stores the Team,
-        # and a concurrent one, which waits here, finds it and is answered or refused without migrating.
+        # One creation of a name at a time, across API processes: a concurrent one waits here, then finds the
+        # Team the first stored and is answered or refused without migrating, or finds none and creates it.
         async with self._store.team_name_lock(name):
             # Checked before migrating, so a taken name or a person at the limit leaves no schema behind.
             taken = await self._store.team_schema(name)

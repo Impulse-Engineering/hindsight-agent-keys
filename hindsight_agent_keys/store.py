@@ -470,8 +470,9 @@ class PostgresKeyStore:
     async def team_name_lock(self, name: str):
         """Hold a lock on the Team name, in any case, across API processes. It takes a connection of its own,
         not one of the pool's, so waiting for it, or a migration under it, never starves the key lookups.
-        A waiter gives up after TEAM_NAME_LOCK_WAIT seconds with Refused(503) and closes its connection,
-        so waiters behind a stuck holder cannot pile up connections."""
+        A waiter gives up after TEAM_NAME_LOCK_WAIT seconds with Refused(503) and closes its connection, so each
+        waiter behind a stuck holder holds a connection for at most that long; how many wait is not capped. A holder
+        that stops, mid-migration say, frees the lock as its connection closes."""
         conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
         try:
             # Postgres's own lower(), the one the unique index on the name uses. A waiter polls: a statement left
