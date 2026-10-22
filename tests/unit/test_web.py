@@ -217,6 +217,8 @@ async def test_every_change_on_the_key_pages_records_who_made_it_on_the_ext_chan
     ok("POST", f"/keys/{key_id}/revoke")
     ok("POST", "/access-requests", headers=bob)
     ok("POST", "/admin/people", email="bob@example.com", role="member")
+    # Revoking an identity is recorded only when it revokes a key.
+    ok("POST", "/keys", headers=bob, name="phone")
     ok("POST", "/admin/revoke-identity", email="bob@example.com")
     team_id = ok("POST", "/teams", name="Platform")["team"]
     ok("POST", f"/teams/{team_id}/keys", name="ci")
@@ -234,6 +236,7 @@ async def test_every_change_on_the_key_pages_records_who_made_it_on_the_ext_chan
         ("key_revoked", "alice@example.com", "ext", None),
         ("access_requested", "bob@example.com", "ext", None),
         ("access_approved", "alice@example.com", "ext", None),
+        ("key_created", "bob@example.com", "ext", None),
         ("identity_revoked", "alice@example.com", "ext", None),
         ("team_created", "alice@example.com", "ext", None),
         ("key_created", "alice@example.com", "ext", None),

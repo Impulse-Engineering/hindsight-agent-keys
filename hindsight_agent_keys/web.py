@@ -180,6 +180,11 @@ class AgentKeysHttpExtension(HttpExtension):
             await _or_refused(memory.tenant_extension.decline_member(email, team, body.email, client_ip(request.headers)))
             return {"team": team, "email": body.email}
 
+        @admin_router.post("/revoke-workplane-keys")
+        async def revoke_workplane_keys(request: Request, email: str = Depends(admin)):
+            """The kill switch for WorkPlane's retain and recall. Here only: no Delegated Request reaches it."""
+            return {"revoked": await memory.tenant_extension.revoke_workplane_keys(email, client_ip(request.headers))}
+
         router.include_router(admin_router)
         # The pages' gate stays on their own router; Delegated Requests have their own gate.
         outer = APIRouter(include_in_schema=False)
@@ -283,6 +288,10 @@ their owner actions; they keep their Teams, and adding them again restores both.
   <input id="identity" type="email" required maxlength="254">
   <button>Revoke every key this person holds</button>
 </form>
+<h2>Kill switch</h2>
+<p>Stops WorkPlane's retain and recall: revokes every key created via WorkPlane, for everyone. Keys people created here keep working.
+Delete WorkPlane's service token in Access first, or WorkPlane creates new ones (<code>docs/operating.md</code>, "Kill switch").</p>
+<button id="revoke-workplane-keys" type="button">Revoke every key created via WorkPlane</button>
 <h2>People</h2>
 <table>
 <thead><tr><th scope="col">Email</th><th scope="col">Role</th><th scope="col">Change</th></tr></thead>
@@ -328,6 +337,18 @@ document.getElementById("revoke-identity").addEventListener("submit", async (eve
   const answer = await resp.json();
   document.getElementById("result").textContent = resp.ok
     ? "Revoked " + answer.revoked + " keys held by " + email + "."
+    : "Refused: " + JSON.stringify(answer.detail);
+});
+document.getElementById("revoke-workplane-keys").addEventListener("click", async () => {
+  if (!confirm("Revoke every key created via WorkPlane, for everyone?")) return;
+  const resp = await fetch("/ext/admin/revoke-workplane-keys", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
+    body: "{}",
+  });
+  const answer = await resp.json();
+  document.getElementById("result").textContent = resp.ok
+    ? "Revoked " + answer.revoked + " keys created via WorkPlane."
     : "Refused: " + JSON.stringify(answer.detail);
 });
 </script>

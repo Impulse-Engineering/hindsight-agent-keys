@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from hindsight_agent_keys.access import ACCESS_JWT_HEADER
-from hindsight_agent_keys.bodies import NewKey, _or_refused
+from hindsight_agent_keys.bodies import Identity, NewKey, RoleChange, _or_refused
 from hindsight_agent_keys.extension import acting_via, client_ip, host_and_json
 
 DELEGATED_JWT_HEADER = "x-delegated-access-jwt"
@@ -89,10 +89,37 @@ def delegated_router(memory) -> APIRouter:
 
     # Admin (#1003)
 
+    async def delegated_admin(email: str = Depends(delegated_person)) -> str:
+        """The admin the Delegate acts for; refuses everyone else."""
+        if await memory.tenant_extension.role(email) != "admin":
+            raise HTTPException(403, "Only admins can do this.")
+        return email
+
+    # Every route under /ext/delegated/admin is for admins only; it is included last, after every
+    # section has added its routes. Revoking every key created via WorkPlane is never one of them.
+    admin_router = APIRouter(prefix="/admin", dependencies=[Depends(delegated_admin)])
+
+    @admin_router.post("/people")
+    async def set_role(body: RoleChange, request: Request, email: str = Depends(delegated_admin)):
+        """As /ext/admin/people does; answers the person's role now, a repeat too."""
+        keys = memory.tenant_extension
+        await _or_refused(keys.set_role(email, body.email, body.role, client_ip(request.headers)))
+        return {"email": body.email, "role": await keys.role(body.email)}
+
+    @admin_router.post("/revoke-identity")
+    async def revoke_identity(body: Identity, request: Request, email: str = Depends(delegated_admin)):
+        """The admin exception: every key the person holds, whoever created it, as /ext/admin/revoke-identity does.
+        Answers how many this request revoked and how many of their keys are active now, a repeat too."""
+        keys = memory.tenant_extension
+        revoked = await _or_refused(keys.revoke_identity(email, body.email, client_ip(request.headers)))
+        active = sum(k["state"] == "active" for k in await keys.list_keys(body.email))
+        return {"email": body.email, "revoked": revoked, "active": active}
+
     # Teams (#1000)
 
     # Join Requests (#1001)
 
     # Open Teams (#1002)
 
+    router.include_router(admin_router)
     return router

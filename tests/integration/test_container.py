@@ -984,6 +984,41 @@ def test_concurrent_delegated_creations_stop_at_the_workplane_cap(hindsight):
     personal_key(hindsight, kim)
 
 
+def test_the_kill_switch_revokes_every_key_created_via_workplane_and_no_other(hindsight):
+    port, name, lee = hindsight["port"], hindsight["name"], "lee@example.test"
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": lee, "role": "member"})[0] == 204
+    own = personal_key(hindsight, lee)["key"]
+    sent = {
+        "Host": DELEGATION_HOST,
+        "Cf-Access-Jwt-Assertion": access_token(name, common_name=DELEGATE_ID, sub="", aud=[DELEGATION_AUD]),
+        "X-Delegated-Access-Jwt": access_token(name, email=lee, aud=[WORKPLANE_AUD]),
+        "Idempotency-Key": "kill-switch",
+    }
+    status, text = http(port, "POST", "/ext/delegated/keys", body={"name": "wp"}, headers=sent)
+    assert status == 200, text
+    workplane = json.loads(text)["key"]
+    assert [http(port, "GET", "/v1/default/banks", key=k)[0] for k in (own, workplane)] == [200, 200]
+    # A WorkPlane key revoked before the kill switch keeps its revocation time and is not counted.
+    status, text = http(port, "POST", "/ext/delegated/keys", body={"name": "earlier"}, headers={**sent, "Idempotency-Key": "ks-2"})
+    earlier = json.loads(text)["id"]
+    assert http(port, "POST", f"/ext/delegated/keys/{earlier}/revoke", body={}, headers=sent)[0] == 200
+    revoked_at = f"SELECT revoked_at::text AS at FROM agent_keys.keys WHERE id = '{earlier}'"
+    before = query(name, revoked_at)
+    # Earlier tests in this container leave other people's WorkPlane keys active; the kill switch takes them all.
+    active = query(name, "SELECT count(*)::int AS n FROM agent_keys.keys WHERE via IS NOT NULL AND revoked_at IS NULL")[0]["n"]
+    assert active >= 1
+    ip = "203.0.113.83"
+    status, text = key_page(hindsight, "POST", "/ext/admin/revoke-workplane-keys", ALICE, body={}, headers={"X-Real-IP": ip})
+    assert (status, json.loads(text)) == (200, {"revoked": active}), text
+    assert query(name, revoked_at) == before
+    assert [http(port, "GET", "/v1/default/banks", key=k)[0] for k in (own, workplane)] == [200, 401]
+    run = run_doc(name, doc_block("docs/operating.md", "where via is not null and revoked_at is null"), "")
+    assert (run.returncode, run.stdout) == (0, "0\n"), run.stdout + run.stderr
+    assert query(name, f"SELECT kind, email, actor, channel FROM agent_keys.events WHERE client_ip = '{ip}'") == [
+        {"kind": "workplane_keys_revoked", "email": None, "actor": ALICE, "channel": "ext"}
+    ]
+
+
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
     # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.
