@@ -1694,12 +1694,13 @@ except Read:
 
 def test_no_request_waits_for_someone_in_the_team_and_a_join_settles_an_agents_request_in_postgres(hindsight):
     name, port, multi = hindsight["name"], hindsight["port"], MCP_ENDPOINTS[0]
-    owner, member, joiner = (f"settled-{who}-{RUN}@example.test" for who in ("owner", "member", "joiner"))
-    for person in (owner, member, joiner):
+    owner, coowner, member, joiner = (f"settled-{who}-{RUN}@example.test" for who in ("owner", "coowner", "member", "joiner"))
+    for person in (owner, coowner, member, joiner):
         assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
     owner_key = personal_key(hindsight, owner)["key"]
     team = team_page(hindsight, "POST", "/ext/teams", owner, {"name": f"Settled {RUN}"})["team"]
     team_page(hindsight, "POST", f"/ext/teams/{team}/members", owner, {"email": member, "role": "member"})
+    team_page(hindsight, "POST", f"/ext/teams/{team}/members", owner, {"email": coowner, "role": "owner"})
     requests = f"SELECT email, role FROM agent_keys.member_requests WHERE team = '{team}' ORDER BY email"
 
     def waiting():
@@ -1722,11 +1723,19 @@ def test_no_request_waits_for_someone_in_the_team_and_a_join_settles_an_agents_r
     assert query(name, requests) == []
     assert waiting() == (0, [], [])
     assert key_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", owner, body={"email": joiner})[0] == 404
-    # A request an earlier release left for someone now in the Team waits for no one either.
-    stale = f"('{team}', '{joiner}', 'member', '{owner}')"
+    # Requests an earlier release left for people now in the Team wait for no one either, and answering one decides
+    # nothing, as for no request: no event, and nobody's place changes (the co-owner is not made a member).
+    stale = f"('{team}', '{joiner}', 'member', '{owner}'), ('{team}', '{coowner}', 'member', '{owner}')"
     query(name, f"INSERT INTO agent_keys.member_requests (team, email, role, requested_by) VALUES {stale} RETURNING email")
     assert waiting() == (0, [], [])
-    sql = f"SELECT kind, email FROM agent_keys.events WHERE team = '{team}' AND kind LIKE '%_requested' ORDER BY id"
+    confirm = {"email": coowner, "role": "member"}
+    assert key_page(hindsight, "POST", f"/ext/teams/{team}/confirmations", owner, body=confirm)[0] == 404
+    assert key_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", owner, body={"email": joiner})[0] == 404
+    assert query(name, f"SELECT email, role FROM agent_keys.members WHERE team = '{team}' ORDER BY email") == sorted(
+        [{"email": e, "role": r} for e, r in ((owner, "owner"), (coowner, "owner"), (member, "member"), (joiner, "member"))],
+        key=lambda m: m["email"],
+    )
+    sql = f"SELECT kind, email FROM agent_keys.events WHERE team = '{team}' AND kind ~ '_(requested|confirmed|declined)$' ORDER BY id"
     assert query(name, sql) == [{"kind": "member_requested", "email": joiner}]
 
 # Webex notices. The container runs without a bot token, so no background sweep competes with these for the queue

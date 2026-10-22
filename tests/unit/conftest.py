@@ -137,6 +137,11 @@ class MemoryStore:
         """store._WAITING: the person is not in the Team already at the role asked for, or as an owner."""
         return self.team_roles.get((team, email)) not in ("owner", role)
 
+    def _waiting_request(self, team, email):
+        """(role, requested_by) of the person's request if it waits, else None."""
+        request = self.requests.get((team, email))
+        return request if request and self._waiting(team, email, request[0]) else None
+
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)
         if not self._waiting(team, email, role):
@@ -153,15 +158,17 @@ class MemoryStore:
         return True
 
     async def confirm_member(self, team, email, role):
-        asked, by = self.requests.get((team, email), (None, None))
+        asked, by = self._waiting_request(team, email) or (None, None)
         if asked == role:
             await self.set_member(team, email, role)
         return asked and (asked, by)
 
     async def decline_member(self, team, email):
         self._change_members(team, lambda roles: None)
+        if self._waiting_request(team, email) is None:
+            return None
         self.requested_at.pop((team, email), None)
-        return self.requests.pop((team, email), None)  # (the role it asked for, who asked)
+        return self.requests.pop((team, email))  # (the role it asked for, who asked)
 
     async def member_requests(self, team):
         return [

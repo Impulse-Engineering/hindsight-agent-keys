@@ -58,7 +58,8 @@ NOTICE_ELIGIBLE = (
 # Whether the request `r` (a member_requests row) still waits for an answer: its person is not in the Team already at the
 # role it asks for, or as an owner. Nothing files one that does not, and joining an Open Team settles one for a member's
 # place, but a request filed before those rules may be left. The Teams page, pending_reviews and the reminders all read
-# requests through this, and a request for someone else is filed only where it holds.
+# requests through this, only a request where it holds is confirmed or declined, and one for someone else is filed only
+# where it holds.
 _WAITING = (
     f"NOT EXISTS (SELECT 1 FROM {SCHEMA}.members w WHERE w.team = r.team AND w.email = r.email AND w.role IN ('owner', r.role))"
 )
@@ -519,11 +520,13 @@ class PostgresKeyStore:
 
     async def confirm_member(self, team: str, email: str, role: str) -> tuple[str, str] | None:
         """Give the person `role` if a pending request asks for exactly that. Returns (the role the request asks for,
-        who asked), nothing changing if it asks for another role, or None if there is no request."""
+        who asked), nothing changing if it asks for another role, or None if there is no request that waits (`_WAITING`)."""
         row = await self._change_members(
             team,
-            f"WITH asked AS (SELECT role, requested_by FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2),"
-            f" taken AS (DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 AND role = $3 RETURNING role),"
+            f"WITH asked AS (SELECT r.role, r.requested_by FROM {SCHEMA}.member_requests r"
+            f" WHERE r.team = $1 AND r.email = $2 AND {_WAITING}),"
+            f" taken AS (DELETE FROM {SCHEMA}.member_requests r WHERE r.team = $1 AND r.email = $2 AND r.role = $3"
+            f" AND {_WAITING} RETURNING r.role),"
             f" granted AS (INSERT INTO {SCHEMA}.members (team, email, role) SELECT $1, $2, role FROM taken"
             " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role)"
             " SELECT role, requested_by FROM asked",
@@ -535,10 +538,12 @@ class PostgresKeyStore:
         return None if row is None else (row["role"], row["requested_by"])
 
     async def decline_member(self, team: str, email: str) -> tuple[str, str] | None:
-        """Drop a pending request; returns (the role it asked for, who asked), or None if there was no request."""
+        """Drop a pending request; returns (the role it asked for, who asked), or None if there was no request that waits
+        (`_WAITING`)."""
         row = await self._change_members(
             team,
-            f"DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 RETURNING role, requested_by",
+            f"DELETE FROM {SCHEMA}.member_requests r WHERE r.team = $1 AND r.email = $2 AND {_WAITING}"
+            " RETURNING r.role, r.requested_by",
             email,
             who=None,
             row=True,
