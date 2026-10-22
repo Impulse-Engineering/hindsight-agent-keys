@@ -22,6 +22,7 @@ from hindsight_agent_keys.bodies import (
     Member,
     NewKey,
     NewTeam,
+    NoticePreference,
     Openness,
     RoleChange,
     _or_refused,
@@ -48,6 +49,14 @@ ROLE_ACTIONS = {
     "member": (("admin", "Grant admin rights"), ("", "Remove")),
     "admin": (("member", "Remove admin rights"), ("", "Remove")),
 }
+
+
+def webex_note(on: bool | None) -> str:
+    """What the page says about Webex notices: nothing where they are not set up."""
+    if on is None:
+        return ""
+    state, enable, label = ("on", "false", "Turn off") if on else ("off", "true", "Turn on")
+    return f'<p>Webex notices are {state}. <button id="webex-notices" type="button" data-enable="{enable}">{label}</button></p>'
 
 
 def _allowlist_row(email: str, role: str, bootstrap: bool) -> str:
@@ -97,8 +106,9 @@ class AgentKeysHttpExtension(HttpExtension):
         @router.get("/", response_class=HTMLResponse)
         async def page(email: str = Depends(person)):
             note = ALLOWLIST_NOTE[await memory.tenant_extension.role(email)]
+            webex = await memory.tenant_extension.webex_notices(email)
             # One pass, so a value that contains a placeholder is not substituted again.
-            return HTMLResponse(PAGE.substitute(allowlist=note, email=html.escape(email)), headers=NO_FRAMING)
+            return HTMLResponse(PAGE.substitute(allowlist=note, webex=webex_note(webex), email=html.escape(email)), headers=NO_FRAMING)
 
         @router.post("/access-requests", status_code=204)
         async def request_access(request: Request, email: str = Depends(person)):
@@ -212,6 +222,13 @@ class AgentKeysHttpExtension(HttpExtension):
             joined = {"team": team, "email": email, "role": role or "member"}
             return joined if role else {**joined, "status": "pending"}
 
+        # --- #1005 ---
+
+        @router.post("/webex-notices", status_code=204)
+        async def set_webex_notices(body: NoticePreference, email: str = Depends(person)):
+            """Turn the person's Webex notices off or on; the page and the MCP tool are not affected."""
+            await _or_refused(memory.tenant_extension.set_webex_notices(email, body.enabled))
+
         router.include_router(admin_router)
         # The pages' gate stays on their own router; Delegated Requests have their own gate.
         outer = APIRouter(include_in_schema=False)
@@ -228,6 +245,7 @@ PAGE = Template("""<!doctype html>
 <p>Signed in as $email. <a href="/ext/teams">Teams</a></p>
 <p>Your keys work for 90 days, and only while you sign in here at least every 30 days.</p>
 $allowlist
+$webex
 <form id="create">
   <label for="key-name">Key name</label>
   <input id="key-name" required maxlength="100">
@@ -287,6 +305,14 @@ document.getElementById("request-access")?.addEventListener("click", async () =>
     method: "POST",
     headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
     body: "{}",
+  });
+  if (resp.ok) location.reload();
+});
+document.getElementById("webex-notices")?.addEventListener("click", async (event) => {
+  const resp = await fetch("/ext/webex-notices", {
+    method: "POST",
+    headers: {"Content-Type": "application/json", "X-Agent-Keys": "1"},
+    body: JSON.stringify({enabled: event.target.dataset.enable === "true"}),
   });
   if (resp.ok) location.reload();
 });

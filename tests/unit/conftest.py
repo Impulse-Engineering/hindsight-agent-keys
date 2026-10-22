@@ -121,10 +121,10 @@ class MemoryStore:
     async def set_member(self, team, email, role):
         had = self.team_roles.get((team, email))
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
-        # A direct add settles the person's open request.
-        self.requests.pop((team, email), None)
+        # A direct add settles the person's open request; (the role they had, who had asked for them).
+        _, asked_by = self.requests.pop((team, email), (None, None))
         self.requested_at.pop((team, email), None)
-        return had
+        return had, asked_by
 
     async def remove_member(self, team, email):
         had = self.team_roles.get((team, email))
@@ -144,16 +144,15 @@ class MemoryStore:
         return True
 
     async def confirm_member(self, team, email, role):
-        asked, _ = self.requests.get((team, email), (None, None))
+        asked, by = self.requests.get((team, email), (None, None))
         if asked == role:
             await self.set_member(team, email, role)
-        return asked
+        return asked and (asked, by)
 
     async def decline_member(self, team, email):
         self._change_members(team, lambda roles: None)
-        role, _ = self.requests.pop((team, email), (None, None))
         self.requested_at.pop((team, email), None)
-        return role
+        return self.requests.pop((team, email), None)  # (the role it asked for, who asked)
 
     async def member_requests(self, team):
         return [{"email": e, "role": r, "requested_by": b} for (t, e), (r, b) in sorted(self.requests.items()) if t == team]

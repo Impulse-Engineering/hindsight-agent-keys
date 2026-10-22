@@ -43,6 +43,10 @@ class Identity(BaseModel):
     email: Email
 
 
+class NoticePreference(BaseModel):
+    enabled: bool  # whether Webex notices to the person are on
+
+
 class Openness(BaseModel):
     open: bool  # true opens the Team, false closes it
 

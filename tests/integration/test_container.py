@@ -1672,6 +1672,492 @@ def test_a_join_that_waits_for_a_closing_finds_the_team_closed_and_files_a_join_
     assert query(name, f"SELECT email FROM agent_keys.members WHERE team = '{team}'") == [{"email": oli}]
     assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": pia}]
 
+# Webex notices. The container runs without a bot token, so no background sweep competes with these for the queue
+# (the sweep, the messages and the HTTP routes are in tests/unit). They call the store the extension uses, and need
+# no Agent Key, so they spend no one's creations: every address carries RUN.
+
+NOTICE_STORE = """
+import asyncio, json
+from datetime import UTC, datetime, timedelta
+import asyncpg
+from pg0 import Pg0
+from hindsight_agent_keys import store as store_module
+from hindsight_agent_keys.notices import Notices
+from hindsight_agent_keys.store import PostgresKeyStore
+
+T0 = datetime(2026, 10, 22, 12, 0, tzinfo=UTC)
+WINDOW = timedelta(minutes=15)
+
+
+def lines(claim):
+    return claim and [list(item[:2]) for item in claim[1]]  # (line, path)
+
+
+async def main():
+    uri = Pg0(name="hindsight").info().uri
+
+    async def url():
+        return uri
+
+    store = PostgresKeyStore(url)
+    out = {{}}
+    try:
+{body}
+    finally:
+        await store.close()
+    print(json.dumps(out, default=str))
+
+
+asyncio.run(main())
+"""
+
+
+def notice_store(container, body):
+    """Run `body` (statements that fill `out`, indented in the script) against the store, inside the container."""
+    indented = "\n".join("        " + line for line in body.strip("\n").splitlines())
+    return in_container(container, NOTICE_STORE.format(body=indented))
+
+
+def test_the_notice_queue_the_window_the_opt_out_the_lock_and_the_claim_hold_in_postgres(hindsight):
+    r1, r2, r3, r4, r5 = (f"{name}-{RUN}@example.test" for name in ("one", "two", "three", "four", "five"))
+    out = notice_store(
+        hindsight["name"],
+        f"""
+R1, R2, R3, R4, R5 = {r1!r}, {r2!r}, {r3!r}, {r4!r}, {r5!r}
+await store.queue_notice([R1, R2], "asker", None, "a", "/ext/teams")
+await store.queue_notice([R1], "asker", None, "b", "/ext/admin")
+out["queued"] = sorted(r for r in await store.queued_recipients() if r in (R1, R2, R3))
+first = await store.claim_notice(R1, T0, T0 - WINDOW, [])
+out["first"] = lines(first)
+out["nothing_left"] = await store.claim_notice(R1, T0, T0 - WINDOW, [])
+await store.finish_notice(first[0], "failed", "HTTP 429, retry after 30 s")
+
+await store.queue_notice([R1], "asker", None, "c", "/ext/teams")
+out["blocked"] = await store.claim_notice(R1, T0 + timedelta(minutes=5), T0 + timedelta(minutes=5) - WINDOW, [])
+out["still_queued"] = R1 in await store.queued_recipients()
+out["at_15_minutes"] = lines(await store.claim_notice(R1, T0 + WINDOW, T0, []))
+
+await store.set_notices_enabled(R2, False)
+out["off"] = await store.notices_enabled(R2)
+out["opted_out"] = await store.claim_notice(R2, T0, T0 - WINDOW, [])
+out["dropped"] = R2 not in await store.queued_recipients()
+await store.set_notices_enabled(R2, True)
+await store.set_notices_enabled(R2, True)
+out["on"] = await store.notices_enabled(R2)
+await store.queue_notice([R2], "asker", None, "d", "/ext/")
+out["r2_after"] = lines(await store.claim_notice(R2, T0, T0 - WINDOW, []))
+
+await store.queue_notice([R3], "asker", None, "x", "/ext/teams")
+claims = await asyncio.gather(*(store.claim_notice(R3, T0, T0 - WINDOW, []) for _ in range(6)))
+out["concurrent_winners"] = sum(c is not None for c in claims)
+
+# A stop inside the claim (here a null where the log needs a time) rolls it back: the queue is as it was.
+await store.queue_notice([R4], "asker", None, "y", "/ext/teams")
+try:
+    await store.claim_notice(R4, None, T0 - WINDOW, [])
+    out["rolled_back"] = None
+except Exception as exc:
+    out["rolled_back"] = type(exc).__name__
+out["rolled_back_queue"] = R4 in await store.queued_recipients()
+out["after_rollback"] = lines(await store.claim_notice(R4, T0, T0 - WINDOW, []))
+
+# An opt-out waits for a send in flight (the person's lock), and gives up if it does not end.
+async with store.notice_lock(R5):
+    off = asyncio.create_task(store.set_notices_enabled(R5, False))
+    await asyncio.sleep(0.5)
+    out["optout_waits"] = not off.done()
+await asyncio.wait_for(off, 5)
+out["optout_after"] = not await store.notices_enabled(R5)
+await store.set_notices_enabled(R5, True)
+store_module.NOTICE_LOCK_WAIT = 0.3
+async with store.notice_lock(R5):
+    try:
+        await store.set_notices_enabled(R5, False)
+        out["lock_gives_up"] = False
+    except TimeoutError:
+        out["lock_gives_up"] = True
+out["still_on"] = await store.notices_enabled(R5)
+
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch(
+        "SELECT recipient, items, status, detail FROM agent_keys.notice_log WHERE recipient = ANY($1) ORDER BY id",
+        [R1, R2, R3, R4, R5],
+    )
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+""",
+    )
+    assert out["queued"] == sorted([r1, r2])
+    # A person's notices go out together, oldest first, and are gone once claimed.
+    assert out["first"] == [["a", "/ext/teams"], ["b", "/ext/admin"]]
+    assert out["nothing_left"] is None
+    # Within 15 minutes of the last message the next one waits, still queued; at 15 minutes it goes.
+    assert out["blocked"] is None and out["still_queued"] is True
+    assert out["at_15_minutes"] == [["c", "/ext/teams"]]
+    # Turned off: nothing is logged and what waited is dropped; turned on again, later notices go out.
+    assert (out["off"], out["opted_out"], out["dropped"], out["on"]) == (False, None, True, True)
+    assert out["r2_after"] == [["d", "/ext/"]]
+    # Two processes sweeping at once: one wins.
+    assert out["concurrent_winners"] == 1
+    # A claim that stops inside its transaction changes nothing.
+    assert out["rolled_back"] == "NotNullViolationError" and out["rolled_back_queue"] is True
+    assert out["after_rollback"] == [["y", "/ext/teams"]]
+    # The opt-out waits for the lock, then commits; a lock that is never freed makes it give up, changing nothing.
+    assert (out["optout_waits"], out["optout_after"]) == (True, True)
+    assert (out["lock_gives_up"], out["still_on"]) == (True, True)
+    assert out["log"] == [
+        [r1, 2, "failed", "HTTP 429, retry after 30 s"],
+        [r1, 1, "sending", None],
+        [r2, 1, "sending", None],
+        [r3, 1, "sending", None],
+        [r4, 1, "sending", None],
+    ]
+
+
+def test_a_queued_notice_is_dropped_at_the_claim_for_someone_no_longer_an_owner_or_admin_in_postgres(hindsight):
+    people = {name: f"{name}-{RUN}@example.test" for name in ("own1", "own2", "own3", "adm1", "adm2")}
+    boot = f"boot-{RUN}@example.test"
+    for name, email in people.items():
+        role = "admin" if name.startswith("adm") else "member"
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": email, "role": role})[0] == 204
+    team = team_page(hindsight, "POST", "/ext/teams", people["own1"], {"name": f"Notices {RUN}"})["team"]
+    for name in ("own2", "own3"):
+        team_page(hindsight, "POST", f"/ext/teams/{team}/members", people["own1"], {"email": people[name], "role": "owner"})
+    queue = f"""
+people, boot, team = {people!r}, {boot!r}, {team!r}
+await store.queue_notice([people["own1"], people["own2"], people["own3"]], "owner", team, "o", "/ext/teams")
+await store.queue_notice([people["adm1"], people["adm2"], boot], "admin", None, "a", "/ext/admin")
+"""
+    notice_store(hindsight["name"], queue)
+    # Since they were queued: own2 left the Team, own3 left the Key Allowlist (still an owner), adm2 was demoted.
+    assert key_page(hindsight, "DELETE", f"/ext/teams/{team}/members", people["own1"], body={"email": people["own2"]})[0] == 200
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": people["own3"], "role": None})[0] == 204
+    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": people["adm2"], "role": "member"})[0] == 204
+    out = notice_store(
+        hindsight["name"],
+        f"""
+people, boot = {people!r}, {boot!r}
+out["claims"] = {{
+    who: lines(await store.claim_notice(email, T0, T0 - WINDOW, [boot]))
+    for who, email in {{**people, "boot": boot}}.items()
+}}
+out["left"] = [r for r in await store.queued_recipients() if r in (*people.values(), boot)]
+""",
+    )
+    assert out["claims"] == {
+        "own1": [["o", "/ext/teams"]],
+        "own2": None,
+        "own3": None,
+        "adm1": [["a", "/ext/admin"]],
+        "adm2": None,
+        "boot": [["a", "/ext/admin"]],
+    }
+    assert out["left"] == []
+
+
+def notice_people(hindsight, label):
+    """Fresh people on the Key Allowlist: three owners of a new Team, and two admins; returns (people, team)."""
+    people = {name: f"{label}-{name}-{RUN}@example.test" for name in ("own1", "own2", "own3", "adm1", "adm2")}
+    for name, email in people.items():
+        role = "admin" if name.startswith("adm") else "member"
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": email, "role": role})[0] == 204
+    team = team_page(hindsight, "POST", "/ext/teams", people["own1"], {"name": f"Notices {label} {RUN}"})["team"]
+    for name in ("own2", "own3"):
+        team_page(hindsight, "POST", f"/ext/teams/{team}/members", people["own1"], {"email": people[name], "role": "owner"})
+    return people, team
+
+
+def test_a_change_that_ends_someones_eligibility_waits_for_their_message_in_flight_in_postgres(hindsight):
+    people, team = notice_people(hindsight, "wait")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+people, team = {people!r}, {team!r}
+
+
+class Slow:
+    \"\"\"A Webex whose message stays in flight until the test lets it go.\"\"\"
+
+    def __init__(self):
+        self.sent = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_message(self, to, text):
+        self.started.set()
+        await self.release.wait()
+        self.sent.append(to)
+
+
+async def held(person, kind, change):
+    slow = Slow()
+    notices = Notices(store, slow, "keys.example.test", lambda: T0, [])
+    await store.queue_notice([person], kind, team if kind == "owner" else None, "line", "/ext/teams")
+    sweep = asyncio.create_task(notices.send_due())
+    await asyncio.wait_for(slow.started.wait(), 10)
+    changing = asyncio.create_task(change())
+    await asyncio.sleep(0.5)
+    waited = not changing.done()
+    slow.release.set()
+    await asyncio.wait_for(asyncio.gather(sweep, changing), 10)
+    return [waited, slow.sent]
+
+
+out["removal"] = await held(people["own2"], "owner", lambda: store.remove_member(team, people["own2"]))
+out["demotion"] = await held(people["own3"], "owner", lambda: store.set_member(team, people["own3"], "member"))
+out["lost_admin"] = await held(people["adm1"], "admin", lambda: store.set_role(people["adm1"], "member"))
+out["roles_now"] = [
+    await store.team_role(team, people["own2"]),
+    await store.team_role(team, people["own3"]),
+    await store.role(people["adm1"]),
+]
+""",
+    )
+    p = people
+    # Each change waited for the message to its person, which went out; then the change took effect.
+    assert out["removal"] == [True, [p["own2"]]]
+    assert out["demotion"] == [True, [p["own3"]]]
+    assert out["lost_admin"] == [True, [p["adm1"]]]
+    assert out["roles_now"] == [None, "member", "member"]
+
+
+def saturated_pool(people, team, with_optout):
+    """A script in which, as the sender begins its final check under the person's notice lock, four changes to that person
+    start waiting for the lock, each holding one of the store's four pool connections; with `with_optout` a fifth waiter is
+    an opt-out. The sender must finish all the same: nothing it does under the lock may wait for a pool connection."""
+    return f"""
+from hindsight_agent_keys import notices as notices_module
+
+people, team, with_optout = {people!r}, {team!r}, {with_optout!r}
+person = people["own2"]
+# The real numbers, scaled to a twentieth so the test is quick; the ratio between them is the real one.
+scale = 0.05
+notices_module.SEND_DEADLINE = notices_module.SEND_DEADLINE * scale
+store_module.NOTICE_LOCK_WAIT = store_module.NOTICE_LOCK_WAIT * scale
+
+
+class Webex:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, to, text):
+        await asyncio.sleep(0.2)  # in flight while the changes wait
+        self.sent.append(to)
+
+
+class Saturated(PostgresKeyStore):
+    waiters = []
+
+    async def still_eligible(self, *args):
+        if not self.waiters:
+            changes = [self.set_role(person, "member") for _ in range(4)]
+            if with_optout:
+                changes.append(self.set_notices_enabled(person, False))
+            self.waiters = [asyncio.create_task(change) for change in changes]
+            await asyncio.sleep(0.3)
+            out["idle"] = (await self._get_pool()).get_idle_size()
+        return await super().still_eligible(*args)
+
+
+saturated, webex = Saturated(url), Webex()
+try:
+    notices = Notices(saturated, webex, "keys.example.test", lambda: T0, [])
+    await saturated.queue_notice([person], "owner", team, "line", "/ext/teams")
+    began = asyncio.get_running_loop().time()
+    await asyncio.wait_for(notices.send_due(), 10)
+    out["send_took"] = asyncio.get_running_loop().time() - began
+    results = await asyncio.gather(*saturated.waiters, return_exceptions=True)
+    out["waiters"] = [type(r).__name__ if isinstance(r, BaseException) else None for r in results]
+    out["sent"] = webex.sent
+    out["enabled_now"] = await saturated.notices_enabled(person)
+    out["send_deadline"] = notices_module.SEND_DEADLINE
+    out["lock_wait"] = store_module.NOTICE_LOCK_WAIT
+finally:
+    await saturated.close()
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch("SELECT status, detail FROM agent_keys.notice_log WHERE recipient = $1", person)
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+"""
+
+
+@pytest.mark.parametrize("with_optout", [False, True])
+def test_changes_waiting_for_the_notice_lock_with_the_pool_full_cannot_starve_the_send_that_holds_it_in_postgres(hindsight, with_optout):
+    people, team = notice_people(hindsight, f"full{int(with_optout)}")
+    out = notice_store(hindsight["name"], saturated_pool(people, team, with_optout))
+    # All four connections were in use by waiters, and the send still finished within its cap and logged its outcome.
+    assert out["idle"] == 0
+    assert out["sent"] == [people["own2"]] and out["log"] == [["sent", None]]
+    assert out["send_took"] < out["send_deadline"] + 0.5
+    # Every waiter then completed: none was refused (503) after waiting out the lock wait.
+    assert out["waiters"] == [None] * (5 if with_optout else 4)
+    assert out["enabled_now"] is (not with_optout)
+
+
+def test_an_opt_out_writes_on_the_locks_own_connection_even_with_the_pool_full_in_postgres(hindsight):
+    people, _ = notice_people(hindsight, "optout")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+person = {people["own3"]!r}
+pool = await store._get_pool()
+held = [await pool.acquire() for _ in range(4)]  # every connection of the pool is in use
+try:
+    try:
+        await asyncio.wait_for(store.set_notices_enabled(person, False), 2)
+        out["opted_out"] = True
+    except TimeoutError:
+        out["opted_out"] = False
+finally:
+    for conn in held:
+        await pool.release(conn)
+out["enabled_now"] = await store.notices_enabled(person)
+""",
+    )
+    assert (out["opted_out"], out["enabled_now"]) == (True, False)
+
+
+def test_a_change_behind_a_send_that_hits_the_deadline_completes_with_no_503_in_postgres(hindsight):
+    people, team = notice_people(hindsight, "cap")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+from hindsight_agent_keys import notices as notices_module
+
+people, team = {people!r}, {team!r}
+# The real numbers, scaled to a twentieth so the test is quick; the ratio between them is the real one.
+scale = 0.05
+notices_module.SEND_DEADLINE = notices_module.SEND_DEADLINE * scale
+store_module.NOTICE_LOCK_WAIT = store_module.NOTICE_LOCK_WAIT * scale
+
+
+class Hung:
+    \"\"\"A Webex that never answers.\"\"\"
+
+    def __init__(self):
+        self.started = asyncio.Event()
+
+    async def send_message(self, to, text):
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+hung = Hung()
+notices = Notices(store, hung, "keys.example.test", lambda: T0, [])
+await store.queue_notice([people["own2"]], "owner", team, "line", "/ext/teams")
+sweep = asyncio.create_task(notices.send_due())
+await asyncio.wait_for(hung.started.wait(), 10)
+began = asyncio.get_running_loop().time()
+removal = asyncio.create_task(store.remove_member(team, people["own2"]))
+await asyncio.sleep(0.1)
+out["waited"] = not removal.done()
+await asyncio.wait_for(asyncio.gather(sweep, removal), 10)
+out["waited_for"] = asyncio.get_running_loop().time() - began
+out["refused"] = removal.exception() is not None
+out["send_deadline"] = notices_module.SEND_DEADLINE
+out["lock_wait"] = store_module.NOTICE_LOCK_WAIT
+out["role_now"] = await store.team_role(team, people["own2"])
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch(
+        "SELECT recipient, status, detail FROM agent_keys.notice_log WHERE recipient = $1", people["own2"]
+    )
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+""",
+    )
+    # The removal waited for the send, which was cut off at the deadline, and then went through: no 503.
+    assert (out["waited"], out["refused"], out["role_now"]) == (True, False, None)
+    assert out["send_deadline"] * 0.8 < out["waited_for"] < out["lock_wait"]
+    assert out["lock_wait"] >= 3 * out["send_deadline"]
+    assert out["log"] == [[people["own2"], "failed", "TimeoutError"]]
+
+
+def test_a_change_that_commits_between_the_claim_and_the_send_stops_the_send_in_postgres(hindsight):
+    people, team = notice_people(hindsight, "race")
+    out = notice_store(
+        hindsight["name"],
+        f"""
+people, team = {people!r}, {team!r}
+
+
+class Webex:
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, to, text):
+        self.sent.append((to, text))
+
+
+class Racing(PostgresKeyStore):
+    \"\"\"A store where, right after a person's notices are claimed, an admin's change to them commits.\"\"\"
+
+    async def claim_notice(self, recipient, *args):
+        claim = await super().claim_notice(recipient, *args)
+        if claim and recipient == people["own2"]:
+            await self.remove_member(team, recipient)
+        if claim and recipient == people["own3"]:
+            await self.set_member(team, recipient, "member")
+        if claim and recipient == people["adm1"]:
+            await self.set_role(recipient, None)
+        return claim
+
+
+racing, webex = Racing(url), Webex()
+try:
+    notices = Notices(racing, webex, "keys.example.test", lambda: T0, [])
+    # own1 is still an owner and adm2 still an admin: they are the control.
+    for who in ("own1", "own2", "own3"):
+        await racing.queue_notice([people[who]], "owner", team, who, "/ext/teams")
+    for who in ("adm1", "adm2"):
+        await racing.queue_notice([people[who]], "admin", None, who, "/ext/admin")
+    await notices.send_due()
+finally:
+    await racing.close()
+out["sent"] = sorted(to for to, _ in webex.sent)
+conn = await asyncpg.connect(uri)
+try:
+    rows = await conn.fetch(
+        "SELECT recipient, status, detail FROM agent_keys.notice_log WHERE recipient = ANY($1) ORDER BY recipient",
+        list(people.values()),
+    )
+finally:
+    await conn.close()
+out["log"] = [list(r.values()) for r in rows]
+""",
+    )
+    p = people
+    assert out["sent"] == sorted([p["own1"], p["adm2"]])
+    assert out["log"] == sorted(
+        [
+            [p["own1"], "sent", None],
+            [p["own2"], "skipped", "no longer eligible"],
+            [p["own3"], "skipped", "no longer eligible"],
+            [p["adm1"], "skipped", "no longer eligible"],
+            [p["adm2"], "sent", None],
+        ]
+    )
+
+
+def test_the_operating_guides_send_log_check_lists_what_was_sent(hindsight):
+    name, person = hindsight["name"], f"logged-{RUN}@example.test"
+    notice_store(
+        name,
+        f"""
+await store.queue_notice([{person!r}], "asker", None, "a", "/ext/")
+claim = await store.claim_notice({person!r}, datetime.now(UTC), datetime(2000, 1, 1, tzinfo=UTC), [])
+await store.finish_notice(claim[0], "sent", None)
+""",
+    )
+    run = run_doc(name, doc_block("docs/operating.md", "agent_keys.notice_log"), "")
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert any(line.split("|")[1:4] == [person, "1", "sent"] for line in run.stdout.splitlines()), run.stdout
+
 
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
