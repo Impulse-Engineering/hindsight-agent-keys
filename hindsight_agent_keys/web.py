@@ -8,7 +8,7 @@ and a same-origin Origin. The state lives on the tenant extension.
 
 import html
 from collections.abc import Awaitable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from string import Template
 from typing import Annotated, Literal
 
@@ -86,7 +86,7 @@ def _allowlist_row(email: str, role: str, bootstrap: bool) -> str:
 
 def _stale_row(row) -> str:
     last = row["last_active"]
-    days = (datetime.now(timezone.utc) - last).days if last else None
+    days = (datetime.now(UTC) - last).days if last else None
     shown = "never had a key" if days is None else f'<span title="{last:%d %b %Y}">{days} days ago</span>'
     return f"<tr><td>{html.escape(row['schema'])}</td><td>{html.escape(row['email'])}</td><td>{shown}</td></tr>"
 
