@@ -46,6 +46,9 @@ SIGN_IN_WINDOW = timedelta(days=30)
 # Roles on the Key Allowlist that may create keys; 'requested' may not.
 LISTED = ("member", "admin")
 
+# A Join Request left waiting this long is counted for every admin, not only the Team's owners.
+ADMIN_REVIEW_AFTER = timedelta(days=7)
+
 # Keys created via WorkPlane, per person, apart from their own (store.ACTIVE_KEYS, store.CREATIONS_PER_HOUR).
 # Defaults of the settings HINDSIGHT_API_TENANT_WORKPLANE_ACTIVE_KEYS and ..._WORKPLANE_KEYS_PER_HOUR. An hour may
 # fill the whole cap, so onboarding into many Teams at once is never held up; the rate still bounds a
@@ -690,6 +693,49 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
         return HindsightConfig.get_configurable_fields() - DENIED_BANK_FIELDS
+
+    # --- #1002 ---
+
+    async def set_open(self, admin: str, team: str, opened: bool, client_ip: str | None) -> None:
+        """An admin opens the Team, so anyone on the Key Allowlist may join it with a live session, or closes it, which keeps
+        its members. Recorded only when it changed, so a repeat records nothing. The Public Team is no Team here (404)."""
+        if await self.role(admin) != "admin":
+            raise Refused(403, "Only admins can open or close a Team.")
+        if await self._store.set_open(team, opened) != opened:
+            await self._record("team_opened" if opened else "team_closed", NO_KEY_ID, client_ip, actor=admin, team=team)
+
+    async def join_team(self, email: str, team: str, client_ip: str | None) -> str | None:
+        """Join an Open Team as a member, with a live session: the Teams page or a Delegated Request, never over MCP. Anyone on
+        the Key Allowlist may. Returns the person's role in it; someone in it already keeps theirs, and only a join records
+        an event. A Team that is not open, or does not exist, gets the person's Join Request instead (None), as asking by name does."""
+        await self._require_allowlisted(email)
+        joined = await self._store.join_open_team(team, email)
+        if joined is None:
+            await self._ask_to_join(email, team, "member", client_ip)
+            return None
+        role, new = joined
+        if new:
+            await self._record("member_joined", NO_KEY_ID, client_ip, email, email, team=team)
+        return role
+
+    async def open_teams(self, email: str) -> list[dict]:
+        """Every Open Team, each with the person's role in it (None if not in it), for anyone on the Key Allowlist; nobody
+        else sees any. Other Teams are listed only to their members and admins (`teams`)."""
+        if await self.role(email) not in LISTED:
+            return []
+        return [{"team": r["schema"], "name": r["name"], "role": r["role"]} for r in await self._store.open_teams(email)]
+
+    # --- pending_reviews (#1004) ---
+
+    async def pending_reviews(self, email: str) -> dict:
+        """What waits for the person to review, as counts only, so no user-written text reaches an agent: the requests
+        to join the Teams they own and, for an admin, those for any other Team left waiting more than
+        ADMIN_REVIEW_AFTER, and the Key Allowlist requests. Carries the Teams page's link when the key pages are on."""
+        joins, access = await self._store.pending_review_counts(
+            email, admin=await self.role(email) == "admin", older_than=self._clock() - ADMIN_REVIEW_AFTER
+        )
+        link = {"link": f"https://{self.access_host}/ext/teams"} if self.access_host else {}
+        return {"join_requests": joins, "access_requests": access, **link}
 
     # --- #1005 ---
 

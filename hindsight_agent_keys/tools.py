@@ -4,8 +4,8 @@ Upstream registers these on both MCP servers, multi-bank (/mcp/) and single-bank
 (/mcp/<bank>/), each with its own instance and no context, so this class holds no
 state and reaches everything through the tenant extension. Only a personal Agent Key
 may use them, and adding someone, or asking to join a Team, only files a request that an owner on the Key Allowlist,
-or an admin, confirms on the Access-protected Teams page or by Delegated Request: an agent never grants anyone
-access on its own, and there is no tool that confirms or declines a request.
+or an admin, confirms on the Access-protected Teams page or by Delegated Request: an agent never adds anyone
+to an existing Team on its own, and there is no tool that confirms or declines a request.
 """
 
 from typing import Literal
@@ -45,10 +45,15 @@ class AgentKeysMcpExtension(MCPExtension):
         @mcp.tool()
         async def list_teams() -> dict:
             """Your Teams: each with its ID, your role, its members and the requests to add
-            people that wait for an owner on the Key Allowlist or an admin."""
+            people that wait for an owner on the Key Allowlist or an admin. Also `pending_reviews`, the counts
+            that the tool of that name returns."""
             try:
+                email = await person()
                 # Only Teams the caller is in, admins included; admins manage any Team on the page.
-                return {"teams": [t for t in await memory.tenant_extension.teams(await person()) if t["role"]]}
+                return {
+                    "teams": [t for t in await memory.tenant_extension.teams(email) if t["role"]],
+                    "pending_reviews": await memory.tenant_extension.pending_reviews(email),
+                }
             except Refused as refusal:
                 return {"error": str(refusal)}
 
@@ -84,3 +89,17 @@ class AgentKeysMcpExtension(MCPExtension):
             except Refused as refusal:
                 return {"error": str(refusal)}
             return {"team": team, "email": email}
+
+        @mcp.tool()
+        async def pending_reviews() -> dict:
+            """Whether anything waits for your person to review.
+            Call it at the start of every session, and when a count is above zero, tell your person.
+            `join_requests` counts the requests to join Teams they own and, for an admin, those for other Teams
+            left waiting more than 7 days; they are reviewed on the Teams page at `link`, which is
+            left out when the key pages are off. `access_requests` counts the people who asked for a place on the
+            Key Allowlist (admins only), reviewed on the admin page, /ext/admin, on the same host.
+            Counts and the link only: no Team names, emails or other text."""
+            try:
+                return await memory.tenant_extension.pending_reviews(await person())
+            except Refused as refusal:
+                return {"error": str(refusal)}

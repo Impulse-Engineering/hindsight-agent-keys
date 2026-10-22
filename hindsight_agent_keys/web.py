@@ -23,6 +23,7 @@ from hindsight_agent_keys.bodies import (
     NewKey,
     NewTeam,
     NoticePreference,
+    Openness,
     RoleChange,
     _or_refused,
 )
@@ -153,7 +154,9 @@ class AgentKeysHttpExtension(HttpExtension):
 
         @router.get("/teams", response_class=HTMLResponse)
         async def teams_page(email: str = Depends(person)):
-            return HTMLResponse(teams_html(email, await memory.tenant_extension.teams(email)), headers=NO_FRAMING)
+            keys = memory.tenant_extension
+            page = teams_html(email, await keys.teams(email), await keys.open_teams(email), await keys.role(email) == "admin")
+            return HTMLResponse(page, headers=NO_FRAMING)
 
         @router.post("/teams")
         async def create_team(body: NewTeam, request: Request, email: str = Depends(person)):
@@ -203,6 +206,21 @@ class AgentKeysHttpExtension(HttpExtension):
         async def revoke_workplane_keys(request: Request, email: str = Depends(admin)):
             """The kill switch for WorkPlane's retain and recall. Here only: no Delegated Request reaches it."""
             return {"revoked": await memory.tenant_extension.revoke_workplane_keys(email, client_ip(request.headers))}
+
+        # Open Teams (#1002)
+
+        @router.post("/teams/{team}/open")
+        async def set_open(team: str, body: Openness, request: Request, email: str = Depends(person)):
+            """Admins only: open the Team to anyone on the Key Allowlist, or close it, keeping its members."""
+            await _or_refused(memory.tenant_extension.set_open(email, team, body.open, client_ip(request.headers)))
+            return {"team": team, "open": body.open}
+
+        @router.post("/teams/{team}/join")
+        async def join_team(team: str, request: Request, email: str = Depends(person)):
+            """Join an Open Team; a Team that is not open gets the person's Join Request instead."""
+            role = await _or_refused(memory.tenant_extension.join_team(email, team, client_ip(request.headers)))
+            joined = {"team": team, "email": email, "role": role or "member"}
+            return joined if role else {**joined, "status": "pending"}
 
         # --- #1005 ---
 
@@ -392,9 +410,10 @@ document.getElementById("revoke-workplane-keys").addEventListener("click", async
 """)
 
 
-def teams_html(email: str, teams: list[dict]) -> str:
+def teams_html(email: str, teams: list[dict], open_teams: list[dict], admin: bool) -> str:
     """The Teams page; every value from the database or the token is escaped."""
     e = html.escape
+    opened = {o["team"] for o in open_teams}
     sections = []
     for t in teams:
         url = f"/ext/teams/{e(t['team'])}"
@@ -414,11 +433,21 @@ def teams_html(email: str, teams: list[dict]) -> str:
         if t["role"]:
             parts.append(KEY_FORM.format(url=url, label="Create a Team key"))
         parts.append(MEMBER_FORMS.format(url=url))
+        if t["team"] in opened:
+            parts.append("<p>An Open Team: anyone on the Key Allowlist may join it.</p>")
+        if admin:
+            label = "Close it; its members stay" if t["team"] in opened else "Open it to everyone on the Key Allowlist"
+            parts.append(OPEN_FORM.format(url=url, open=str(t["team"] not in opened).lower(), label=label))
         sections.append("<section>" + "".join(parts) + "</section>")
+    joinable = []
+    for o in open_teams:
+        action = "(you are in it)" if o["role"] else JOIN_FORM.format(url=f"/ext/teams/{e(o['team'])}")
+        joinable.append(f"<li>{e(o['name'])} {action}</li>")
     # One pass, so a value that contains a placeholder is not substituted again.
     return TEAMS_PAGE.substitute(
         email=e(email),
         public=KEY_FORM.format(url="/ext/teams/public", label="Create a Public Team key"),
+        open=f"<ul>{''.join(joinable)}</ul>" if joinable else "<p>None listed for you.</p>",
         teams="".join(sections) or "<p>You are in no Team yet.</p>",
     )
 
@@ -442,6 +471,12 @@ REQUEST_FORMS = """<form data-url="{url}/confirmations" data-method="POST">
 <form data-url="{url}/requests" data-method="DELETE">
 <input type="hidden" name="email" value="{email}"><button>Decline</button></form>"""
 
+# Shown to admins only; the server refuses anyone else too.
+OPEN_FORM = """<form data-url="{url}/open" data-method="POST">
+<input type="hidden" name="open" value="{open}"><button>{label}</button></form>"""
+
+JOIN_FORM = """<form data-url="{url}/join" data-method="POST"><button>Join</button></form>"""
+
 TEAMS_PAGE = Template("""<!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><title>Teams</title></head>
@@ -458,6 +493,9 @@ $public
 <p>Name a Team you are not in. Its owners, or an admin, decide; this page answers the same whether or not the Team exists.</p>
 <form data-url="/ext/join-requests" data-method="POST">
 <label>Team name <input name="name" required maxlength="100"></label> <button>Ask to join</button></form>
+<h2>Open Teams</h2>
+<p>Anyone on the Key Allowlist joins an Open Team without asking. Only admins open or close a Team.</p>
+$open
 $teams
 <script>
 for (const form of document.querySelectorAll("form[data-url]")) {

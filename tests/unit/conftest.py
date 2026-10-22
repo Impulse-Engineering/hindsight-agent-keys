@@ -78,6 +78,8 @@ class MemoryStore:
         self.team_roles = {}  # (team, email) -> "owner" | "member"
         self.creators = {}  # team -> email
         self.requests = {}  # (team, email) -> (role, requested_by)
+        self.opened = set()  # the schemas of Open Teams (#1002)
+        self.requested_at = {}  # (team, email) -> when the open request was filed; asking again keeps it
         # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
         self.stale = []
         self.fail = False
@@ -121,6 +123,7 @@ class MemoryStore:
         self._change_members(team, lambda roles: roles.__setitem__((team, email), role))
         # A direct add settles the person's open request; (the role they had, who had asked for them).
         _, asked_by = self.requests.pop((team, email), (None, None))
+        self.requested_at.pop((team, email), None)
         return had, asked_by
 
     async def remove_member(self, team, email):
@@ -131,11 +134,13 @@ class MemoryStore:
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)
         self.requests[team, email] = (role, by)
+        self.requested_at.setdefault((team, email), datetime.now(UTC))
 
     async def add_join_request(self, team, email, role):
         if team not in self.teams_by_schema or (team, email) in self.team_roles or (team, email) in self.requests:
             return False
         self.requests[team, email] = (role, email)
+        self.requested_at[team, email] = datetime.now(UTC)
         return True
 
     async def confirm_member(self, team, email, role):
@@ -146,6 +151,7 @@ class MemoryStore:
 
     async def decline_member(self, team, email):
         self._change_members(team, lambda roles: None)
+        self.requested_at.pop((team, email), None)
         return self.requests.pop((team, email), None)  # (the role it asked for, who asked)
 
     async def member_requests(self, team):
@@ -288,6 +294,33 @@ class MemoryStore:
         for key in hits:
             key["revoked_at"] = now
         return len(hits)
+
+    # --- #1002 ---
+
+    async def set_open(self, team, opened):
+        if team not in self.teams_by_schema:
+            raise Refused(404, "There is no such Team.")
+        was = team in self.opened
+        (self.opened.add if opened else self.opened.discard)(team)
+        return was
+
+    async def join_open_team(self, team, email):
+        if team not in self.opened:
+            return None
+        joined = (team, email) not in self.team_roles
+        return self.team_roles.setdefault((team, email), "member"), joined
+
+    async def open_teams(self, email):
+        return [r for r in await self.teams(email, everyone=True) if r["schema"] in self.opened]
+
+    # --- pending_reviews (#1004) ---
+
+    async def pending_review_counts(self, email, *, admin, older_than):
+        joins = sum(
+            self.team_roles.get((team, email)) == "owner" or (admin and self.requested_at[team, asker] < older_than)
+            for team, asker in self.requests
+        )
+        return joins, sum(admin and role == "requested" for role in self.roles.values())
 
 
 class Migrations(ExtensionContext):

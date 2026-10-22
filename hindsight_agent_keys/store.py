@@ -99,6 +99,10 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.idempotency (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (delegate, email, key)
 );
+-- #1002: an Open Team, which anyone on the Key Allowlist joins without asking; only admins open or close one.
+ALTER TABLE {SCHEMA}.teams ADD COLUMN IF NOT EXISTS open boolean NOT NULL DEFAULT false;
+-- #1004: when the request was filed, so an admin hears of Join Requests left waiting. Asking again keeps it.
+ALTER TABLE {SCHEMA}.member_requests ADD COLUMN IF NOT EXISTS requested_at timestamptz NOT NULL DEFAULT now();
 -- #1005: Webex notices. A notice waits here, one line for one person, until the person may be messaged again.
 -- `kind` is who the recipient is to the notice, checked again when it is taken to be sent: an 'owner' of `team`
 -- (on the Key Allowlist), an 'admin', or the 'asker' of a request that was decided.
@@ -563,6 +567,61 @@ class PostgresKeyStore:
             f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
         )
         return len(rows)
+
+    # --- #1002 ---
+
+    async def set_open(self, team: str, opened: bool) -> bool:
+        """Open or close the Team; returns whether it was open. Refused(404) if there is no such Team."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            # The Team's lock, which a join takes too, so a join that waits for a closing finds the Team closed.
+            was = await conn.fetchval(f"SELECT open FROM {SCHEMA}.teams WHERE schema = $1 FOR UPDATE", team)
+            if was is None:
+                raise Refused(404, "There is no such Team.")
+            await conn.execute(f"UPDATE {SCHEMA}.teams SET open = $2 WHERE schema = $1", team, opened)
+        return was
+
+    async def join_open_team(self, team: str, email: str) -> tuple[str, bool] | None:
+        """Make the person a member of the Team if it is open: (their role now, whether they joined just now); someone in it
+        already keeps their role. None, changing nothing, if the Team is not open or does not exist."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            # The Team's lock, as every member change takes, so a join waits for a concurrent closing or approval.
+            if not await conn.fetchval(f"SELECT open FROM {SCHEMA}.teams WHERE schema = $1 FOR UPDATE", team):
+                return None
+            joined = await conn.fetchval(
+                f"INSERT INTO {SCHEMA}.members (team, email, role) VALUES ($1, $2, 'member')"
+                " ON CONFLICT (team, email) DO NOTHING RETURNING true",
+                team,
+                email,
+            )
+            role = await conn.fetchval(f"SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2", team, email)
+        return role, bool(joined)
+
+    async def open_teams(self, email: str) -> list[asyncpg.Record]:
+        """Every Open Team with the person's role in it, None if not a member."""
+        pool = await self._get_pool()
+        return await pool.fetch(
+            f"SELECT t.schema, t.name, m.role FROM {SCHEMA}.teams t"
+            f" LEFT JOIN {SCHEMA}.members m ON m.team = t.schema AND m.email = $1 WHERE t.open ORDER BY lower(t.name)",
+            email,
+        )
+
+    # --- pending_reviews (#1004) ---
+
+    async def pending_review_counts(self, email: str, *, admin: bool, older_than: datetime) -> tuple[int, int]:
+        """What waits for the person: (requests to join the Teams they own, and for an admin those for any other
+        Team filed before `older_than`; the people who asked for a place on the Key Allowlist, for an admin only)."""
+        pool = await self._get_pool()
+        joins, access = await pool.fetchrow(
+            f"SELECT (SELECT count(*) FROM {SCHEMA}.member_requests r WHERE ($2::boolean AND r.requested_at < $3) OR EXISTS"
+            f" (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner')),"
+            f" (SELECT count(*) FROM {SCHEMA}.allowlist WHERE $2::boolean AND role = 'requested')",
+            email,
+            admin,
+            older_than,
+        )
+        return joins, access
 
     # --- #1005 ---
 

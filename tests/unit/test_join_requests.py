@@ -302,7 +302,14 @@ async def test_the_teams_page_lists_join_requests_for_an_owner_to_confirm_and_of
 
 async def test_no_mcp_tool_approves_or_declines_and_an_owners_add_over_mcp_only_asks(world):
     names = {tool.name for tool in await world.mcp.list_tools()}
-    assert names == {"create_team", "list_teams", "add_team_member", "remove_team_member", "request_to_join_team"}
+    assert names == {
+        "create_team",
+        "list_teams",
+        "add_team_member",
+        "remove_team_member",
+        "request_to_join_team",
+        "pending_reviews",
+    }
     assert await world.add("mcp", ALICE, CAROL) == (200, {"team": world.schema, "email": CAROL, "role": "member", **PENDING})
     assert await world.members() == {ALICE: "owner", BOB: "member"}
     assert await world.requests() == [{"email": CAROL, "role": "member", "by": ALICE}]
