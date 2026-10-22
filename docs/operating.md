@@ -29,7 +29,7 @@ Only people on it can create Agent Keys.
 - **Removing someone** disables the keys they hold from their next request, without deleting them, and stops them acting as a Team owner: adding or removing members, asking for people to join, confirming or declining requests, and creating Team keys. Their Teams, ownership and memberships are kept, so adding the person back makes the keys and the owner actions work again. Until then they can still list and revoke their own keys and ask to be added back. To end someone's access, revoke their identity as well (below).
 - **Listing it** from the CT *(not verified)*: `pg psql -d hindsight -Atc 'select role, email from agent_keys.allowlist order by 1, 2'`. The first admins come from the secret, so this can miss them.
 
-Every change is an event in `agent_keys.events` (README, "The event log").
+Every change is recorded as an event in `agent_keys.events` (README, "The event log"). A change stored just before a stop or an event-log failure has no event row; the tables are the source of truth and nothing needs repairing (README, "Delegated Requests").
 
 ## Agent Keys
 

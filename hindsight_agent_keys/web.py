@@ -401,7 +401,7 @@ KEY_FORM = """<form data-url="{url}/keys" data-method="POST">
 <label>Key name <input name="name" required maxlength="100"></label> <button>{label}</button></form>"""
 
 # Shown to members too; the server refuses changes from anyone but admins and owners on the Key Allowlist,
-# except that a person adding themselves as a member only files a Join Request.
+# except that a person adding themselves, as a member or an owner, only files a Join Request.
 MEMBER_FORMS = """<form data-url="{url}/members" data-method="POST">
 <label>Email <input name="email" type="email" required></label>
 <label>Role <select name="role"><option>member</option><option>owner</option></select></label>
