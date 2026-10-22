@@ -681,19 +681,17 @@ class PostgresKeyStore:
 
     # --- pending_reviews (#1004) ---
 
-    async def pending_review_counts(self, email: str, *, admin: bool, older_than: datetime) -> tuple[int, int]:
-        """What waits for the person: (requests to join the Teams they own that wait (`_WAITING`), and for an admin those for
-        any other Team filed before `older_than`; the people who asked for a place on the Key Allowlist, for an admin only)."""
+    async def pending_join_requests(self, email: str, *, admin: bool, older_than: datetime) -> int:
+        """How many requests to join the Teams the person owns wait (`_WAITING`), and for an admin those for any other Team
+        filed before `older_than`."""
         pool = await self._get_pool()
-        joins, access = await pool.fetchrow(
-            f"SELECT (SELECT count(*) FROM {SCHEMA}.member_requests r WHERE {_WAITING} AND (($2::boolean AND r.requested_at < $3)"
-            f" OR EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner'))),"
-            f" (SELECT count(*) FROM {SCHEMA}.allowlist WHERE $2::boolean AND role = 'requested')",
+        return await pool.fetchval(
+            f"SELECT count(*) FROM {SCHEMA}.member_requests r WHERE {_WAITING} AND (($2::boolean AND r.requested_at < $3)"
+            f" OR EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner'))",
             email,
             admin,
             older_than,
         )
-        return joins, access
 
     # --- #1005 ---
 

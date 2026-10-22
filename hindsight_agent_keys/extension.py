@@ -307,10 +307,16 @@ class AgentKeysTenantExtension(TenantExtension):
         """The person's place on the Key Allowlist: 'admin', 'member', 'requested' (asked to join) or None."""
         return "admin" if email in self.bootstrap_admins else await self._store.role(email)
 
+    def _key_allowlist(self, rows: list) -> list:
+        """The Key Allowlist as every reader takes it, from its stored rows (each with `email` and `role`): the bootstrap
+        admins as admins, then everyone else's row. A bootstrap admin's own row is never read, so a request left in it
+        waits for nobody: the admin page, pending_reviews, the notices and the reminders all read the list through this."""
+        admins = [{"email": e, "role": "admin"} for e in sorted(self.bootstrap_admins)]
+        return admins + [r for r in rows if r["email"] not in self.bootstrap_admins]
+
     async def allowlist(self) -> list[tuple[str, str]]:
         """(email, role) for the bootstrap admins, then everyone else with a role, pending requests first."""
-        stored = [(r["email"], r["role"]) for r in await self._store.allowlist() if r["email"] not in self.bootstrap_admins]
-        return [(e, "admin") for e in sorted(self.bootstrap_admins)] + stored
+        return [(r["email"], r["role"]) for r in self._key_allowlist(await self._store.allowlist())]
 
     async def request_access(self, email: str, client_ip: str | None) -> None:
         """Ask the admins to add a signed-in person; does nothing if they already have a role."""
@@ -744,9 +750,9 @@ class AgentKeysTenantExtension(TenantExtension):
         """What waits for the person to review, as counts only, so no user-written text reaches an agent: the requests
         to join the Teams they own and, for an admin, those for any other Team left waiting more than
         ADMIN_REVIEW_AFTER, and the Key Allowlist requests. Carries the Teams page's link when the key pages are on."""
-        joins, access = await self._store.pending_review_counts(
-            email, admin=await self.role(email) == "admin", older_than=self._clock() - ADMIN_REVIEW_AFTER
-        )
+        admin = await self.role(email) == "admin"
+        joins = await self._store.pending_join_requests(email, admin=admin, older_than=self._clock() - ADMIN_REVIEW_AFTER)
+        access = sum(role == "requested" for _, role in await self.allowlist()) if admin else 0
         link = {"link": f"https://{self.access_host}/ext/teams"} if self.access_host else {}
         return {"join_requests": joins, "access_requests": access, **link}
 
@@ -815,12 +821,13 @@ class AgentKeysTenantExtension(TenantExtension):
         None before the first run): a warning to
         the holder of a key that works and expires within KEY_WARNING, and to someone holding one whose sign-in window
         closes within SIGN_IN_WARNING."""
-        roles = {r["email"]: r["role"] for r in due["allowlist"]}
+        allowlist = self._key_allowlist(due["allowlist"])
+        roles = {r["email"]: r["role"] for r in allowlist}
         signed_in = {r["email"]: r["last_seen"] for r in due["sign_ins"]}
-        admins = sorted(self.bootstrap_admins | {email for email, role in roles.items() if role == "admin"})
+        admins = sorted(email for email, role in roles.items() if role == "admin")
 
         def listed(email: str) -> bool:
-            return email in self.bootstrap_admins or roles.get(email) in LISTED
+            return roles.get(email) in LISTED
 
         def came_due(at: datetime) -> bool:
             return at <= now and (due["last"] is None or at > due["last"])
@@ -844,10 +851,8 @@ class AgentKeysTenantExtension(TenantExtension):
                 # An admin who owns the Team has it as an owner.
                 others = [a for a in admins if a not in owners]
                 reminders.append(Notice("admin", others, _waiting(r, waited, "the"), "/ext/teams"))
-        for r in due["allowlist"]:
-            waited = now - r["requested_at"]
-            # A bootstrap admin is an admin whatever their row says, so no request of theirs waits.
-            if r["role"] == "requested" and r["email"] not in self.bootstrap_admins and waited > REMIND_AFTER:
+        for r in allowlist:
+            if r["role"] == "requested" and (waited := now - r["requested_at"]) > REMIND_AFTER:
                 line = f"{plain(r['email'])} has waited {_days(waited // _DAY)} for a place on the Key Allowlist."
                 reminders.append(Notice("admin", admins, line, "/ext/admin"))
         working = [k for k in due["keys"] if works(k)]

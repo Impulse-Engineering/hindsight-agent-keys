@@ -116,6 +116,14 @@ async def test_asking_again_leaves_the_request_as_old_as_it_was():
     assert await waiting(w, ALICE) == (1, 1)
 
 
+async def test_a_bootstrap_admins_leftover_key_allowlist_request_waits_for_no_admin():
+    w = await world(**PAGES)
+    # Alice asked for a place before she became a bootstrap admin: the admin page hides the row, and nobody can answer it.
+    w.store.roles[ALICE] = "requested"
+    assert await waiting(w, ALICE) == (0, 1)
+    assert [role for email, role in await w.ext.allowlist() if email == ALICE] == ["admin"]
+
+
 async def test_the_answer_holds_no_team_name_or_email():
     w = await world(**PAGES)
     answer = await call(w.mcp, w.keys[ALICE], "pending_reviews")

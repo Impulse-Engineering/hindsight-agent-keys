@@ -329,13 +329,12 @@ class MemoryStore:
 
     # --- pending_reviews (#1004) ---
 
-    async def pending_review_counts(self, email, *, admin, older_than):
-        joins = sum(
+    async def pending_join_requests(self, email, *, admin, older_than):
+        return sum(
             self._waiting(team, asker, role)
             and (self.team_roles.get((team, email)) == "owner" or (admin and self.requested_at[team, asker] < older_than))
             for (team, asker), (role, _) in self.requests.items()
         )
-        return joins, sum(admin and role == "requested" for role in self.roles.values())
 
 
 class Migrations(ExtensionContext):
