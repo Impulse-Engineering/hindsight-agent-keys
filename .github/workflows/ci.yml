@@ -8,7 +8,7 @@ on:
   schedule:
     - cron: "23 7 * * *"
 
-# Every job starts read-only; only publish (packages) and scan-alert (issues) widen their tokens.
+# Every job starts read-only. publish adds packages: write, scan-alert adds issues: write, and verify-published adds packages: read.
 permissions:
   contents: read
 

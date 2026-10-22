@@ -12,23 +12,23 @@ import subprocess
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-# Split so that this file does not match itself.
+# Every example here is split ("192" + ".168…") so that no line of this file matches; it is checked like any other.
 DOMAIN = re.compile("aseva" + r"\.(?:ai|com)\b", re.IGNORECASE)
-# An address may end a sentence or begin a hostname (10.0.0.5.nip.io), but is not part of a longer number.
+# An address may end a sentence or begin a hostname (<address>.nip.io), but is not part of a longer number.
 IPV4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)")
-PRIVATE = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10")]
+PRIVATE = [ipaddress.ip_network((first + ".0.0", bits)) for first, bits in (("10.0", 8), ("172.16", 12), ("192.168", 16), ("100.64", 10))]
 
 
 def tracked_text():
-    """(path, text) for every tracked file that reads as UTF-8, this one aside: its examples are not real."""
+    """(path, text) for every tracked file, undecodable bytes replaced so a binary's ASCII is still read."""
     out = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
     for path in out.decode().split("\0"):
-        if not path or path == "tests/scripts/test_public_repo.py":
+        if not path:
             continue
         try:
-            with open(os.path.join(ROOT, path), encoding="utf-8") as f:
+            with open(os.path.join(ROOT, path), encoding="utf-8", errors="replace") as f:
                 yield path, f.read()
-        except (UnicodeDecodeError, FileNotFoundError):
+        except FileNotFoundError:
             continue
 
 
@@ -55,8 +55,8 @@ def test_no_tracked_file_names_a_real_host():
 
 @pytest.mark.parametrize(
     "line",
-    ["open https://ui." + "aseva" + ".ai/", "mail ops@" + "ASEVA" + ".com", "the host is at 192.168.7.9.", "ssh 10.1.2.3",
-     "curl http://10.0.0.5.nip.io/", "172.20.1.1:8888"],
+    ["open https://ui." + "aseva" + ".ai/", "mail ops@" + "ASEVA" + ".com", "the host is at 192" + ".168.7.9.", "ssh 10" + ".1.2.3",
+     "curl http://10" + ".0.0.5.nip.io/", "172" + ".20.1.1:8888"],
 )
 def test_the_check_sees_a_domain_or_a_private_address(line):
     assert names_a_real_host(line)
