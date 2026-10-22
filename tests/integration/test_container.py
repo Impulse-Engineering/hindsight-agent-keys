@@ -664,9 +664,11 @@ def test_pending_reviews_counts_the_owners_teams_and_an_admin_also_hears_of_old_
     hindsight, two_people
 ):
     name, port, multi = hindsight["name"], hindsight["port"], MCP_ENDPOINTS[0]
-    ned, quin = "ned@example.test", "quin@example.test"
-    assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": ned, "role": "member"})[0] == 204
-    ned_key, erin_key = personal_key(hindsight, ned)["key"], personal_key(hindsight, ERIN)["key"]
+    # Each person is this test's own: a key created for one of the shared people spends an hour's creations the others need.
+    ned, ravi, quin = "ned@example.test", "ravi@example.test", "quin@example.test"
+    for person in (ned, ravi):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    ned_key, ravi_key = personal_key(hindsight, ned)["key"], personal_key(hindsight, ravi)["key"]
     link = f"https://{ACCESS_HOST}/ext/teams"
 
     def reviews(key):
@@ -678,7 +680,7 @@ def test_pending_reviews_counts_the_owners_teams_and_an_admin_also_hears_of_old_
     before = reviews(two_people[ALICE])
     team = call_tool(port, ned_key, multi, "create_team", name="Ned Team")["team"]
     # An admin files a request for Ned's Team, and Quin asks for a place on the Key Allowlist.
-    call_tool(port, two_people[ALICE], multi, "add_team_member", team=team, email=ERIN)
+    call_tool(port, two_people[ALICE], multi, "add_team_member", team=team, email=ravi)
     assert key_page(hindsight, "POST", "/ext/access-requests", quin, body={})[0] == 204
     # Ned, no admin, owns the Team: the request is for Ned to review, and Quin's is not. It is new, so not yet Alice's.
     assert reviews(ned_key) == {"join_requests": 1, "access_requests": 0, "link": link}
@@ -690,8 +692,8 @@ def test_pending_reviews_counts_the_owners_teams_and_an_admin_also_hears_of_old_
     old = {**before, "join_requests": before["join_requests"] + 1, "access_requests": before["access_requests"] + 1}
     assert reviews(two_people[ALICE]) == old
     # Asking again, as the person and as an owner changing the role, leaves the request as old as it was.
-    call_tool(port, erin_key, multi, "request_to_join_team", name="Ned Team")
-    call_tool(port, ned_key, multi, "add_team_member", team=team, email=ERIN, role="owner")
+    call_tool(port, ravi_key, multi, "request_to_join_team", name="Ned Team")
+    call_tool(port, ned_key, multi, "add_team_member", team=team, email=ravi, role="owner")
     assert reviews(two_people[ALICE]) == old
     assert reviews(ned_key)["join_requests"] == 1
 
