@@ -461,6 +461,11 @@ class PostgresKeyStore:
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT name FROM {SCHEMA}.teams WHERE schema = $1", team)
 
+    async def team_creator(self, team: str) -> str | None:
+        """The email of the person who created the Team, None if there is no such Team."""
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT created_by FROM {SCHEMA}.teams WHERE schema = $1", team)
+
     @contextlib.asynccontextmanager
     async def team_name_lock(self, name: str):
         """Hold a lock on the Team name, in any case, across API processes. It takes a connection of its own,

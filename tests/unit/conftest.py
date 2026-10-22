@@ -269,6 +269,9 @@ class MemoryStore:
     async def team_name(self, team):
         return self.teams_by_schema.get(team)
 
+    async def team_creator(self, team):
+        return self.creators.get(team)
+
     @contextlib.asynccontextmanager
     async def team_name_lock(self, name):
         async with self.name_locks.setdefault(name.strip().lower(), asyncio.Lock()):

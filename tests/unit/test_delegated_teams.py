@@ -22,6 +22,7 @@ ALICE = "alice@example.com"
 BOB = "bob@example.com"
 CAROL = "carol@example.com"
 ADMIN = "admin@example.com"
+DAVE = "dave@example.com"
 TEAMS = "/ext/delegated/teams"
 KEYS = "/ext/delegated/keys"
 
@@ -141,7 +142,6 @@ async def test_an_owner_and_an_admin_add_and_remove_members_directly_and_each_ch
     assert {r["team"] for r in events.rows} == {schema}
 
 
-DAVE = "dave@example.com"
 ERIN = "erin@example.com"
 FRANK = "frank@example.com"
 
@@ -184,19 +184,21 @@ async def test_a_repeated_add_or_removal_answers_the_current_state_and_records_n
     assert [r[0] for r in logged(events)] == ["member_added", "owner_added", "member_removed"]
 
 
-async def test_a_repeated_team_creation_answers_the_team_the_person_owns(team):
+async def test_a_repeated_team_creation_answers_the_team_the_person_created_and_owns(team):
     client, ext, events = delegated_app(team)
-    ext._store.roles.update({ALICE: "member", BOB: "member", CAROL: "member"})
+    ext._store.roles.update({ALICE: "member", BOB: "member", CAROL: "member", DAVE: "member"})
     first = send(client, team, "POST", TEAMS, {"name": "Platform"}).json()
     again = send(client, team, "POST", TEAMS, {"name": " platform "})
     # The current state: the Team's stored name, not the spelling this request used.
     assert (again.status_code, again.json()) == (200, first)
     assert (ext.context.schemas, [r["kind"] for r in events.rows]) == ([first["team"]], ["team_created"])
-    # Only an owner of that Team gets it back: a member, or anyone else, finds the name taken.
+    # Only its creator, while an owner, repeats the creation: a co-owner, a member or anyone else finds the name taken.
     await ext.set_member(ALICE, first["team"], BOB, "member", None)
-    for email in (BOB, CAROL):
+    await ext.set_member(ALICE, first["team"], CAROL, "owner", None)
+    await ext.set_member(CAROL, first["team"], ALICE, "member", None)
+    for email in (ALICE, BOB, CAROL, DAVE):
         resp = send(client, team, "POST", TEAMS, {"name": "Platform"}, email)
-        assert (resp.status_code, resp.json()["detail"]) == (409, "A Team with that name exists.")
+        assert (resp.status_code, resp.json().get("detail")) == (409, "A Team with that name exists."), email
     assert ext.context.schemas == [first["team"]]
 
 
@@ -224,7 +226,7 @@ async def test_team_creation_keeps_the_teams_pages_terms(team):
         await ext.create_team(ALICE, f"Team {n}", None)
     resp = send(client, team, "POST", TEAMS, {"name": "One more"})
     assert (resp.status_code, resp.json()["detail"]) == (429, "You can create at most 10 Teams.")
-    # The name of a Team they own is still answered at the limit; the Public Team's name is reserved.
+    # The name of a Team they created and own is still answered at the limit; the Public Team's name is reserved.
     assert send(client, team, "POST", TEAMS, {"name": "team 3"}).json() == {"team": ext.context.schemas[3], "name": "Team 3"}
     assert send(client, team, "POST", TEAMS, {"name": "Public"}).status_code == 409
     assert len(ext.context.schemas) == 10

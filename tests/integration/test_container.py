@@ -1140,7 +1140,7 @@ def test_a_delegate_creates_a_team_adds_a_member_and_their_workplane_team_key_st
     status, made = send("POST", "/teams", olga, {"name": "WP Team"})
     assert status == 200, made
     team = made["team"]
-    # A repeat answers the Team the person owns, as stored, and creates no second.
+    # A repeat answers the Team the person created and owns, as stored, and creates no second.
     assert send("POST", "/teams", olga, {"name": "wp team"}) == (200, {"team": team, "name": "WP Team"})
     assert query(name, "SELECT count(*) AS n FROM agent_keys.teams WHERE lower(name) = 'wp team'") == [{"n": 1}]
     members, creation = f"/teams/{team}/members", f"/teams/{team}/keys"

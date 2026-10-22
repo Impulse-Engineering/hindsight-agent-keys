@@ -127,8 +127,8 @@ def delegated_router(memory) -> APIRouter:
 
     @router.post("/teams")
     async def create_team(body: NewTeam, request: Request, email: str = Depends(delegated_person)):
-        """A Team with the person as its first owner. The name of a Team they own answers that Team as stored,
-        creating nothing."""
+        """A Team with the person as its first owner. The name of a Team they created and still own answers
+        that Team as stored, creating nothing."""
         keys = memory.tenant_extension
         team = await _or_refused(keys.create_team(email, body.name, client_ip(request.headers), delegated_repeat=True))
         return {"team": team, "name": await keys.team_name(team)}

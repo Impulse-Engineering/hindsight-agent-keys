@@ -439,7 +439,8 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def create_team(self, email: str, name: str, client_ip: str | None, *, delegated_repeat: bool = False) -> str:
         """Create a Team with the person as its first owner. Returns the Team's schema. With `delegated_repeat`
-        (a Delegated Request), the name of a Team the person already owns returns its schema and changes nothing."""
+        (a Delegated Request), the name of a Team the person created and still owns returns its schema and
+        changes nothing."""
         await self._require_allowlisted(email)
         if name.lower() == PUBLIC_SCHEMA:
             raise Refused(409, "The name public is reserved for the Public Team.")
@@ -449,7 +450,12 @@ class AgentKeysTenantExtension(TenantExtension):
             # Checked before migrating, so a taken name or a person at the limit leaves no schema behind.
             taken = await self._store.team_schema(name)
             if taken is not None:
-                if delegated_repeat and await self._store.team_role(taken, email) == "owner":
+                # A repeat is the creator's own request again; a co-owner asking for the name finds it taken.
+                if (
+                    delegated_repeat
+                    and await self._store.team_creator(taken) == email
+                    and await self._store.team_role(taken, email) == "owner"
+                ):
                     return taken
                 raise Refused(409, "A Team with that name exists.")
             await self._store.check_team_limit(email)
