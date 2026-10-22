@@ -49,6 +49,14 @@ LISTED = ("member", "admin")
 # A Join Request left waiting this long is counted for every admin, not only the Team's owners.
 ADMIN_REVIEW_AFTER = timedelta(days=7)
 
+# A request left waiting longer than this is in a daily Webex reminder to those who can answer it; a request to join a
+# Team (a Join Request or one an agent filed), after ADMIN_REVIEW_AFTER, to every admin too, as pending_reviews counts it.
+REMIND_AFTER = timedelta(days=3)
+# A key's holder is warned once when a key that works comes within this long of expiring,
+KEY_WARNING = timedelta(days=14)
+# and once when their sign-in window comes within this long of closing while they hold one.
+SIGN_IN_WARNING = timedelta(days=7)
+
 # Keys created via WorkPlane, per person, apart from their own (store.ACTIVE_KEYS, store.CREATIONS_PER_HOUR).
 # Defaults of the settings HINDSIGHT_API_TENANT_WORKPLANE_ACTIVE_KEYS and ..._WORKPLANE_KEYS_PER_HOUR. An hour may
 # fill the whole cap, so onboarding into many Teams at once is never held up; the rate still bounds a
@@ -234,7 +242,9 @@ class AgentKeysTenantExtension(TenantExtension):
         token = (config.get("webex_bot_token") or "").strip()
         self.notices = None
         if token and self.access_host:
-            self.notices = Notices(self._store, webex or WebexClient(token), self.access_host, self._clock, self.bootstrap_admins)
+            self.notices = Notices(
+                self._store, webex or WebexClient(token), self.access_host, self._clock, self.bootstrap_admins, self._reminders
+            )
         self._tenants: list[Tenant] | None = None
         # Refusal rows are bounded twice: one a minute per client, and at most
         # 60 a minute in total, so unauthenticated callers cannot grow the log.
@@ -792,3 +802,86 @@ class AgentKeysTenantExtension(TenantExtension):
         asked = "to join" if asker == member else f"to add {plain(member)} to"
         line = f'Your request {asked} the Team "{await self._team_name(team)}" was {decided}.'
         return Notice("asker", [] if asker == actor else [asker], line, "/ext/teams")
+
+    # --- #1006 ---
+
+    def _reminders(self, now: datetime, due: dict) -> list[Notice]:
+        """The day's reminders, from what store.run_reminders read (`due`). Daily, while it waits: a request untouched
+        more than REMIND_AFTER, to whoever can answer it, and a request to join a Team (a Join Request or one an agent
+        filed), after ADMIN_REVIEW_AFTER, to every admin too. Once, when it came due since the previous run (`due["last"]`,
+        None before the first run): a warning to
+        the holder of a key that works and expires within KEY_WARNING, and to someone holding one whose sign-in window
+        closes within SIGN_IN_WARNING."""
+        roles = {r["email"]: r["role"] for r in due["allowlist"]}
+        signed_in = {r["email"]: r["last_seen"] for r in due["sign_ins"]}
+        admins = sorted(self.bootstrap_admins | {email for email, role in roles.items() if role == "admin"})
+
+        def listed(email: str) -> bool:
+            return email in self.bootstrap_admins or roles.get(email) in LISTED
+
+        def came_due(at: datetime) -> bool:
+            return at <= now and (due["last"] is None or at > due["last"])
+
+        def works(key) -> bool:
+            # The rule `principal` applies to a key on each request (with `find_key`'s columns), which the stale_schemas
+            # view also counts by: a change to one belongs in the others.
+            seen = signed_in.get(key["email"])
+            team = key["kind"] == "team" and key["schema"] != PUBLIC_SCHEMA
+            return listed(key["email"]) and seen is not None and now - seen < SIGN_IN_WINDOW and (not team or key["team_role"])
+
+        reminders = []
+        for r in due["requests"]:
+            waited = now - r["requested_at"]
+            # Someone already in the Team at the role asked for, or above it, has nothing left to wait for.
+            if waited <= REMIND_AFTER or r["has"] in ("owner", r["role"]):
+                continue
+            # An owner off the Key Allowlist is dropped when the notice is claimed, as for every "owner" notice.
+            owners = r["owners"]
+            reminders.append(Notice("owner", owners, _waiting(r, waited, "your"), "/ext/teams", r["team"]))
+            if waited > ADMIN_REVIEW_AFTER:
+                # An admin who owns the Team has it as an owner.
+                others = [a for a in admins if a not in owners]
+                reminders.append(Notice("admin", others, _waiting(r, waited, "the"), "/ext/teams"))
+        for r in due["allowlist"]:
+            waited = now - r["requested_at"]
+            # A bootstrap admin is an admin whatever their row says, so no request of theirs waits.
+            if r["role"] == "requested" and r["email"] not in self.bootstrap_admins and waited > REMIND_AFTER:
+                line = f"{plain(r['email'])} has waited {_days(waited // _DAY)} for a place on the Key Allowlist."
+                reminders.append(Notice("admin", admins, line, "/ext/admin"))
+        working = [k for k in due["keys"] if works(k)]
+        for k in working:
+            if came_due(k["expires_at"] - KEY_WARNING):
+                if k["kind"] == "personal":
+                    team = ""
+                elif k["schema"] == PUBLIC_SCHEMA:
+                    team = " for the Public Team"
+                else:
+                    team = f' for the Team "{plain(k["team_name"])}"'
+                line = f'Your Agent Key "{plain(k["name"])}"{team} expires {_when(k["expires_at"], now)}. Renew it on your key page.'
+                reminders.append(Notice("holder", [k["email"]], line, "/ext/"))
+        for email in sorted({k["email"] for k in working}):
+            closes = signed_in[email] + SIGN_IN_WINDOW
+            if came_due(closes - SIGN_IN_WARNING):
+                line = f"Your Agent Keys stop working {_when(closes, now)}, unless you sign in again: open your key page."
+                reminders.append(Notice("holder", [email], line, "/ext/"))
+        return reminders
+
+
+_DAY = timedelta(days=1)
+
+
+def _days(n: int) -> str:
+    return f"{n} day" if n == 1 else f"{n} days"
+
+
+def _when(at: datetime, now: datetime) -> str:
+    """'in 14 days, on 2027-01-20': whole days from now, rounded up as list_keys counts them, and the day (UTC)."""
+    return f"in {_days(math.ceil((at - now) / _DAY))}, on {at.astimezone(UTC).date().isoformat()}"
+
+
+def _waiting(r, waited: timedelta, whose: str) -> str:
+    """A reminder of a request still waiting, to the Team's owners (`whose` "your") or the admins ("the")."""
+    team = f'{whose} Team "{plain(r["name"])}"' + (" as an owner" if r["role"] == "owner" else "")
+    if r["requested_by"] == r["email"]:
+        return f"{plain(r['email'])} has waited {_days(waited // _DAY)} to join {team}."
+    return f"{plain(r['requested_by'])} asked {_days(waited // _DAY)} ago to add {plain(r['email'])} to {team}."

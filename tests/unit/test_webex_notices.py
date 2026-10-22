@@ -102,12 +102,63 @@ class NoticeStore(MemoryStore):
         self.hang = 0.0  # seconds queue_notice takes
         self.opts_out_after_claim = None  # a person whose opt-out commits right after their notices are claimed
         self.after_claim = None  # called with the person, right after their notices are claimed: a change committing then
+        self.runs = {}  # the days whose reminders were queued -> when
+        self.asked_at = {}  # email -> when their Key Allowlist request was filed (Postgres: DEFAULT now())
 
     def _break(self, name):
         if name in self.break_on:
             raise self.break_on[name]
 
-    async def queue_notice(self, recipients, kind, team, line, path):
+    async def run_reminders(self, day, now, is_due, build):
+        if day in self.runs:
+            return True
+        if not is_due(max(self.runs.values(), default=None), day - timedelta(days=1) in self.runs):
+            return False
+        # One transaction in Postgres: a stop anywhere in it leaves the queue and the days run as they were.
+        queue, runs = list(self.queue), dict(self.runs)
+        try:
+            self.runs[day] = now
+            self._break("run_reminders")
+            for notice in build(self._due(now, max(runs.values(), default=None))):
+                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path)
+        except BaseException:
+            self.queue, self.runs = queue, runs
+            raise
+        return True
+
+    def _due(self, now, last):
+        """What PostgresKeyStore.run_reminders reads, from this store's data."""
+        return {
+            "last": last,
+            "allowlist": [
+                {"email": e, "role": r, "requested_at": self.asked_at.get(e, datetime.now(UTC))} for e, r in self.roles.items()
+            ],
+            "requests": [
+                {
+                    "team": t,
+                    "name": self.teams_by_schema[t],
+                    "email": e,
+                    "role": role,
+                    "requested_by": by,
+                    "requested_at": self.requested_at[t, e],
+                    "has": self.team_roles.get((t, e)),
+                    "owners": sorted(o for (ot, o), r in self.team_roles.items() if ot == t and r == "owner"),
+                }
+                for (t, e), (role, by) in sorted(self.requests.items(), key=lambda item: self.requested_at[item[0]])
+            ],
+            "keys": [
+                {
+                    **k,
+                    "team_name": self.teams_by_schema.get(k["schema"]),
+                    "team_role": self.team_roles.get((k["schema"], k["email"])),
+                }
+                for k in self.keys.values()
+                if k["revoked_at"] is None and k["expires_at"] > now
+            ],
+            "sign_ins": [{"email": e, "last_seen": at} for e, at in self.sign_ins.items()],
+        }
+
+    async def queue_notice(self, recipients, kind, team, line, path, conn=None):
         self._break("queue_notice")
         await asyncio.sleep(self.hang)
         self.queue += [(r, kind, team, line, path) for r in recipients]
@@ -119,7 +170,9 @@ class NoticeStore(MemoryStore):
         listed = recipient in admins or self.roles.get(recipient) in ("member", "admin")
         if kind == "owner":
             return listed and self.team_roles.get((team, recipient)) == "owner"
-        return kind != "admin" or recipient in admins or self.roles.get(recipient) == "admin"
+        if kind == "admin":
+            return recipient in admins or self.roles.get(recipient) == "admin"
+        return listed if kind == "holder" else kind == "asker"
 
     async def claim_notice(self, recipient, now, since, admins):
         if any(row["recipient"] == recipient and row["at"] > since for row in self.log):

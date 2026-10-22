@@ -3,7 +3,7 @@
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import date, datetime
 
 import asyncpg
 
@@ -30,14 +30,19 @@ def _notice_lock_key(email: str) -> str:
     return f"{SCHEMA}.notice_send:{email}"
 
 
-# Whether a queued notice (t.kind, t.team) is still the person's ($1) to read, given the bootstrap admins ($2), who are
-# admins whatever the allowlist says. 'member' and 'admin' are extension.LISTED, the roles that may create keys.
+# Whether the person ($1) is on the Key Allowlist, given the bootstrap admins ($2), who are admins whatever the allowlist
+# says. 'member' and 'admin' are extension.LISTED, the roles that may create keys.
+_LISTED = f"($1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role IN ('member', 'admin')))"
+# Whether a queued notice (t.kind, t.team) is still the person's to read: an owner of the Team on the Key Allowlist, an
+# admin, a key's holder still on the Key Allowlist, or the asker of a decided request. Any other kind is not.
 NOTICE_ELIGIBLE = (
     "CASE t.kind"
     f" WHEN 'owner' THEN EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = t.team AND m.email = $1 AND m.role = 'owner')"
-    f"   AND ($1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role IN ('member', 'admin')))"
+    f"   AND {_LISTED}"
     f" WHEN 'admin' THEN $1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role = 'admin')"
-    " ELSE true END"
+    f" WHEN 'holder' THEN {_LISTED}"
+    " WHEN 'asker' THEN true"
+    " ELSE false END"
 )
 
 # Idempotent and outside upstream's Alembic history, like the event log.
@@ -151,6 +156,17 @@ CREATE INDEX IF NOT EXISTS notice_log_recipient_idx ON {SCHEMA}.notice_log (reci
 CREATE TABLE IF NOT EXISTS {SCHEMA}.notice_optouts (
     email text PRIMARY KEY
 );
+-- #1006: when a 'requested' row was filed, so admins are reminded of one left waiting. Rows there before count from then.
+ALTER TABLE {SCHEMA}.allowlist ADD COLUMN IF NOT EXISTS requested_at timestamptz NOT NULL DEFAULT now();
+-- #1006: each day whose reminders were queued, written in the transaction that queues them, so a day runs once.
+CREATE TABLE IF NOT EXISTS {SCHEMA}.reminder_runs (
+    day date PRIMARY KEY,
+    at timestamptz NOT NULL
+);
+-- #1006: a notice may also be for the 'holder' of keys running out (on the Key Allowlist). Replaced by the name Postgres
+-- gave #1005's column CHECK, so a table #1005 made takes it too.
+ALTER TABLE {SCHEMA}.notice_queue DROP CONSTRAINT IF EXISTS notice_queue_kind_check,
+    ADD CONSTRAINT notice_queue_kind_check CHECK (kind IN ('owner', 'admin', 'asker', 'holder'));
 """
 
 
@@ -654,11 +670,13 @@ class PostgresKeyStore:
 
     # --- #1005 ---
 
-    async def queue_notice(self, recipients: list[str], kind: str, team: str | None, line: str, path: str) -> None:
+    async def queue_notice(
+        self, recipients: list[str], kind: str, team: str | None, line: str, path: str, conn: asyncpg.Connection | None = None
+    ) -> None:
         """Queue one line, linking to `path` on the key pages, for each recipient, who is `kind` to it ('owner' of
-        `team`, 'admin' or 'asker')."""
-        pool = await self._get_pool()
-        await pool.execute(
+        `team`, 'admin', 'asker' or 'holder'). On `conn`, inside its transaction, when given."""
+        db = conn or await self._get_pool()
+        await db.execute(
             f"INSERT INTO {SCHEMA}.notice_queue (recipient, kind, team, line, path)"
             " SELECT r, $2, $3, $4, $5 FROM unnest($1::text[]) r",
             recipients,
@@ -667,6 +685,59 @@ class PostgresKeyStore:
             line,
             path,
         )
+
+    async def run_reminders(
+        self,
+        day: date,
+        now: datetime,
+        is_due: Callable[[datetime | None, bool], bool],
+        build: Callable[[dict], list],
+    ) -> bool:
+        """Queue the reminders of `day` unless a process has, if `is_due(the last run's time or None, whether the day before
+        was run)` (Notices.remind). One transaction records the day, reads what reminders are made of, and queues the notices
+        `build(due)` makes, so a stop anywhere in it leaves the day not run and nothing queued. A second process running the
+        same day waits for the first's transaction at the day's row, then finds the day run. Returns whether the day has been
+        run, by this call or before; False, queuing nothing, while it is not due. `due` holds `last`, when the previous run
+        was (None before the first), and every row of `allowlist`, `sign_ins` and `requests` (with the Team's name, the
+        person's role in it now, `has`, and its owners), and of `keys` that are unrevoked and unexpired at `now` (with their
+        Team's name and their holder's role in it, `team_role`)."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn, conn.transaction():
+            last, ran, ran_before = await conn.fetchrow(
+                f"SELECT max(at), bool_or(day = $1::date), bool_or(day = $1::date - 1) FROM {SCHEMA}.reminder_runs", day
+            )
+            if ran:
+                return True
+            if not is_due(last, bool(ran_before)):
+                return False
+            if not await conn.fetchval(
+                f"INSERT INTO {SCHEMA}.reminder_runs (day, at) VALUES ($1, $2) ON CONFLICT (day) DO NOTHING RETURNING true",
+                day,
+                now,
+            ):
+                return True
+            due = {
+                "last": last,
+                "allowlist": await conn.fetch(f"SELECT email, role, requested_at FROM {SCHEMA}.allowlist ORDER BY email"),
+                "sign_ins": await conn.fetch(f"SELECT email, last_seen FROM {SCHEMA}.sign_ins ORDER BY email"),
+                "requests": await conn.fetch(
+                    f"SELECT r.team, t.name, r.email, r.role, r.requested_by, r.requested_at, m.role AS has,"
+                    f" ARRAY(SELECT o.email FROM {SCHEMA}.members o WHERE o.team = r.team AND o.role = 'owner' ORDER BY o.email)"
+                    f" AS owners FROM {SCHEMA}.member_requests r JOIN {SCHEMA}.teams t ON t.schema = r.team"
+                    f" LEFT JOIN {SCHEMA}.members m ON m.team = r.team AND m.email = r.email"
+                    " ORDER BY r.requested_at, r.team, r.email"
+                ),
+                "keys": await conn.fetch(
+                    f"SELECT k.email, k.name, k.kind, k.schema, k.expires_at, t.name AS team_name, m.role AS team_role"
+                    f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.teams t ON t.schema = k.schema"
+                    f" LEFT JOIN {SCHEMA}.members m ON m.team = k.schema AND m.email = k.email"
+                    " WHERE k.revoked_at IS NULL AND k.expires_at > $1 ORDER BY k.expires_at, k.id",
+                    now,
+                ),
+            }
+            for notice in build(due):
+                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path, conn)
+        return True
 
     async def queued_recipients(self) -> list[str]:
         pool = await self._get_pool()
@@ -677,7 +748,8 @@ class PostgresKeyStore:
     ) -> tuple[int, list[tuple[str, str, str, str | None]]] | None:
         """Take everything queued for the person that they are still eligible for and log it as one message `sending`:
         (log ID, [(line, path, kind, team)]). Eligible is still what the notice made them (NOTICE_ELIGIBLE): an owner of its
-        Team who is on the Key Allowlist, or an admin (`admins` are the bootstrap admins); the rest is dropped. None, taking
+        Team who is on the Key Allowlist, an admin (`admins` are the bootstrap admins), or a key's holder on the Key
+        Allowlist; the rest is dropped. None, taking
         nothing, if they were messaged after `since` (it stays queued) or have nothing left to be told; their queue is
         emptied, and nothing logged, if they turned notices off. One transaction, one at a time per person across
         processes: a stop inside it rolls it back and the queue is as it was. The sender checks eligibility again under
