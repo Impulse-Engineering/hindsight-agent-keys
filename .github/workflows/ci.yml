@@ -8,7 +8,7 @@ on:
   schedule:
     - cron: "23 7 * * *"
 
-# Every job starts read-only; only publish widens its token.
+# Every job starts read-only; a job that needs more (publish, verify-published, scan-alert) lists it in its own permissions block.
 permissions:
   contents: read
 
@@ -43,7 +43,7 @@ jobs:
       - name: Lint (ruff, shellcheck, actionlint)
         run: PATH="/tmp/it/bin:$PATH" scripts/lint.sh
 
-      - name: Script tests (release watcher, doc shell checks, pins)
+      - name: Script tests (release watcher, scan alert, doc shell checks, pins, no real hosts)
         run: PATH="/tmp/it/bin:$PATH" pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 
       - name: Build the images (API, then UI from the same pinned base)
@@ -79,6 +79,28 @@ jobs:
             docker run --rm -v "$RUNNER_TEMP/$tar:/scan/image.tar:ro" "$GRYPE" \
               docker-archive:/scan/image.tar --only-fixed --fail-on critical -o table
           done
+
+  # A scheduled scan of main that does not pass (failed, cancelled or timed out) files an
+  # issue here (scripts/scan-alert.sh), so the break is seen before a PR meets it.
+  scan-alert:
+    if: always() && github.event_name == 'schedule' && needs.scan.result != 'success'
+    needs: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: File the failed scan as an issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: scripts/scan-alert.sh "$RUN_URL"
 
   publish:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
