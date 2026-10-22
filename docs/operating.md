@@ -135,7 +135,7 @@ The extension sends Webex direct messages from a bot: to a Team's owners on the 
    - they are an owner of a new Team that is not open (an Open Team is silent: joining it is direct);
    - a second person, also on the Key Allowlist, who is not in that Team and has no request waiting for it, asks to join it by name, which files a new Join Request.
 
-   The owner should see the message in their Webex app. For the admin variant instead, make the test person an admin (notices on), and have someone who is not on the Key Allowlist yet sign in and ask for it. It passes on HTTP 200 (`sent` in the send log below) and the message shown in their Webex app. Whether a bot may message a person by email before that person has messaged it is exactly what this checks. Fill in the table below.
+   The owner should see the message in their Webex app. For the admin variant instead, make the test person an admin (notices on), and have someone with no place on the Key Allowlist at all (not a member, not an admin, and no request of theirs waiting: decline an old one first) sign in and ask for it, which files a new request. It passes on HTTP 200 (`sent` in the send log below) and the message shown in their Webex app. Whether a bot may message a person by email before that person has messaged it is exactly what this checks. Fill in the table below.
 
 **Dev check and token record.** Fill in a row when the check runs, and again each time the token is regenerated.
 
