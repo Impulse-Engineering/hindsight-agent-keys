@@ -572,11 +572,13 @@ class AgentKeysTenantExtension(TenantExtension):
     async def request_member(self, email: str, team: str, member: str, role: str, client_ip: str | None) -> None:
         """As an admin, or an owner on the Key Allowlist, ask for `member` to become an "owner" or "member" of the Team.
         Agents add people this way: nothing changes until an owner on the Key Allowlist, or an admin, confirms it, on the
-        Teams page or by Delegated Request. Anyone else may only ask for themselves, which files a Join Request."""
+        Teams page or by Delegated Request. Anyone else may only ask for themselves, which files a Join Request. A request
+        for someone in the Team already at that role, or as an owner, changes, records and tells nothing."""
         if await self._is_join_request(email, team, member):
             return await self._ask_to_join(email, team, role, client_ip)
         await self._require_manager(email, team)
-        await self._store.request_member(team, member, role, email)
+        if not await self._store.request_member(team, member, role, email):
+            return
         await self._record(f"{role}_requested", NO_KEY_ID, client_ip, member, email, team=team)
         await self._notify(partial(self._member_requested_notice, email, team, member, role))
 
@@ -717,7 +719,8 @@ class AgentKeysTenantExtension(TenantExtension):
     async def join_team(self, email: str, team: str, client_ip: str | None) -> str | None:
         """Join an Open Team as a member, with a live session: the Teams page or a Delegated Request, never over MCP. Anyone on
         the Key Allowlist may. Returns the person's role in it; someone in it already keeps theirs, and only a join records
-        an event. A Team that is not open, or does not exist, gets the person's Join Request instead (None), as asking by name does."""
+        an event. Their request for a member's place is settled, telling nobody; one for an owner's place stays. A Team that
+        is not open, or does not exist, gets the person's Join Request instead (None), as asking by name does."""
         await self._require_allowlisted(email)
         joined = await self._store.join_open_team(team, email)
         if joined is None:
@@ -832,8 +835,7 @@ class AgentKeysTenantExtension(TenantExtension):
         reminders = []
         for r in due["requests"]:
             waited = now - r["requested_at"]
-            # Someone already in the Team at the role asked for, or above it, has nothing left to wait for.
-            if waited <= REMIND_AFTER or r["has"] in ("owner", r["role"]):
+            if waited <= REMIND_AFTER:
                 continue
             # An owner off the Key Allowlist is dropped when the notice is claimed, as for every "owner" notice.
             owners = r["owners"]

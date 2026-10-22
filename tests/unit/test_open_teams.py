@@ -144,7 +144,7 @@ async def test_open_teams_are_listed_to_everyone_on_the_key_allowlist_and_other_
 
 
 @pytest.mark.parametrize("channel", LIVE)
-async def test_a_join_leaves_the_persons_own_open_request_in_place(world, channel):
+async def test_a_join_leaves_the_persons_request_for_an_owners_place_to_an_owner(world, channel):
     # Carol asked, while the Team was closed, to be an owner; joining makes her a member and leaves that to an owner.
     assert (await world.add(channel, CAROL, CAROL, "owner"))[1]["status"] == "pending"
     await world.ext.set_open(ADMIN, world.schema, True, None)

@@ -44,6 +44,13 @@ NOTICE_ELIGIBLE = (
     " WHEN 'asker' THEN true"
     " ELSE false END"
 )
+# Whether the request `r` (a member_requests row) still waits for an answer: its person is not in the Team already at the
+# role it asks for, or as an owner. Nothing files one that does not, and joining an Open Team settles one for a member's
+# place, but a request filed before those rules may be left. The Teams page, pending_reviews and the reminders all read
+# requests through this, and a request for someone else is filed only where it holds.
+_WAITING = (
+    f"NOT EXISTS (SELECT 1 FROM {SCHEMA}.members w WHERE w.team = r.team AND w.email = r.email AND w.role IN ('owner', r.role))"
+)
 
 # Idempotent and outside upstream's Alembic history, like the event log.
 # A key stores only an HMAC of the whole key, never the key.
@@ -425,16 +432,21 @@ class PostgresKeyStore:
             team, f"DELETE FROM {SCHEMA}.members WHERE team = $1 AND email = $2 RETURNING role", email, who=email
         )
 
-    async def request_member(self, team: str, email: str, role: str, by: str) -> None:
-        """Ask for the person to get this role in the Team; replaces an earlier request for them."""
-        await self._change_members(
-            team,
-            f"INSERT INTO {SCHEMA}.member_requests (team, email, role, requested_by) VALUES ($1, $2, $3, $4)"
-            " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role, requested_by = excluded.requested_by",
-            email,
-            role,
-            by,
-            who=None,
+    async def request_member(self, team: str, email: str, role: str, by: str) -> bool:
+        """Ask for the person to get this role in the Team, replacing an earlier request for them; True if filed. Nothing
+        is filed for someone in the Team already at that role, or as an owner: it would wait for nothing (`_WAITING`)."""
+        return bool(
+            await self._change_members(
+                team,
+                f"INSERT INTO {SCHEMA}.member_requests (team, email, role, requested_by)"
+                f" SELECT r.team, r.email, r.role, $4::text FROM (SELECT $1::text AS team, $2::text AS email, $3::text AS role) r"
+                f" WHERE {_WAITING}"
+                " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role, requested_by = excluded.requested_by RETURNING true",
+                email,
+                role,
+                by,
+                who=None,
+            )
         )
 
     async def add_join_request(self, team: str, email: str, role: str) -> bool:
@@ -488,9 +500,12 @@ class PostgresKeyStore:
         return None if row is None else (row["role"], row["requested_by"])
 
     async def member_requests(self, team: str) -> list[asyncpg.Record]:
+        """The Team's requests that wait for an answer (`_WAITING`)."""
         pool = await self._get_pool()
         return await pool.fetch(
-            f"SELECT email, role, requested_by FROM {SCHEMA}.member_requests WHERE team = $1 ORDER BY email", team
+            f"SELECT r.email, r.role, r.requested_by FROM {SCHEMA}.member_requests r WHERE r.team = $1 AND {_WAITING}"
+            " ORDER BY r.email",
+            team,
         )
 
     async def _change_members(self, team: str, sql: str, *args: str, who: str | None, row: bool = False):
@@ -628,7 +643,8 @@ class PostgresKeyStore:
 
     async def join_open_team(self, team: str, email: str) -> tuple[str, bool] | None:
         """Make the person a member of the Team if it is open: (their role now, whether they joined just now); someone in it
-        already keeps their role. None, changing nothing, if the Team is not open or does not exist."""
+        already keeps their role. Their request for a member's place, which then waits for nothing, is settled; one for an
+        owner's place stays for an owner to answer. None, changing nothing, if the Team is not open or does not exist."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
             # The Team's lock, as every member change takes, so a join waits for a concurrent closing or approval.
@@ -639,6 +655,9 @@ class PostgresKeyStore:
                 " ON CONFLICT (team, email) DO NOTHING RETURNING true",
                 team,
                 email,
+            )
+            await conn.execute(
+                f"DELETE FROM {SCHEMA}.member_requests WHERE team = $1 AND email = $2 AND role = 'member'", team, email
             )
             role = await conn.fetchval(f"SELECT role FROM {SCHEMA}.members WHERE team = $1 AND email = $2", team, email)
         return role, bool(joined)
@@ -655,12 +674,12 @@ class PostgresKeyStore:
     # --- pending_reviews (#1004) ---
 
     async def pending_review_counts(self, email: str, *, admin: bool, older_than: datetime) -> tuple[int, int]:
-        """What waits for the person: (requests to join the Teams they own, and for an admin those for any other
-        Team filed before `older_than`; the people who asked for a place on the Key Allowlist, for an admin only)."""
+        """What waits for the person: (requests to join the Teams they own that wait (`_WAITING`), and for an admin those for
+        any other Team filed before `older_than`; the people who asked for a place on the Key Allowlist, for an admin only)."""
         pool = await self._get_pool()
         joins, access = await pool.fetchrow(
-            f"SELECT (SELECT count(*) FROM {SCHEMA}.member_requests r WHERE ($2::boolean AND r.requested_at < $3) OR EXISTS"
-            f" (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner')),"
+            f"SELECT (SELECT count(*) FROM {SCHEMA}.member_requests r WHERE {_WAITING} AND (($2::boolean AND r.requested_at < $3)"
+            f" OR EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner'))),"
             f" (SELECT count(*) FROM {SCHEMA}.allowlist WHERE $2::boolean AND role = 'requested')",
             email,
             admin,
@@ -698,9 +717,9 @@ class PostgresKeyStore:
         `build(due)` makes, so a stop anywhere in it leaves the day not run and nothing queued. A second process running the
         same day waits for the first's transaction at the day's row, then finds the day run. Returns whether the day has been
         run, by this call or before; False, queuing nothing, while it is not due. `due` holds `last`, when the previous run
-        was (None before the first), and every row of `allowlist`, `sign_ins` and `requests` (with the Team's name, the
-        person's role in it now, `has`, and its owners), and of `keys` that are unrevoked and unexpired at `now` (with their
-        Team's name and their holder's role in it, `team_role`)."""
+        was (None before the first), and every row of `allowlist` and `sign_ins`, of `requests` that wait (`_WAITING`, with
+        the Team's name and its owners), and of `keys` that are unrevoked and unexpired at `now` (with their Team's name and
+        their holder's role in it, `team_role`)."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
             last, ran, ran_before = await conn.fetchrow(
@@ -721,11 +740,10 @@ class PostgresKeyStore:
                 "allowlist": await conn.fetch(f"SELECT email, role, requested_at FROM {SCHEMA}.allowlist ORDER BY email"),
                 "sign_ins": await conn.fetch(f"SELECT email, last_seen FROM {SCHEMA}.sign_ins ORDER BY email"),
                 "requests": await conn.fetch(
-                    f"SELECT r.team, t.name, r.email, r.role, r.requested_by, r.requested_at, m.role AS has,"
+                    f"SELECT r.team, t.name, r.email, r.role, r.requested_by, r.requested_at,"
                     f" ARRAY(SELECT o.email FROM {SCHEMA}.members o WHERE o.team = r.team AND o.role = 'owner' ORDER BY o.email)"
                     f" AS owners FROM {SCHEMA}.member_requests r JOIN {SCHEMA}.teams t ON t.schema = r.team"
-                    f" LEFT JOIN {SCHEMA}.members m ON m.team = r.team AND m.email = r.email"
-                    " ORDER BY r.requested_at, r.team, r.email"
+                    f" WHERE {_WAITING} ORDER BY r.requested_at, r.team, r.email"
                 ),
                 "keys": await conn.fetch(
                     f"SELECT k.email, k.name, k.kind, k.schema, k.expires_at, t.name AS team_name, m.role AS team_role"

@@ -1553,7 +1553,7 @@ def test_an_admin_opens_a_team_anyone_listed_joins_it_and_closing_keeps_its_memb
     # Only an admin opens it, its owner included.
     assert send("POST", f"/teams/{team}/open", gus, {"open": True})[0] == 403
     assert send("GET", "/open-teams", hal) == (200, [])
-    # Hal asks to join while it is closed; his request outlives his join below.
+    # Hal asks to join while it is closed; his join below settles it.
     assert send("POST", "/join-requests", hal, {"name": "open team"}) == (200, {"name": "open team", "status": "pending"})
     for _ in range(2):
         assert send("POST", f"/teams/{team}/open", ALICE, {"open": True}) == (200, {"team": team, "open": True})
@@ -1574,7 +1574,7 @@ def test_an_admin_opens_a_team_anyone_listed_joins_it_and_closing_keeps_its_memb
         {"email": gus, "role": "owner"}, {"email": hal, "role": "member"}, {"email": ida, "role": "member"}
     ]
     requests = f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}' ORDER BY email"
-    assert query(name, requests) == [{"email": hal}, {"email": jay}]
+    assert query(name, requests) == [{"email": jay}]
     kinds = "('team_opened', 'team_closed', 'member_joined', 'join_requested')"
     sql = f"SELECT kind, email, actor, channel FROM agent_keys.events WHERE team = '{team}' AND kind IN {kinds} ORDER BY id"
     assert [(r["kind"], r["email"], r["actor"], r["channel"]) for r in query(name, sql)] == [
@@ -1671,6 +1671,63 @@ def test_a_join_that_waits_for_a_closing_finds_the_team_closed_and_files_a_join_
     assert (joined[0], json.loads(joined[1])) == (200, {"team": team, "email": pia, "role": "member", "status": "pending"})
     assert query(name, f"SELECT email FROM agent_keys.members WHERE team = '{team}'") == [{"email": oli}]
     assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": pia}]
+
+
+# What the day's reminders read as a Team's waiting requests (store.run_reminders), on a day nobody runs: `build` raises,
+# which rolls the run back, so no day is recorded and nothing is queued.
+REMINDER_READ = """
+class Read(Exception):
+    pass
+
+
+def build(due):
+    out["waiting"] = [r["email"] for r in due["requests"] if r["team"] == TEAM]
+    raise Read
+
+
+try:
+    await store.run_reminders(datetime(2000, 1, 1).date(), T0, lambda last, ran_before: True, build)
+except Read:
+    pass
+"""
+
+
+def test_no_request_waits_for_someone_in_the_team_and_a_join_settles_an_agents_request_in_postgres(hindsight):
+    name, port, multi = hindsight["name"], hindsight["port"], MCP_ENDPOINTS[0]
+    owner, member, joiner = (f"settled-{who}-{RUN}@example.test" for who in ("owner", "member", "joiner"))
+    for person in (owner, member, joiner):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    owner_key = personal_key(hindsight, owner)["key"]
+    team = team_page(hindsight, "POST", "/ext/teams", owner, {"name": f"Settled {RUN}"})["team"]
+    team_page(hindsight, "POST", f"/ext/teams/{team}/members", owner, {"email": member, "role": "member"})
+    requests = f"SELECT email, role FROM agent_keys.member_requests WHERE team = '{team}' ORDER BY email"
+
+    def waiting():
+        """What the owner's agent counts and lists for the Team, and what the reminders read."""
+        (listed,) = [t for t in call_tool(port, owner_key, multi, "list_teams")["teams"] if t["team"] == team]
+        read = notice_store(name, f"TEAM = {team!r}\n{REMINDER_READ}")["waiting"]
+        return call_tool(port, owner_key, multi, "pending_reviews")["join_requests"], [r["email"] for r in listed["requests"]], read
+
+    # The owner's agent asks for the member and for the owner as members: each is in the Team at that role or above, so
+    # the same reply and nothing filed or recorded. Its request for the joiner is filed.
+    for email in (member, owner, joiner):
+        answer = call_tool(port, owner_key, multi, "add_team_member", team=team, email=email)
+        assert answer == {"team": team, "email": email, "role": "member", "status": "pending"}
+    assert query(name, requests) == [{"email": joiner, "role": "member"}]
+    assert waiting() == (1, [joiner], [joiner])
+    # The joiner joins once an admin opens the Team: the request is settled, and nothing is left to count, list, remind
+    # or decline, so no decline can be announced.
+    assert key_page(hindsight, "POST", f"/ext/teams/{team}/open", ALICE, body={"open": True})[0] == 200
+    assert team_page(hindsight, "POST", f"/ext/teams/{team}/join", joiner, {}) == {"team": team, "email": joiner, "role": "member"}
+    assert query(name, requests) == []
+    assert waiting() == (0, [], [])
+    assert key_page(hindsight, "DELETE", f"/ext/teams/{team}/requests", owner, body={"email": joiner})[0] == 404
+    # A request an earlier release left for someone now in the Team waits for no one either.
+    stale = f"('{team}', '{joiner}', 'member', '{owner}')"
+    query(name, f"INSERT INTO agent_keys.member_requests (team, email, role, requested_by) VALUES {stale} RETURNING email")
+    assert waiting() == (0, [], [])
+    sql = f"SELECT kind, email FROM agent_keys.events WHERE team = '{team}' AND kind LIKE '%_requested' ORDER BY id"
+    assert query(name, sql) == [{"kind": "member_requested", "email": joiner}]
 
 # Webex notices. The container runs without a bot token, so no background sweep competes with these for the queue
 # (the sweep, the messages and the HTTP routes are in tests/unit). They call the store the extension uses, and need

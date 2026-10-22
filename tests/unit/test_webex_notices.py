@@ -141,10 +141,10 @@ class NoticeStore(MemoryStore):
                     "role": role,
                     "requested_by": by,
                     "requested_at": self.requested_at[t, e],
-                    "has": self.team_roles.get((t, e)),
                     "owners": sorted(o for (ot, o), r in self.team_roles.items() if ot == t and r == "owner"),
                 }
                 for (t, e), (role, by) in sorted(self.requests.items(), key=lambda item: self.requested_at[item[0]])
+                if self._waiting(t, e, role)
             ],
             "keys": [
                 {

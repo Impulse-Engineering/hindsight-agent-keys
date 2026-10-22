@@ -131,10 +131,17 @@ class MemoryStore:
         self._change_members(team, lambda roles: roles.pop((team, email), None))
         return had
 
+    def _waiting(self, team, email, role):
+        """store._WAITING: the person is not in the Team already at the role asked for, or as an owner."""
+        return self.team_roles.get((team, email)) not in ("owner", role)
+
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)
+        if not self._waiting(team, email, role):
+            return False
         self.requests[team, email] = (role, by)
         self.requested_at.setdefault((team, email), datetime.now(UTC))
+        return True
 
     async def add_join_request(self, team, email, role):
         if team not in self.teams_by_schema or (team, email) in self.team_roles or (team, email) in self.requests:
@@ -155,7 +162,11 @@ class MemoryStore:
         return self.requests.pop((team, email), None)  # (the role it asked for, who asked)
 
     async def member_requests(self, team):
-        return [{"email": e, "role": r, "requested_by": b} for (t, e), (r, b) in sorted(self.requests.items()) if t == team]
+        return [
+            {"email": e, "role": r, "requested_by": b}
+            for (t, e), (r, b) in sorted(self.requests.items())
+            if t == team and self._waiting(t, e, r)
+        ]
 
     def _change_members(self, team, change):
         if team not in self.teams_by_schema:
@@ -308,6 +319,9 @@ class MemoryStore:
         if team not in self.opened:
             return None
         joined = (team, email) not in self.team_roles
+        if self.requests.get((team, email), (None,))[0] == "member":
+            del self.requests[team, email]
+            self.requested_at.pop((team, email), None)
         return self.team_roles.setdefault((team, email), "member"), joined
 
     async def open_teams(self, email):
@@ -317,8 +331,9 @@ class MemoryStore:
 
     async def pending_review_counts(self, email, *, admin, older_than):
         joins = sum(
-            self.team_roles.get((team, email)) == "owner" or (admin and self.requested_at[team, asker] < older_than)
-            for team, asker in self.requests
+            self._waiting(team, asker, role)
+            and (self.team_roles.get((team, email)) == "owner" or (admin and self.requested_at[team, asker] < older_than))
+            for (team, asker), (role, _) in self.requests.items()
         )
         return joins, sum(admin and role == "requested" for role in self.roles.values())
 

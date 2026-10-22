@@ -315,6 +315,19 @@ async def test_no_mcp_tool_approves_or_declines_and_an_owners_add_over_mcp_only_
     assert await world.requests() == [{"email": CAROL, "role": "member", "by": ALICE}]
 
 
+async def test_an_owners_request_over_mcp_for_someone_already_in_the_team_at_that_role_or_above_is_a_no_op(world):
+    asked = {"team": world.schema, "email": BOB, "role": "member", **PENDING}
+    # Bob is a member, and Alice an owner: the same reply, and nothing stored, recorded or announced.
+    assert await world.add("mcp", ALICE, BOB) == (200, asked)
+    assert await world.add("mcp", ALICE, ALICE) == (200, {**asked, "email": ALICE})
+    assert await world.add("mcp", ALICE, ALICE, "owner") == (200, {**asked, "email": ALICE, "role": "owner"})
+    assert (await world.requests(), world.events.rows) == ([], [])
+    # Asking for a member to become an owner still waits for an owner's answer.
+    assert await world.add("mcp", ALICE, BOB, "owner") == (200, {**asked, "role": "owner"})
+    assert await world.requests() == [{"email": BOB, "role": "owner", "by": ALICE}]
+    assert logged(world.events) == [event("mcp", "owner_requested", BOB, ALICE)]
+
+
 @pytest.mark.parametrize("step", ["ask", "approve", "decline"])
 async def test_a_change_stored_before_its_event_failed_is_not_recorded_by_a_delegates_repeat(world, step):
     """The event log fails after the store committed: the change stands with no event row, and the Delegate's repeat,
