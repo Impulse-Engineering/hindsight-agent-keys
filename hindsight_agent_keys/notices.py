@@ -118,14 +118,15 @@ class Webex(Protocol):
 class Notice(NamedTuple):
     """One line for each of the recipients, and the page it links to. `kind` is who they are to it, which the store
     checks again when it takes the notice to send: an "owner" of `team` who is on the Key Allowlist, an "admin", the
-    "holder" of keys running out who is on the Key Allowlist, or the "asker" of a request that was decided (a decision
-    is about their own request, so nothing needs checking)."""
+    "holder" of `key` (of any key, for a sign-in window warning) who is on the Key Allowlist and whose key still works,
+    or the "asker" of a request that was decided (a decision is about their own request, so nothing needs checking)."""
 
     kind: str
     recipients: list[str]
     line: str
     path: str
     team: str | None = None
+    key: str | None = None
 
 
 class Notices:
@@ -161,7 +162,9 @@ class Notices:
                 notice = await build()
                 if not notice.recipients:
                     return
-                await self._store.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path)
+                await self._store.queue_notice(
+                    notice.recipients, notice.kind, notice.team, notice.line, notice.path, key_id=notice.key
+                )
         except Exception as exc:  # noqa: BLE001 - a notice never fails the request that caused it
             logger.warning("agent-keys: could not queue a Webex notice: %s", type(exc).__name__)
             return
@@ -217,10 +220,10 @@ class Notices:
         except Exception as exc:  # noqa: BLE001 - the lock could not be taken: logged in the send log, not retried
             await self._finish(log_id, "failed", _why(exc), None)
 
-    async def _send(self, conn, to: str, items: list[tuple[str, str, str, str | None]]) -> tuple[str, str | None]:
+    async def _send(self, conn, to: str, items: list[tuple[str, str, str, str | None, str | None]]) -> tuple[str, str | None]:
         """The final checks and the send, under the lock, on its connection: (status, detail) for the send log."""
         try:
-            still = await self._store.still_eligible(conn, to, items, self._admins)
+            still = await self._store.still_eligible(conn, to, items, self._admins, self._clock())
             items = [item for item, ok in zip(items, still, strict=True) if ok]
             if not items:
                 return "skipped", "no longer eligible"
@@ -240,7 +243,7 @@ class Notices:
         except Exception as exc:  # noqa: BLE001 - the row stays `sending`; the message is not sent again
             logger.warning("agent-keys: could not write the Webex send log: %s", type(exc).__name__)
 
-    def _message(self, items: list[tuple[str, str, str, str | None]]) -> str:
+    def _message(self, items: list[tuple[str, str, str, str | None, str | None]]) -> str:
         shown = [f"- {item[0]}" for item in items[:MAX_LINES]]
         more = [f"...and {len(items) - MAX_LINES} more."] if len(items) > MAX_LINES else []
         pages = dict.fromkeys(f"https://{self._host}{item[1]}" for item in items)

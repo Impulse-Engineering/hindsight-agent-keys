@@ -284,6 +284,27 @@ async def test_a_warning_queued_for_someone_since_removed_from_the_key_allowlist
     assert world.store.queue == []
 
 
+async def test_a_warning_about_a_key_revoked_since_it_was_queued_is_dropped_unsent(world):
+    await _warned(world)
+    [tablet] = [k["id"] for k in await world.ext.list_keys(GINA)]
+    await world.ext.revoke_key(GINA, tablet, None)
+    await world.send()
+    assert [to for to, _ in world.webex.sent] == [DAVE]
+    assert world.store.queue == [] and [row["recipient"] for row in world.store.log] == [DAVE]
+
+
+async def test_a_key_revoked_between_the_claim_and_the_send_stops_its_warning(world):
+    await _warned(world)
+    [tablet] = [k["id"] for k in await world.ext.list_keys(GINA)]
+    world.store.after_claim = lambda person: world.store.keys[tablet].update(revoked_at=world.clock.now) if person == GINA else None
+    await world.send()
+    assert [to for to, _ in world.webex.sent] == [DAVE]
+    assert [(row["recipient"], row["status"], row["detail"]) for row in world.store.log] == [
+        (DAVE, "sent", None),
+        (GINA, "skipped", "no longer eligible"),
+    ]
+
+
 async def test_a_key_holder_removed_from_the_key_allowlist_between_the_claim_and_the_send_is_not_sent_to(world):
     await _warned(world)
     world.store.after_claim = lambda person: world.store.roles.pop(person) if person == GINA else None
@@ -386,11 +407,11 @@ async def test_a_stop_before_the_days_run_commits_queues_nothing_and_the_next_sw
     else:
         calls = []
 
-        async def second_stops(*args):
+        async def second_stops(*args, **kwargs):
             calls.append(args)
             if len(calls) == 2:
                 raise Stopped
-            await queue_notice(*args)
+            await queue_notice(*args, **kwargs)
 
         world.store.queue_notice = second_stops
     with pytest.raises(Stopped):

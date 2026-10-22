@@ -44,14 +44,26 @@ async def _poll_for_lock(conn: asyncpg.Connection, sql: str, key: str, wait: flo
 # Whether the person ($1) is on the Key Allowlist, given the bootstrap admins ($2), who are admins whatever the allowlist
 # says. 'member' and 'admin' are extension.LISTED, the roles that may create keys.
 _LISTED = f"($1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role IN ('member', 'admin')))"
-# Whether a queued notice (t.kind, t.team) is still the person's to read: an owner of the Team on the Key Allowlist, an
-# admin, a key's holder still on the Key Allowlist, or the asker of a decided request. Any other kind is not.
+# Whether the key `k` works at $3, as `principal` decides on each request, but for its holder's place on the Key Allowlist
+# (`_LISTED`): not revoked or expired, its holder signed in within extension.SIGN_IN_WINDOW, and a Team key's holder still
+# in its Team. extension._reminders' `works` and the stale_schemas view count by the same rule: a change to one belongs in
+# the others.
+_WORKS = (
+    "k.revoked_at IS NULL AND $3::timestamptz < k.expires_at"
+    f" AND EXISTS (SELECT 1 FROM {SCHEMA}.sign_ins s WHERE s.email = k.email AND $3::timestamptz - s.last_seen < interval '30 days')"
+    f" AND (k.kind <> 'team' OR k.schema = 'public'"
+    f" OR EXISTS (SELECT 1 FROM {SCHEMA}.members km WHERE km.team = k.schema AND km.email = k.email))"
+)
+# Whether a queued notice (t.kind, t.team, t.key_id) is still the person's to read at $3: an owner of the Team on the Key
+# Allowlist, an admin, a key's holder still on the Key Allowlist whose key still works (for a warning that names none, the
+# sign-in window's, any key of theirs that works), or the asker of a decided request. Any other kind is not.
 NOTICE_ELIGIBLE = (
     "CASE t.kind"
     f" WHEN 'owner' THEN EXISTS (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = t.team AND m.email = $1 AND m.role = 'owner')"
     f"   AND {_LISTED}"
     f" WHEN 'admin' THEN $1 = ANY($2::text[]) OR EXISTS (SELECT 1 FROM {SCHEMA}.allowlist a WHERE a.email = $1 AND a.role = 'admin')"
-    f" WHEN 'holder' THEN {_LISTED}"
+    f" WHEN 'holder' THEN {_LISTED} AND EXISTS (SELECT 1 FROM {SCHEMA}.keys k WHERE k.email = $1"
+    f"   AND (t.key_id IS NULL OR k.id = t.key_id) AND {_WORKS})"
     " WHEN 'asker' THEN true"
     " ELSE false END"
 )
@@ -186,6 +198,9 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.reminder_runs (
 -- gave #1005's column CHECK, so a table #1005 made takes it too.
 ALTER TABLE {SCHEMA}.notice_queue DROP CONSTRAINT IF EXISTS notice_queue_kind_check,
     ADD CONSTRAINT notice_queue_kind_check CHECK (kind IN ('owner', 'admin', 'asker', 'holder'));
+-- The key a 'holder' warning is about, which must still work for it to be sent; NULL for a sign-in window warning, which
+-- needs any key of the holder's that works.
+ALTER TABLE {SCHEMA}.notice_queue ADD COLUMN IF NOT EXISTS key_id text;
 """
 
 
@@ -618,12 +633,11 @@ class PostgresKeyStore:
     async def revoke_keys(
         self, email: str, now: datetime, key_id: str | None = None, *, via_workplane: bool = False
     ) -> int:
-        """Revoke one of the person's keys, or with no key ID all of them; returns how many. Revoking all of them also drops
-        the warnings queued for the person (`_drop_key_warnings`)."""
+        """Revoke one of the person's keys, or with no key ID all of them; returns how many. Under the person's notice lock
+        (`_lock_notices`): a revocation can end their eligibility for a warning."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
-            if key_id is None:
-                await self._drop_key_warnings(conn, [email])
+            await self._lock_notices(conn, email)
             rows = await conn.fetch(
                 f"UPDATE {SCHEMA}.keys SET revoked_at = $2"
                 " WHERE email = $1 AND revoked_at IS NULL AND ($3::text IS NULL OR id = $3) AND (NOT $4::boolean OR via IS NOT NULL)"
@@ -641,12 +655,15 @@ class PostgresKeyStore:
         return await pool.fetchval(f"SELECT last_seen FROM {SCHEMA}.sign_ins WHERE email = $1", email)
 
     async def revoke_workplane_keys(self, now: datetime) -> int:
-        """Revoke every unrevoked key created via WorkPlane, whoever holds it, and drop the warnings queued for its holders
-        (`_drop_key_warnings`); returns how many."""
+        """Revoke every unrevoked key created via WorkPlane, whoever holds it; returns how many. Under each holder's notice
+        lock, taken in order (`_lock_notices`), as for any revocation."""
         pool = await self._get_pool()
         async with pool.acquire() as conn, conn.transaction():
-            holders = await conn.fetch(f"SELECT DISTINCT email FROM {SCHEMA}.keys WHERE via IS NOT NULL AND revoked_at IS NULL")
-            await self._drop_key_warnings(conn, [r["email"] for r in holders])
+            holders = await conn.fetch(
+                f"SELECT DISTINCT email FROM {SCHEMA}.keys WHERE via IS NOT NULL AND revoked_at IS NULL ORDER BY email"
+            )
+            for holder in holders:
+                await self._lock_notices(conn, holder["email"])
             rows = await conn.fetch(
                 f"UPDATE {SCHEMA}.keys SET revoked_at = $1 WHERE via IS NOT NULL AND revoked_at IS NULL RETURNING id", now
             )
@@ -712,19 +729,29 @@ class PostgresKeyStore:
     # --- Webex notices ---
 
     async def queue_notice(
-        self, recipients: list[str], kind: str, team: str | None, line: str, path: str, conn: asyncpg.Connection | None = None
+        self,
+        recipients: list[str],
+        kind: str,
+        team: str | None,
+        line: str,
+        path: str,
+        conn: asyncpg.Connection | None = None,
+        *,
+        key_id: str | None = None,
     ) -> None:
         """Queue one line, linking to `path` on the key pages, for each recipient, who is `kind` to it ('owner' of
-        `team`, 'admin', 'asker' or 'holder'). On `conn`, inside its transaction, when given."""
+        `team`, 'admin', 'asker' or 'holder' of the key `key_id`, or of any key for a warning that names none). On `conn`,
+        inside its transaction, when given."""
         db = conn or await self._get_pool()
         await db.execute(
-            f"INSERT INTO {SCHEMA}.notice_queue (recipient, kind, team, line, path)"
-            " SELECT r, $2, $3, $4, $5 FROM unnest($1::text[]) r",
+            f"INSERT INTO {SCHEMA}.notice_queue (recipient, kind, team, line, path, key_id)"
+            " SELECT r, $2, $3, $4, $5, $6 FROM unnest($1::text[]) r",
             recipients,
             kind,
             team,
             line,
             path,
+            key_id,
         )
 
     async def queued_recipients(self) -> list[str]:
@@ -733,11 +760,11 @@ class PostgresKeyStore:
 
     async def claim_notice(
         self, recipient: str, now: datetime, since: datetime, admins: list[str]
-    ) -> tuple[int, list[tuple[str, str, str, str | None]]] | None:
-        """Take everything queued for the person that they are still eligible for and log it as one message `sending`:
-        (log ID, [(line, path, kind, team)]). Eligible is still what the notice made them (NOTICE_ELIGIBLE): an owner of its
-        Team who is on the Key Allowlist, an admin (`admins` are the bootstrap admins), or a key's holder on the Key
-        Allowlist; the rest is dropped. None, taking
+    ) -> tuple[int, list[tuple[str, str, str, str | None, str | None]]] | None:
+        """Take everything queued for the person that they are still eligible for at `now` and log it as one message
+        `sending`: (log ID, [(line, path, kind, team, key ID)]). Eligible is still what the notice made them
+        (NOTICE_ELIGIBLE): an owner of its Team who is on the Key Allowlist, an admin (`admins` are the bootstrap admins),
+        or a key's holder on the Key Allowlist whose key still works; the rest is dropped. None, taking
         nothing, if they were messaged after `since` (it stays queued) or have nothing left to be told; their queue is
         emptied, and nothing logged, if they turned notices off. One transaction, one at a time per person across
         processes: a stop inside it rolls it back and the queue is as it was. The sender checks eligibility again under
@@ -748,10 +775,11 @@ class PostgresKeyStore:
             if await conn.fetchval(f"SELECT 1 FROM {SCHEMA}.notice_log WHERE recipient = $1 AND at > $2", recipient, since):
                 return None
             rows = await conn.fetch(
-                f"WITH taken AS (DELETE FROM {SCHEMA}.notice_queue WHERE recipient = $1 RETURNING id, kind, team, line, path)"
-                f" SELECT line, path, kind, team FROM taken t WHERE {NOTICE_ELIGIBLE} ORDER BY id",
+                f"WITH taken AS (DELETE FROM {SCHEMA}.notice_queue WHERE recipient = $1 RETURNING id, kind, team, key_id, line, path)"
+                f" SELECT line, path, kind, team, key_id FROM taken t WHERE {NOTICE_ELIGIBLE} ORDER BY id",
                 recipient,
                 admins,
+                now,
             )
             if not rows or await conn.fetchval(f"SELECT 1 FROM {SCHEMA}.notice_optouts WHERE email = $1", recipient):
                 return None
@@ -761,20 +789,29 @@ class PostgresKeyStore:
                 now,
                 len(rows),
             )
-        return log_id, [(r["line"], r["path"], r["kind"], r["team"]) for r in rows]
+        return log_id, [(r["line"], r["path"], r["kind"], r["team"], r["key_id"]) for r in rows]
 
     async def still_eligible(
-        self, conn: asyncpg.Connection, recipient: str, items: list[tuple[str, str, str, str | None]], admins: list[str]
+        self,
+        conn: asyncpg.Connection,
+        recipient: str,
+        items: list[tuple[str, str, str, str | None, str | None]],
+        admins: list[str],
+        now: datetime,
     ) -> list[bool]:
-        """For each claimed item, whether the person is still eligible for it now. Called under the person's notice lock, on
-        the connection `notice_lock` gave, which every change that can end their eligibility takes before it commits, so once
-        one has committed this sees it and, until it has, the change waits for the message that follows."""
+        """For each claimed item, whether the person is still eligible for it at `now`. Called under the person's notice
+        lock, on the connection `notice_lock` gave, which every change that can end their eligibility (a revocation of the
+        key a warning is about included) takes before it commits, so once one has committed this sees it and, until it has,
+        the change waits for the message that follows."""
         rows = await conn.fetch(
-            f"SELECT t.ord FROM unnest($3::text[], $4::text[]) WITH ORDINALITY AS t(kind, team, ord) WHERE {NOTICE_ELIGIBLE}",
+            "SELECT t.ord FROM unnest($4::text[], $5::text[], $6::text[]) WITH ORDINALITY AS t(kind, team, key_id, ord)"
+            f" WHERE {NOTICE_ELIGIBLE}",
             recipient,
             admins,
+            now,
             [item[2] for item in items],
             [item[3] for item in items],
+            [item[4] for item in items],
         )
         yes = {r["ord"] - 1 for r in rows}
         return [i in yes for i in range(len(items))]
@@ -811,7 +848,7 @@ class PostgresKeyStore:
         """Take the person's notice lock until the transaction on `conn` ends. Every change that can end someone's eligibility
         for a notice (a removal or a role change in a Team, a role change on the Key Allowlist) calls this before it changes
         anything, so it waits for a message to them in flight and a message whose final check comes after the commit sees it;
-        so does a revocation that drops their queued warnings (`_drop_key_warnings`).
+        so does a revocation of a key of theirs, which can end a warning's.
         It takes the lock on the transaction's own connection, first, so a change holds one pool connection while it waits
         and never waits for a second while it holds the lock.
         Polls, as notice_lock does; Refused(503) if the message does not finish within NOTICE_LOCK_WAIT seconds."""
@@ -823,17 +860,6 @@ class PostgresKeyStore:
             NOTICE_LOCK_POLL,
             Refused(503, "A message to that person is being sent; try again in a moment."),
         )
-
-    async def _drop_key_warnings(self, conn: asyncpg.Connection, emails: list[str]) -> None:
-        """Drop the warnings queued for these people (their 'holder' notices), in the transaction on `conn` that revokes their
-        keys, so none asks them afterwards to renew a key that no longer works. Takes each one's notice lock first, in order
-        (`_lock_notices`), so a message to them in flight is sent before the revocation commits. shortcut: a message claimed
-        just before, whose final check comes after, still goes out (a holder's eligibility is their place on the Key
-        Allowlist, which a revocation keeps), and the queue does not say which key a warning is about, so the kill switch
-        also drops a warning about a holder's own key; make a warning name its key if either matters."""
-        for email in sorted(set(emails)):
-            await self._lock_notices(conn, email)
-        await conn.execute(f"DELETE FROM {SCHEMA}.notice_queue WHERE kind = 'holder' AND recipient = ANY($1::text[])", emails)
 
     async def notices_enabled(self, email: str, conn: asyncpg.Connection | None = None) -> bool:
         """Whether the person has not turned notices off; on `notice_lock`'s connection when the sender holds the lock."""
@@ -893,7 +919,7 @@ class PostgresKeyStore:
                     f" WHERE {_WAITING} ORDER BY r.requested_at, r.team, r.email"
                 ),
                 "keys": await conn.fetch(
-                    f"SELECT k.email, k.name, k.kind, k.schema, k.expires_at, t.name AS team_name, m.role AS team_role"
+                    f"SELECT k.id, k.email, k.name, k.kind, k.schema, k.expires_at, t.name AS team_name, m.role AS team_role"
                     f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.teams t ON t.schema = k.schema"
                     f" LEFT JOIN {SCHEMA}.members m ON m.team = k.schema AND m.email = k.email"
                     " WHERE k.revoked_at IS NULL AND k.expires_at > $1 ORDER BY k.expires_at, k.id",
@@ -901,5 +927,5 @@ class PostgresKeyStore:
                 ),
             }
             for notice in build(due):
-                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path, conn)
+                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path, conn, key_id=notice.key)
         return True

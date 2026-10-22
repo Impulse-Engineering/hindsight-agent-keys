@@ -438,8 +438,8 @@ class AgentKeysTenantExtension(TenantExtension):
         raise Refused(404, "You hold no unrevoked key with that ID.")
 
     async def revoke_identity(self, admin: str, email: str, client_ip: str | None) -> int:
-        """Revoke every key the person holds, and drop the key warnings queued for them; returns how many. Admins only.
-        Recorded only when it revoked a key, so a repeat records nothing."""
+        """Revoke every key the person holds; returns how many. Admins only. Recorded only when it revoked
+        a key, so a repeat records nothing."""
         if await self.role(admin) != "admin":
             raise Refused(403, "Only an admin can revoke an identity.")
         revoked = await self._store.revoke_keys(email, self._clock())
@@ -448,8 +448,8 @@ class AgentKeysTenantExtension(TenantExtension):
         return revoked
 
     async def revoke_workplane_keys(self, admin: str, client_ip: str | None) -> int:
-        """The kill switch: revoke every key created via WorkPlane, whoever holds it, and drop the key warnings queued for
-        its holders; returns how many. Admins only, on the /ext admin pages; no Delegated Request reaches it."""
+        """The kill switch: revoke every key created via WorkPlane, whoever holds it; returns how many.
+        Admins only, on the /ext admin pages; no Delegated Request reaches it."""
         if await self.role(admin) != "admin":
             raise Refused(403, "Only an admin can revoke the keys created via WorkPlane.")
         revoked = await self._store.revoke_workplane_keys(self._clock())
@@ -835,7 +835,7 @@ class AgentKeysTenantExtension(TenantExtension):
 
         def works(key) -> bool:
             # The rule `principal` applies to a key on each request (with `find_key`'s columns), which the stale_schemas
-            # view also counts by: a change to one belongs in the others.
+            # view and store._WORKS also count by: a change to one belongs in the others.
             seen = signed_in.get(key["email"])
             team = key["kind"] == "team" and key["schema"] != PUBLIC_SCHEMA
             return listed(key["email"]) and seen is not None and now - seen < SIGN_IN_WINDOW and (not team or key["team_role"])
@@ -866,7 +866,7 @@ class AgentKeysTenantExtension(TenantExtension):
                 else:
                     team = f' for the Team "{plain(k["team_name"])}"'
                 line = f'Your Agent Key "{plain(k["name"])}"{team} expires {_when(k["expires_at"], now)}. Renew it on your key page.'
-                reminders.append(Notice("holder", [k["email"]], line, "/ext/"))
+                reminders.append(Notice("holder", [k["email"]], line, "/ext/", key=k["id"]))
         for email in sorted({k["email"] for k in working}):
             closes = signed_in[email] + SIGN_IN_WINDOW
             if came_due(closes - SIGN_IN_WARNING):

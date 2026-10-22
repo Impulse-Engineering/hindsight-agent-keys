@@ -119,7 +119,7 @@ class NoticeStore(MemoryStore):
             self.runs[day] = now
             self._break("run_reminders")
             for notice in build(self._due(now, max(runs.values(), default=None))):
-                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path)
+                await self.queue_notice(notice.recipients, notice.kind, notice.team, notice.line, notice.path, key_id=notice.key)
         except BaseException:
             self.queue, self.runs = queue, runs
             raise
@@ -157,21 +157,36 @@ class NoticeStore(MemoryStore):
             "sign_ins": [{"email": e, "last_seen": at} for e, at in self.sign_ins.items()],
         }
 
-    async def queue_notice(self, recipients, kind, team, line, path, conn=None):
+    async def queue_notice(self, recipients, kind, team, line, path, conn=None, *, key_id=None):
         self._break("queue_notice")
         await asyncio.sleep(self.hang)
-        self.queue += [(r, kind, team, line, path) for r in recipients]
+        self.queue += [(r, kind, team, line, path, key_id) for r in recipients]
 
     async def queued_recipients(self):
         return sorted({q[0] for q in self.queue})
 
-    def _eligible(self, recipient, kind, team, admins):
+    def _works(self, key, now):
+        """store._WORKS: the key works at `now`, but for its holder's place on the Key Allowlist."""
+        seen = self.sign_ins.get(key["email"])
+        team = key["kind"] == "team" and key["schema"] != "public"
+        return (
+            key["revoked_at"] is None
+            and now < key["expires_at"]
+            and seen is not None
+            and now - seen < timedelta(days=30)
+            and (not team or (key["schema"], key["email"]) in self.team_roles)
+        )
+
+    def _eligible(self, recipient, kind, team, key_id, admins, now):
         listed = recipient in admins or self.roles.get(recipient) in ("member", "admin")
         if kind == "owner":
             return listed and self.team_roles.get((team, recipient)) == "owner"
         if kind == "admin":
             return recipient in admins or self.roles.get(recipient) == "admin"
-        return listed if kind == "holder" else kind == "asker"
+        if kind == "holder":
+            mine = (k for k in self.keys.values() if k["email"] == recipient and key_id in (None, k["id"]))
+            return listed and any(self._works(k, now) for k in mine)
+        return kind == "asker"
 
     async def claim_notice(self, recipient, now, since, admins):
         if any(row["recipient"] == recipient and row["at"] > since for row in self.log):
@@ -180,7 +195,7 @@ class NoticeStore(MemoryStore):
         # A stop here is a stop inside the transaction: it rolls back, and the queue is as it was.
         self._break("claim_notice")
         self.queue = [q for q in self.queue if q[0] != recipient]
-        mine = [q for q in mine if self._eligible(recipient, q[1], q[2], admins)]
+        mine = [q for q in mine if self._eligible(recipient, q[1], q[2], q[5], admins, now)]
         if not mine or recipient in self.optouts:
             return None
         row = {"id": len(self.log) + 1, "recipient": recipient, "at": now, "items": len(mine), "status": "sending", "detail": None}
@@ -189,10 +204,10 @@ class NoticeStore(MemoryStore):
             self.optouts.add(recipient)
         if self.after_claim:
             self.after_claim(recipient)
-        return row["id"], [(line, path, kind, team) for _, kind, team, line, path in mine]
+        return row["id"], [(line, path, kind, team, key_id) for _, kind, team, line, path, key_id in mine]
 
-    async def still_eligible(self, conn, recipient, items, admins):
-        return [self._eligible(recipient, kind, team, admins) for _, _, kind, team in items]
+    async def still_eligible(self, conn, recipient, items, admins, now):
+        return [self._eligible(recipient, kind, team, key_id, admins, now) for _, _, kind, team, key_id in items]
 
     async def finish_notice(self, log_id, status, detail, conn=None):
         self._break("finish_notice")
