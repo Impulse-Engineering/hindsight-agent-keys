@@ -712,7 +712,7 @@ class AgentKeysTenantExtension(TenantExtension):
     async def get_allowed_config_fields(self, context: RequestContext, bank_id: str) -> set[str] | None:
         return HindsightConfig.get_configurable_fields() - DENIED_BANK_FIELDS
 
-    # --- #1002 ---
+    # --- Open Teams ---
 
     async def set_open(self, admin: str, team: str, opened: bool, client_ip: str | None) -> None:
         """An admin opens the Team, so anyone on the Key Allowlist may join it with a live session, or closes it, which keeps
@@ -744,7 +744,7 @@ class AgentKeysTenantExtension(TenantExtension):
             return []
         return [{"team": r["schema"], "name": r["name"], "role": r["role"]} for r in await self._store.open_teams(email)]
 
-    # --- pending_reviews (#1004) ---
+    # --- pending_reviews ---
 
     async def pending_reviews(self, email: str) -> dict:
         """What waits for the person to review, as counts only, so no user-written text reaches an agent: the requests
@@ -756,7 +756,7 @@ class AgentKeysTenantExtension(TenantExtension):
         link = {"link": f"https://{self.access_host}/ext/teams"} if self.access_host else {}
         return {"join_requests": joins, "access_requests": access, **link}
 
-    # --- #1005 ---
+    # --- Webex notices ---
 
     async def webex_notices(self, email: str) -> bool | None:
         """Whether Webex notices to the person are on (they are, unless the person turned them off); None where they
@@ -777,7 +777,8 @@ class AgentKeysTenantExtension(TenantExtension):
         if self.notices is not None:
             await self.notices.tell(build)
 
-    async def _team_name(self, team: str) -> str:
+    async def _shown_team(self, team: str) -> str:
+        """The Team's name, flattened and defanged (`plain`) for a notice."""
         return plain(await self._store.team_name(team) or "")
 
     async def _listed_owners(self, team: str, *, but: str | None = None) -> list[str]:
@@ -796,23 +797,23 @@ class AgentKeysTenantExtension(TenantExtension):
 
     async def _join_requested_notice(self, email: str, team: str, role: str) -> Notice:
         asked = " as an owner" if role == "owner" else ""
-        line = f'{plain(email)} asked to join your Team "{await self._team_name(team)}"{asked}.'
+        line = f'{plain(email)} asked to join your Team "{await self._shown_team(team)}"{asked}.'
         return Notice("owner", await self._listed_owners(team), line, "/ext/teams", team)
 
     async def _member_requested_notice(self, filer: str, team: str, member: str, role: str) -> Notice:
         """An owner or an admin asked for someone else to join: the Team's other owners are told."""
         asked = " as an owner" if role == "owner" else ""
-        line = f'{plain(filer)} asked to add {plain(member)} to your Team "{await self._team_name(team)}"{asked}.'
+        line = f'{plain(filer)} asked to add {plain(member)} to your Team "{await self._shown_team(team)}"{asked}.'
         return Notice("owner", await self._listed_owners(team, but=filer), line, "/ext/teams", team)
 
     async def _request_decided_notice(self, team: str, member: str, asker: str, actor: str, outcome: str) -> Notice:
         """Tells whoever asked, unless they decided it themselves."""
         decided = "approved" if outcome == "confirmed" else "declined"
         asked = "to join" if asker == member else f"to add {plain(member)} to"
-        line = f'Your request {asked} the Team "{await self._team_name(team)}" was {decided}.'
+        line = f'Your request {asked} the Team "{await self._shown_team(team)}" was {decided}.'
         return Notice("asker", [] if asker == actor else [asker], line, "/ext/teams")
 
-    # --- #1006 ---
+    # --- Reminders ---
 
     def _reminders(self, now: datetime, due: dict) -> list[Notice]:
         """The day's reminders, from what store.run_reminders read (`due`). Daily, while it waits: a request untouched

@@ -207,7 +207,7 @@ class AgentKeysHttpExtension(HttpExtension):
             """The kill switch for WorkPlane's retain and recall. Here only: no Delegated Request reaches it."""
             return {"revoked": await _or_refused(memory.tenant_extension.revoke_workplane_keys(email, client_ip(request.headers)))}
 
-        # Open Teams (#1002)
+        # Open Teams
 
         @router.post("/teams/{team}/open")
         async def set_open(team: str, body: Openness, request: Request, email: str = Depends(person)):
@@ -222,7 +222,7 @@ class AgentKeysHttpExtension(HttpExtension):
             joined = {"team": team, "email": email, "role": role or "member"}
             return joined if role else {**joined, "status": "pending"}
 
-        # --- #1005 ---
+        # --- Webex notices ---
 
         @router.post("/webex-notices", status_code=204)
         async def set_webex_notices(body: NoticePreference, email: str = Depends(person)):

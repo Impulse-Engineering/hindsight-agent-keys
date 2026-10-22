@@ -117,9 +117,9 @@ async def test_after_7_days_every_admin_is_reminded_too_and_an_admin_who_owns_th
 async def test_admins_are_reminded_daily_of_a_key_allowlist_request_untouched_more_than_3_days(world):
     world.post(ERIN, "/access-requests", {})
     await settled(world)
-    world.store.asked_at[ERIN] = world.clock.now - timedelta(days=3)
+    world.store.requested_at[ERIN] = world.clock.now - timedelta(days=3)
     # A bootstrap admin is an admin whatever the Key Allowlist still holds for them, so no request of theirs waits.
-    world.store.roles[ADMIN], world.store.asked_at[ADMIN] = "requested", world.clock.now - timedelta(days=9)
+    world.store.roles[ADMIN], world.store.requested_at[ADMIN] = "requested", world.clock.now - timedelta(days=9)
     await remind(world)
     assert world.webex.sent == []
     world.clock.later(days=1)
@@ -235,7 +235,7 @@ async def test_every_value_a_person_wrote_is_flattened_and_defanged_in_a_reminde
     await remind(world)  # the first run
     for person in (DAVE, crafted, GINA):
         world.store.requested_at[team, person] = world.clock.now
-    world.store.asked_at[crafted] = world.clock.now
+    world.store.requested_at[crafted] = world.clock.now
     world.clock.later(days=76)
     world.store.sign_ins[CAROL] = world.clock.now
     await remind(world)
@@ -377,7 +377,7 @@ async def test_a_stop_before_the_days_run_commits_queues_nothing_and_the_next_sw
     world.post(ERIN, "/access-requests", {})
     await settled(world)
     aged(world, DAVE, days=4)
-    world.store.asked_at[ERIN] = world.clock.now - timedelta(days=4)
+    world.store.requested_at[ERIN] = world.clock.now - timedelta(days=4)
     queue_notice = world.store.queue_notice
     if where == "after the day is recorded":
         world.store.break_on["run_reminders"] = Stopped()

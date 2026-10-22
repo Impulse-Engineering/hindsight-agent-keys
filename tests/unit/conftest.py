@@ -78,8 +78,10 @@ class MemoryStore:
         self.team_roles = {}  # (team, email) -> "owner" | "member"
         self.creators = {}  # team -> email
         self.requests = {}  # (team, email) -> (role, requested_by)
-        self.opened = set()  # the schemas of Open Teams (#1002)
-        self.requested_at = {}  # (team, email) -> when the open request was filed; asking again keeps it
+        self.opened = set()  # the schemas of Open Teams
+        # When each request was filed, as the tables' requested_at: a Team's request by (team, email), and a Key Allowlist
+        # request by email. Asking again keeps it.
+        self.requested_at = {}
         # Rows of the stale_schemas view, whose rule only Postgres runs (tests/integration).
         self.stale = []
         self.fail = False
@@ -306,7 +308,7 @@ class MemoryStore:
             key["revoked_at"] = now
         return len(hits)
 
-    # --- #1002 ---
+    # --- Open Teams ---
 
     async def set_open(self, team, opened):
         if team not in self.teams_by_schema:
@@ -327,7 +329,7 @@ class MemoryStore:
     async def open_teams(self, email):
         return [r for r in await self.teams(email, everyone=True) if r["schema"] in self.opened]
 
-    # --- pending_reviews (#1004) ---
+    # --- pending_reviews ---
 
     async def pending_join_requests(self, email, *, admin, older_than):
         return sum(

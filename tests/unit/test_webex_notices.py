@@ -103,7 +103,6 @@ class NoticeStore(MemoryStore):
         self.opts_out_after_claim = None  # a person whose opt-out commits right after their notices are claimed
         self.after_claim = None  # called with the person, right after their notices are claimed: a change committing then
         self.runs = {}  # the days whose reminders were queued -> when
-        self.asked_at = {}  # email -> when their Key Allowlist request was filed (Postgres: DEFAULT now())
 
     def _break(self, name):
         if name in self.break_on:
@@ -131,7 +130,7 @@ class NoticeStore(MemoryStore):
         return {
             "last": last,
             "allowlist": [
-                {"email": e, "role": r, "requested_at": self.asked_at.get(e, datetime.now(UTC))} for e, r in self.roles.items()
+                {"email": e, "role": r, "requested_at": self.requested_at.get(e, datetime.now(UTC))} for e, r in self.roles.items()
             ],
             "requests": [
                 {

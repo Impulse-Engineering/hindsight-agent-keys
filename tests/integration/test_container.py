@@ -1536,7 +1536,7 @@ def test_approving_declining_and_asking_to_join_wait_for_the_teams_lock(hindsigh
     assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": kai}]
 
 
-# --- #1002 ---
+# --- Open Teams ---
 
 
 def test_an_admin_opens_a_team_anyone_listed_joins_it_and_closing_keeps_its_members(hindsight):
