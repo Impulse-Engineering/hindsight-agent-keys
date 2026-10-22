@@ -998,8 +998,8 @@ def test_a_delegate_creates_a_team_adds_a_member_and_their_workplane_team_key_st
     status, made = send("POST", "/teams", olga, {"name": "WP Team"})
     assert status == 200, made
     team = made["team"]
-    # A repeat answers the Team the person owns and creates no second.
-    assert send("POST", "/teams", olga, {"name": "wp team"}) == (200, {"team": team, "name": "wp team"})
+    # A repeat answers the Team the person owns, as stored, and creates no second.
+    assert send("POST", "/teams", olga, {"name": "wp team"}) == (200, {"team": team, "name": "WP Team"})
     assert query(name, "SELECT count(*) AS n FROM agent_keys.teams WHERE lower(name) = 'wp team'") == [{"n": 1}]
     members, creation = f"/teams/{team}/members", f"/teams/{team}/keys"
     for _ in range(2):
@@ -1045,7 +1045,7 @@ def test_a_delegate_creates_a_team_adds_a_member_and_their_workplane_team_key_st
     ]
 
 
-def test_concurrent_identical_delegated_adds_and_removals_change_the_team_once(hindsight):
+def test_concurrent_identical_delegated_adds_removals_and_team_key_creations_change_the_team_once(hindsight):
     port, name, otto, pia = hindsight["port"], hindsight["name"], "otto@example.test", "pia@example.test"
     assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": otto, "role": "member"})[0] == 204
     # Minted once, so the requests below reach the server together.
@@ -1074,6 +1074,60 @@ def test_concurrent_identical_delegated_adds_and_removals_change_the_team_once(h
     change("DELETE", {"email": pia})
     assert query(name, f"SELECT role FROM agent_keys.members WHERE team = '{team}' AND email = '{pia}'") == []
     assert recorded() == ["member_added", "member_removed"]
+
+    # Eight identical Team key creations (one idempotency key) make one key; the rest answer its ID without the key.
+    def create_key(_):
+        path, headers = f"/ext/delegated/teams/{team}/keys", {**sent, "Idempotency-Key": "otto-1"}
+        return http(port, "POST", path, body={"name": "wp"}, headers=headers)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        answers = list(pool.map(create_key, range(8)))
+    assert [status for status, _ in answers] == [200] * 8, answers
+    created = [json.loads(text) for _, text in answers]
+    assert (len({c["id"] for c in created}), sum("key" in c for c in created)) == (1, 1), created
+    sql = f"SELECT kind FROM agent_keys.events WHERE team = '{team}' AND kind = 'key_created'"
+    assert query(name, sql) == [{"kind": "key_created"}]
+
+
+def test_concurrent_identical_delegated_team_creations_answer_one_team_and_migrate_once(hindsight):
+    port, name, quinn, rae = hindsight["port"], hindsight["name"], "quinn@example.test", "rae@example.test"
+    for person in (quinn, rae):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+
+    def sent_for(email):
+        # Minted once, so the creations below reach the server together.
+        return {
+            "Host": DELEGATION_HOST,
+            "Cf-Access-Jwt-Assertion": access_token(name, common_name=DELEGATE_ID, sub="", aud=[DELEGATION_AUD]),
+            "X-Delegated-Access-Jwt": access_token(name, email=email, aud=[WORKPLANE_AUD]),
+        }
+
+    def team_schemas():
+        return query(name, "SELECT count(*) AS n FROM information_schema.schemata WHERE schema_name LIKE 't\\_%'")[0]["n"]
+
+    quinns, raes, before = sent_for(quinn), sent_for(rae), team_schemas()
+
+    def create(n):
+        # Every spelling of the name is one name.
+        body = {"name": ["Racing Team", " racing team"][n % 2]}
+        return http(port, "POST", "/ext/delegated/teams", body=body, headers=quinns)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        answers = list(pool.map(create, range(8)))
+    assert [status for status, _ in answers] == [200] * 8, answers
+    (team,) = {json.loads(text)["team"] for _, text in answers}
+    # Each answers the stored name, whichever spelling created the Team.
+    stored = query(name, "SELECT schema, name FROM agent_keys.teams WHERE lower(name) = 'racing team'")
+    assert stored == [{"schema": team, "name": stored[0]["name"]}]
+    assert {json.loads(text)["name"] for _, text in answers} == {stored[0]["name"]}
+    events = query(name, f"SELECT kind FROM agent_keys.events WHERE team = '{team}'")
+    assert [e["kind"] for e in events] == ["team_created"]
+    # Only the Team's schema was migrated: no loser migrated a schema of its own and left it unlisted.
+    assert team_schemas() == before + 1
+    # Someone else finds the name taken, and migrates nothing.
+    status, text = http(port, "POST", "/ext/delegated/teams", body={"name": "RACING TEAM"}, headers=raes)
+    assert (status, json.loads(text)["detail"]) == (409, "A Team with that name exists.")
+    assert team_schemas() == before + 1
 
 
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):

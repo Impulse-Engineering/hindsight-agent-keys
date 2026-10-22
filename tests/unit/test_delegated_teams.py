@@ -1,8 +1,20 @@
 """A Delegate (WorkPlane) creates Teams and Team keys for the signed-in person, and an owner or admin adds and
 removes members, all with the person's rights: what the key pages and MCP refuse a person, it refuses too."""
 
+import asyncio
+
 import pytest
-from conftest import ACCESS_HOST, DELEGATE_ID, delegated_app, delegated_headers
+from conftest import (
+    ACCESS_HOST,
+    DELEGATE_ID,
+    Migrations,
+    delegated_app,
+    delegated_headers,
+)
+from test_delegated_keys import on_the_key_page
+from test_delegation import logged
+
+from hindsight_agent_keys.store import Refused
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -26,11 +38,6 @@ def team_key(client, team, schema, name="workplane", idempotency_key="k1", email
     return send(client, team, "POST", f"{TEAMS}/{schema}/keys", {"name": name}, email, **{"Idempotency-Key": idempotency_key})
 
 
-def logged(events):
-    """What each recorded event names, as the event log would: kind, person, actor, Team, channel, Delegate."""
-    return [(r["kind"], r["email"], r["actor"], r["team"], r["channel"], r["delegate"]) for r in events.rows]
-
-
 async def test_a_delegate_creates_a_team_and_a_workplane_marked_team_key_for_the_person(team):
     client, ext, events = delegated_app(team)
     ext._store.roles[ALICE] = "member"
@@ -47,17 +54,24 @@ async def test_a_delegate_creates_a_team_and_a_workplane_marked_team_key_for_the
     listed = send(client, team, "GET", KEYS).json()
     assert [(k["id"], k["via"]) for k in listed] == [(created["id"], DELEGATE_ID)]
     assert logged(events) == [
-        ("team_created", ALICE, ALICE, schema, "delegated", DELEGATE_ID),
-        ("key_created", ALICE, ALICE, schema, "delegated", DELEGATE_ID),
+        ("team_created", ALICE, ALICE, "delegated", DELEGATE_ID),
+        ("key_created", ALICE, ALICE, "delegated", DELEGATE_ID),
     ]
+    assert [r["team"] for r in events.rows] == [schema, schema]
 
 
 @pytest.mark.parametrize(
-    ("role", "member"),
-    [(None, True), ("requested", True), ("member", False)],
-    ids=["off the Key Allowlist, though a member", "only asked to join, though a member", "listed, but not in the Team"],
+    ("role", "member", "public"),
+    [(None, True, False), ("requested", True, False), ("member", False, False), (None, False, True), ("requested", False, True)],
+    ids=[
+        "off the Key Allowlist, though a member",
+        "only asked to join, though a member",
+        "listed, but not in the Team",
+        "off the Key Allowlist, for the Public Team",
+        "only asked to join, for the Public Team",
+    ],
 )
-async def test_a_team_key_needs_a_person_on_the_key_allowlist_who_is_in_the_team(team, role, member):
+async def test_a_team_key_needs_a_person_on_the_key_allowlist_who_is_in_the_team(team, role, member, public):
     client, ext, events = delegated_app(team)
     ext._store.roles[CAROL] = "member"
     schema = await ext.create_team(CAROL, "Platform", None)
@@ -66,9 +80,20 @@ async def test_a_team_key_needs_a_person_on_the_key_allowlist_who_is_in_the_team
     if role:
         ext._store.roles[ALICE] = role
     before = len(events.rows)
-    resp = team_key(client, team, schema)
+    resp = team_key(client, team, "public" if public else schema)
     assert resp.status_code == 403, resp.text
     assert (ext._store.keys, len(events.rows)) == ({}, before)
+
+
+async def test_a_listed_person_gets_a_workplane_marked_public_team_key_without_being_a_member(team):
+    client, ext, events = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    resp = team_key(client, team, "public")
+    assert resp.status_code == 200, resp.text
+    principal = await ext.principal(resp.json()["key"])
+    assert (principal.kind, principal.schema, principal.email) == ("team", "public", ALICE)
+    assert [(k["id"], k["via"]) for k in send(client, team, "GET", KEYS).json()] == [(resp.json()["id"], DELEGATE_ID)]
+    assert logged(events) == [("key_created", ALICE, ALICE, "delegated", DELEGATE_ID)]
 
 
 async def test_team_keys_count_with_the_persons_other_workplane_keys_and_not_with_their_own(team):
@@ -105,12 +130,13 @@ async def test_an_owner_and_an_admin_add_and_remove_members_directly_and_each_ch
     # A removed member's Team key is refused on its next request.
     assert await ext.principal(key) is None
     assert logged(events) == [
-        ("member_added", BOB, ALICE, schema, "delegated", DELEGATE_ID),
-        ("owner_added", CAROL, ADMIN, schema, "delegated", DELEGATE_ID),
-        ("key_created", BOB, BOB, schema, "delegated", DELEGATE_ID),
-        ("member_removed", BOB, ALICE, schema, "delegated", DELEGATE_ID),
-        ("member_removed", CAROL, ADMIN, schema, "delegated", DELEGATE_ID),
+        ("member_added", BOB, ALICE, "delegated", DELEGATE_ID),
+        ("owner_added", CAROL, ADMIN, "delegated", DELEGATE_ID),
+        ("key_created", BOB, BOB, "delegated", DELEGATE_ID),
+        ("member_removed", BOB, ALICE, "delegated", DELEGATE_ID),
+        ("member_removed", CAROL, ADMIN, "delegated", DELEGATE_ID),
     ]
+    assert {r["team"] for r in events.rows} == {schema}
 
 
 DAVE = "dave@example.com"
@@ -161,7 +187,8 @@ async def test_a_repeated_team_creation_answers_the_team_the_person_owns(team):
     ext._store.roles.update({ALICE: "member", BOB: "member", CAROL: "member"})
     first = send(client, team, "POST", TEAMS, {"name": "Platform"}).json()
     again = send(client, team, "POST", TEAMS, {"name": " platform "})
-    assert (again.status_code, again.json()["team"]) == (200, first["team"])
+    # The current state: the Team's stored name, not the spelling this request used.
+    assert (again.status_code, again.json()) == (200, first)
     assert (ext.context.schemas, [r["kind"] for r in events.rows]) == ([first["team"]], ["team_created"])
     # Only an owner of that Team gets it back: a member, or anyone else, finds the name taken.
     await ext.set_member(ALICE, first["team"], BOB, "member", None)
@@ -169,6 +196,76 @@ async def test_a_repeated_team_creation_answers_the_team_the_person_owns(team):
         resp = send(client, team, "POST", TEAMS, {"name": "Platform"}, email)
         assert (resp.status_code, resp.json()["detail"]) == (409, "A Team with that name exists.")
     assert ext.context.schemas == [first["team"]]
+
+
+async def test_a_retry_after_an_unrecorded_change_answers_the_current_state_and_records_nothing(team):
+    client, ext, events = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    # Each change is stored but its event is not (the event log failed, or the process stopped between them).
+    events.fail = True
+    schema = send(client, team, "POST", TEAMS, {"name": "Platform"}).json()["team"]
+    members = f"{TEAMS}/{schema}/members"
+    for method, email in (("POST", BOB), ("POST", CAROL), ("DELETE", CAROL)):
+        assert send(client, team, method, members, {"email": email, "role": "member"}).status_code == 200
+    events.fail = False
+    assert send(client, team, "POST", TEAMS, {"name": "Platform"}).json()["team"] == schema
+    for method, email in (("POST", BOB), ("DELETE", CAROL)):
+        assert send(client, team, method, members, {"email": email, "role": "member"}).status_code == 200
+    assert events.rows == []
+    assert [m["email"] for m in (await ext.teams(ALICE))[0]["members"]] == [ALICE, BOB]
+
+
+async def test_team_creation_keeps_the_teams_pages_terms(team):
+    client, ext, _ = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    for n in range(10):
+        await ext.create_team(ALICE, f"Team {n}", None)
+    resp = send(client, team, "POST", TEAMS, {"name": "One more"})
+    assert (resp.status_code, resp.json()["detail"]) == (429, "You can create at most 10 Teams.")
+    # The name of a Team they own is still answered at the limit; the Public Team's name is reserved.
+    assert send(client, team, "POST", TEAMS, {"name": "team 3"}).json() == {"team": ext.context.schemas[3], "name": "Team 3"}
+    assert send(client, team, "POST", TEAMS, {"name": "Public"}).status_code == 409
+    assert len(ext.context.schemas) == 10
+
+
+@pytest.mark.parametrize(
+    "body", [{"email": "not-an-email", "role": "member"}, {"email": BOB, "role": "admin"}, {"email": BOB}], ids=str
+)
+async def test_a_member_change_needs_an_email_and_a_role_of_member_or_owner(team, body):
+    client, ext, events = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+    schema = await ext.create_team(ALICE, "Platform", None)
+    before = len(events.rows)
+    assert send(client, team, "POST", f"{TEAMS}/{schema}/members", body).status_code == 422
+    assert ([m["email"] for m in await ext._store.members(schema)], len(events.rows)) == ([ALICE], before)
+
+
+class SlowMigrations(Migrations):
+    """Yields while migrating, as the real migration does, so concurrent creations interleave."""
+
+    async def run_migration(self, schema):
+        await asyncio.sleep(0)
+        await super().run_migration(schema)
+
+
+async def test_concurrent_creations_of_one_name_migrate_once_and_the_loser_finds_the_team(team):
+    _, ext, events = delegated_app(team)
+    ext.set_context(SlowMigrations())
+    ext._store.roles.update({ALICE: "member", BOB: "member"})
+    delegated = [ext.create_team(ALICE, "Platform", None, delegated_repeat=True) for _ in range(4)]
+    stranger = ext.create_team(BOB, "platform", None, delegated_repeat=True)
+    *answers, refused = await asyncio.gather(*delegated, stranger, return_exceptions=True)
+    # The owner's repeats all answer the winner's Team; anyone else finds the name taken. One schema, one event.
+    (schema,) = ext.context.schemas
+    assert answers == [schema] * 4
+    assert (type(refused), refused.status) == (Refused, 409)
+    assert [r["kind"] for r in events.rows] == ["team_created"]
+    # The key page and MCP get no repeat shortcut, but the loser still leaves no schema behind.
+    first, second = await asyncio.gather(
+        ext.create_team(ALICE, "Support", None), ext.create_team(ALICE, "support", None), return_exceptions=True
+    )
+    assert (isinstance(first, str), (type(second), second.status)) == (True, (Refused, 409))
+    assert len(ext.context.schemas) == 2
 
 
 async def test_a_repeated_team_key_creation_returns_the_same_id_without_the_key(team):
@@ -194,17 +291,6 @@ async def test_a_team_key_creation_needs_an_idempotency_key(team, idempotency_ke
     headers = {k: v for k, v in {**delegated_headers(team), "Idempotency-Key": idempotency_key}.items() if v is not None}
     assert client.post(f"{TEAMS}/{schema}/keys", json={"name": "workplane"}, headers=headers).status_code == 422
     assert (ext._store.keys, len(events.rows)) == ({}, before)
-
-
-def on_the_key_page(team, email):
-    """A request from the person on /ext, as the key page's script sends it."""
-    return {
-        "Host": ACCESS_HOST,
-        "Cf-Access-Jwt-Assertion": team.token(email=email),
-        "Content-Type": "application/json",
-        "X-Agent-Keys": "1",
-        "Origin": f"https://{ACCESS_HOST}",
-    }
 
 
 @pytest.mark.parametrize("bobs_key_from", ["a Delegated Request", "the key page"])

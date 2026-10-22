@@ -99,9 +99,11 @@ def delegated_router(memory) -> APIRouter:
 
     @router.post("/teams")
     async def create_team(body: NewTeam, request: Request, email: str = Depends(delegated_person)):
-        """A Team with the person as its first owner. The name of a Team they own answers that Team, creating nothing."""
-        creation = memory.tenant_extension.create_team(email, body.name, client_ip(request.headers), repeat_ok=True)
-        return {"team": await _or_refused(creation), "name": body.name}
+        """A Team with the person as its first owner. The name of a Team they own answers that Team as stored,
+        creating nothing."""
+        keys = memory.tenant_extension
+        team = await _or_refused(keys.create_team(email, body.name, client_ip(request.headers), delegated_repeat=True))
+        return {"team": team, "name": await keys.team_name(team)}
 
     @router.post("/teams/{team}/keys")
     async def create_team_key(
@@ -127,7 +129,7 @@ def delegated_router(memory) -> APIRouter:
     async def set_member(team: str, body: Member, request: Request, email: str = Depends(delegated_person)):
         """Add the member, or change their role. A repeat changes nothing."""
         change = memory.tenant_extension.set_member(
-            email, team, body.email, body.role, client_ip(request.headers), repeat_ok=True
+            email, team, body.email, body.role, client_ip(request.headers), delegated_repeat=True
         )
         await _or_refused(change)
         return {"team": team, "email": body.email, "role": body.role}
@@ -135,7 +137,7 @@ def delegated_router(memory) -> APIRouter:
     @router.delete("/teams/{team}/members")
     async def remove_member(team: str, body: FormerMember, request: Request, email: str = Depends(delegated_person)):
         """Their Team keys stop on their next request. A repeat changes nothing."""
-        removal = memory.tenant_extension.remove_member(email, team, body.email, client_ip(request.headers), repeat_ok=True)
+        removal = memory.tenant_extension.remove_member(email, team, body.email, client_ip(request.headers), delegated_repeat=True)
         await _or_refused(removal)
         return {"team": team, "email": body.email}
 

@@ -1,6 +1,8 @@
 """Stand-ins for what the extension talks to: its database, Hindsight's migrations,
 the event log, and a Cloudflare Access team that serves signing keys and signs JWTs."""
 
+import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -80,6 +82,7 @@ class MemoryStore:
         self.stale = []
         self.fail = False
         self.idempotency = {}  # (delegate, email, key) -> body_sha256, key_id, created_at
+        self.name_locks = {}  # lower-cased Team name -> asyncio.Lock
 
     async def stale_schemas(self):
         return self.stale
@@ -262,6 +265,14 @@ class MemoryStore:
 
     async def last_sign_in(self, email):
         return self.sign_ins.get(email)
+
+    async def team_name(self, team):
+        return self.teams_by_schema.get(team)
+
+    @contextlib.asynccontextmanager
+    async def team_name_lock(self, name):
+        async with self.name_locks.setdefault(name.strip().lower(), asyncio.Lock()):
+            yield
 
 
 class Migrations(ExtensionContext):

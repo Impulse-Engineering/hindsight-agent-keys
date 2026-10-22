@@ -1,6 +1,7 @@
 """Agent Keys and the people who hold them, kept in the extension's own schema."""
 
 import asyncio
+import contextlib
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 
@@ -451,3 +452,26 @@ class PostgresKeyStore:
         """When the person last signed in through Access, as `signed_in` recorded it."""
         pool = await self._get_pool()
         return await pool.fetchval(f"SELECT last_seen FROM {SCHEMA}.sign_ins WHERE email = $1", email)
+
+    async def team_name(self, team: str) -> str | None:
+        """The Team's name as it was created, None if there is no such Team."""
+        pool = await self._get_pool()
+        return await pool.fetchval(f"SELECT name FROM {SCHEMA}.teams WHERE schema = $1", team)
+
+    @contextlib.asynccontextmanager
+    async def team_name_lock(self, name: str):
+        """Hold a lock on the Team name, in any case, across API processes. It takes a connection of its own,
+        not one of the pool's, so waiting for it, or a migration under it, never starves the key lookups."""
+        conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
+        try:
+            # Postgres's own lower(), the one the unique index on the name uses. A waiter polls: a statement left
+            # waiting for the lock holds a transaction open, and the migration under the lock creates indexes
+            # concurrently, which waits for every open transaction to finish, so a blocked waiter would deadlock it.
+            while not await conn.fetchval(
+                "SELECT pg_try_advisory_lock(hashtext(lower($1)))", f"{SCHEMA}.team_name:{name.strip()}"
+            ):
+                await asyncio.sleep(0.1)
+            yield
+        finally:
+            # Closing the connection releases the lock, on a failure too.
+            await conn.close()
