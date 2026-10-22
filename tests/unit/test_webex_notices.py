@@ -760,6 +760,30 @@ async def test_the_other_owners_hear_when_an_owner_or_an_admin_files_a_request_f
     ]
 
 
+async def test_a_repeat_of_an_agents_open_request_records_and_tells_nobody_but_a_change_of_role_or_asker_does(world):
+    key = (world.schema, DAVE)
+    await world.ext.request_member(ALICE, world.schema, DAVE, "member", None)
+    filed = world.store.requested_at[key]
+    await world.send()
+    world.webex.sent.clear()
+    world.clock.later(minutes=20)
+    recorded = len(world.events.rows)
+    await world.ext.request_member(ALICE, world.schema, DAVE, "member", None)  # the same request again
+    await world.send()
+    assert (len(world.events.rows), world.webex.sent, world.store.queue) == (recorded, [], [])
+    # A new role, then a new asker: each is recorded and told to the other owners, and the date it was filed stays.
+    await world.ext.request_member(ALICE, world.schema, DAVE, "owner", None)
+    await world.ext.request_member(BOB, world.schema, DAVE, "owner", None)
+    await world.ext.request_member(BOB, world.schema, DAVE, "owner", None)
+    await world.send()
+    assert [(r["kind"], r["actor"]) for r in world.events.rows[recorded:]] == [("owner_requested", ALICE), ("owner_requested", BOB)]
+    assert (world.store.requests[key], world.store.requested_at[key]) == (("owner", BOB), filed)
+    assert world.webex.sent == [
+        (ALICE, f'Hindsight:\n- {BOB} asked to add {DAVE} to your Team "Platform" as an owner.\nSee {TEAMS}'),
+        (BOB, f'Hindsight:\n- {ALICE} asked to add {DAVE} to your Team "Platform" as an owner.\nSee {TEAMS}'),
+    ]
+
+
 async def test_a_direct_add_that_settles_a_request_tells_whoever_asked_unless_they_added_the_person(world):
     await world.ext.request_to_join(DAVE, "Platform", None)  # DAVE asked for themselves
     await world.ext.request_member(ALICE, world.schema, GINA, "member", None)  # ALICE asked for GINA

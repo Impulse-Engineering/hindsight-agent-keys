@@ -144,7 +144,7 @@ class MemoryStore:
 
     async def request_member(self, team, email, role, by):
         self._change_members(team, lambda roles: None)
-        if not self._waiting(team, email, role):
+        if not self._waiting(team, email, role) or self.requests.get((team, email)) == (role, by):
             return False
         self.requests[team, email] = (role, by)
         self.requested_at.setdefault((team, email), datetime.now(UTC))

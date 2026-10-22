@@ -505,15 +505,18 @@ class PostgresKeyStore:
         )
 
     async def request_member(self, team: str, email: str, role: str, by: str) -> bool:
-        """Ask for the person to get this role in the Team, replacing an earlier request for them; True if filed. Nothing
-        is filed for someone in the Team already at that role, or as an owner: it would wait for nothing (`_WAITING`)."""
+        """Ask for the person to get this role in the Team, replacing an earlier request for them; True if filed or changed.
+        Nothing is filed for someone in the Team already at that role, or as an owner: it would wait for nothing (`_WAITING`).
+        The same role from the same asker again is no change (False), and `requested_at` is never reset."""
         return bool(
             await self._change_members(
                 team,
-                f"INSERT INTO {SCHEMA}.member_requests (team, email, role, requested_by)"
+                f"INSERT INTO {SCHEMA}.member_requests AS q (team, email, role, requested_by)"
                 f" SELECT r.team, r.email, r.role, $4::text FROM (SELECT $1::text AS team, $2::text AS email, $3::text AS role) r"
                 f" WHERE {_WAITING}"
-                " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role, requested_by = excluded.requested_by RETURNING true",
+                " ON CONFLICT (team, email) DO UPDATE SET role = excluded.role, requested_by = excluded.requested_by"
+                # No row comes back for an identical repeat, so it is not recorded or announced again.
+                " WHERE (q.role, q.requested_by) IS DISTINCT FROM (excluded.role, excluded.requested_by) RETURNING true",
                 email,
                 role,
                 by,

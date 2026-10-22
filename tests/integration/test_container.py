@@ -1738,6 +1738,35 @@ def test_no_request_waits_for_someone_in_the_team_and_a_join_settles_an_agents_r
     sql = f"SELECT kind, email FROM agent_keys.events WHERE team = '{team}' AND kind ~ '_(requested|confirmed|declined)$' ORDER BY id"
     assert query(name, sql) == [{"kind": "member_requested", "email": joiner}]
 
+
+def test_an_agents_repeated_request_stores_and_records_nothing_and_a_change_of_role_or_asker_does_in_postgres(hindsight):
+    name, port, multi = hindsight["name"], hindsight["port"], MCP_ENDPOINTS[0]
+    # Each person is this test's own: a key created for one of the shared people spends an hour's creations the others need.
+    owner, coowner, joiner = (f"repeat-{who}-{RUN}@example.test" for who in ("owner", "coowner", "joiner"))
+    for person in (owner, coowner, joiner):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    keys = {person: personal_key(hindsight, person)["key"] for person in (owner, coowner)}
+    team = team_page(hindsight, "POST", "/ext/teams", owner, {"name": f"Repeat {RUN}"})["team"]
+    team_page(hindsight, "POST", f"/ext/teams/{team}/members", owner, {"email": coowner, "role": "owner"})
+    row = f"SELECT role, requested_by, requested_at < now() - interval '4 days' AS aged FROM agent_keys.member_requests WHERE team = '{team}'"
+    sql = f"SELECT kind, actor FROM agent_keys.events WHERE team = '{team}' AND kind ~ '_requested$' ORDER BY id"
+
+    def ask(asker, role):
+        return call_tool(port, keys[asker], multi, "add_team_member", team=team, email=joiner, role=role)
+
+    ask(owner, "member")
+    query(name, f"UPDATE agent_keys.member_requests SET requested_at = now() - interval '5 days' WHERE team = '{team}' RETURNING email")
+    # The same request again, as it stands after each change, stores and records nothing; a change of role, then of asker,
+    # replaces the request and records it, and the date it was first filed stays.
+    for asker, role in [(owner, "member"), (owner, "owner"), (owner, "owner"), (coowner, "owner"), (coowner, "owner")]:
+        ask(asker, role)
+        assert query(name, row) == [{"role": role, "requested_by": asker, "aged": True}]
+    assert query(name, sql) == [
+        {"kind": "member_requested", "actor": owner},
+        {"kind": "owner_requested", "actor": owner},
+        {"kind": "owner_requested", "actor": coowner},
+    ]
+
 # Webex notices. The container runs without a bot token, so no background sweep competes with these for the queue
 # (the sweep, the messages and the HTTP routes are in tests/unit). They call the store the extension uses, and need
 # no Agent Key, so they spend no one's creations: every address carries RUN.
