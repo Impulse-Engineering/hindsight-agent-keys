@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.idempotency (
 );
 -- #1002: an Open Team, which anyone on the Key Allowlist joins without asking; only admins open or close one.
 ALTER TABLE {SCHEMA}.teams ADD COLUMN IF NOT EXISTS open boolean NOT NULL DEFAULT false;
+-- #1004: when the request was filed, so an admin hears of Join Requests left waiting. Asking again keeps it.
+ALTER TABLE {SCHEMA}.member_requests ADD COLUMN IF NOT EXISTS requested_at timestamptz NOT NULL DEFAULT now();
 """
 
 
@@ -563,3 +565,19 @@ class PostgresKeyStore:
             f" LEFT JOIN {SCHEMA}.members m ON m.team = t.schema AND m.email = $1 WHERE t.open ORDER BY lower(t.name)",
             email,
         )
+
+    # --- pending_reviews (#1004) ---
+
+    async def pending_review_counts(self, email: str, *, admin: bool, older_than: datetime) -> tuple[int, int]:
+        """What waits for the person: (requests to join the Teams they own, and for an admin those for any other
+        Team filed before `older_than`; the people who asked for a place on the Key Allowlist, for an admin only)."""
+        pool = await self._get_pool()
+        joins, access = await pool.fetchrow(
+            f"SELECT (SELECT count(*) FROM {SCHEMA}.member_requests r WHERE ($2::boolean AND r.requested_at < $3) OR EXISTS"
+            f" (SELECT 1 FROM {SCHEMA}.members m WHERE m.team = r.team AND m.email = $1 AND m.role = 'owner')),"
+            f" (SELECT count(*) FROM {SCHEMA}.allowlist WHERE $2::boolean AND role = 'requested')",
+            email,
+            admin,
+            older_than,
+        )
+        return joins, access
