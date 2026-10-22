@@ -1492,6 +1492,143 @@ def test_approving_declining_and_asking_to_join_wait_for_the_teams_lock(hindsigh
     assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": kai}]
 
 
+# --- #1002 ---
+
+
+def test_an_admin_opens_a_team_anyone_listed_joins_it_and_closing_keeps_its_members(hindsight):
+    name = hindsight["name"]
+    gus, hal, ida, jay = (f"{n}@example.test" for n in ("gus", "hal", "ida", "jay"))
+    for person in (gus, hal, ida, jay):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+
+    def send(method, path, email, body=None):
+        status, text = delegated(hindsight, method, f"/ext/delegated{path}", email, body=body)
+        return status, json.loads(text)
+
+    team = send("POST", "/teams", gus, {"name": "Open Team"})[1]["team"]
+    # Only an admin opens it, its owner included.
+    assert send("POST", f"/teams/{team}/open", gus, {"open": True})[0] == 403
+    assert send("GET", "/open-teams", hal) == (200, [])
+    # Hal asks to join while it is closed; his request outlives his join below.
+    assert send("POST", "/join-requests", hal, {"name": "open team"}) == (200, {"name": "open team", "status": "pending"})
+    for _ in range(2):
+        assert send("POST", f"/teams/{team}/open", ALICE, {"open": True}) == (200, {"team": team, "open": True})
+    assert send("GET", "/open-teams", hal) == (200, [{"team": team, "name": "Open Team", "role": None}])
+    # Hal joins by Delegated Request and Ida on the Teams page, each once however often they ask.
+    joined = {"team": team, "role": "member"}
+    for _ in range(2):
+        assert send("POST", f"/teams/{team}/join", hal, {}) == (200, {**joined, "email": hal})
+        status, text = key_page(hindsight, "POST", f"/ext/teams/{team}/join", ida, body={})
+        assert (status, json.loads(text)) == (200, {**joined, "email": ida}), text
+    assert key_page(hindsight, "POST", f"/ext/teams/{team}/keys", hal, body={"name": "ci"})[0] == 200
+    # Closing keeps them; Jay then files a Join Request.
+    status, text = key_page(hindsight, "POST", f"/ext/teams/{team}/open", ALICE, body={"open": False})
+    assert (status, json.loads(text)) == (200, {"team": team, "open": False}), text
+    assert send("POST", f"/teams/{team}/join", jay, {}) == (200, {**joined, "email": jay, "status": "pending"})
+    assert send("GET", "/open-teams", hal) == (200, [])
+    assert query(name, f"SELECT email, role FROM agent_keys.members WHERE team = '{team}' ORDER BY email") == [
+        {"email": gus, "role": "owner"}, {"email": hal, "role": "member"}, {"email": ida, "role": "member"}
+    ]
+    requests = f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}' ORDER BY email"
+    assert query(name, requests) == [{"email": hal}, {"email": jay}]
+    kinds = "('team_opened', 'team_closed', 'member_joined', 'join_requested')"
+    sql = f"SELECT kind, email, actor, channel FROM agent_keys.events WHERE team = '{team}' AND kind IN {kinds} ORDER BY id"
+    assert [(r["kind"], r["email"], r["actor"], r["channel"]) for r in query(name, sql)] == [
+        ("join_requested", hal, hal, "delegated"),
+        ("team_opened", None, ALICE, "delegated"),
+        ("member_joined", hal, hal, "delegated"),
+        ("member_joined", ida, ida, "ext"),
+        ("team_closed", None, ALICE, "ext"),
+        ("join_requested", jay, jay, "delegated"),
+    ]
+
+
+def test_joining_an_open_team_waits_for_the_teams_lock_and_a_concurrent_approval_makes_one_membership(hindsight):
+    port, name = hindsight["port"], hindsight["name"]
+    kim, lee, ned = (f"{n}@example.test" for n in ("kim", "lee", "ned"))
+    for person in (kim, lee, ned):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    kim_sent, lee_sent, ned_sent, alice_sent = (delegated_headers(hindsight, person) for person in (kim, lee, ned, ALICE))
+    status, text = http(port, "POST", "/ext/delegated/teams", body={"name": "Lock Open Team"}, headers=kim_sent)
+    assert status == 200, text
+    team = json.loads(text)["team"]
+    base = f"/ext/delegated/teams/{team}"
+    assert http(port, "POST", "/ext/delegated/join-requests", body={"name": "lock open team"}, headers=lee_sent)[0] == 200
+    assert http(port, "POST", f"{base}/open", body={"open": True}, headers=alice_sent)[0] == 200
+    hold = 8
+    docker("exec", "-d", name, PYTHON, "-c", f"TEAM = {team!r}\nHOLD = {hold}\n{HOLD_TEAM_LOCK}")
+    deadline = time.time() + 30
+    while docker("exec", name, "test", "-e", f"/tmp/held-{team}", check=False).returncode:
+        assert time.time() < deadline, "the lock was never taken"
+        time.sleep(0.2)
+    started = time.time()
+
+    def answer(call):
+        path, body, sent = call
+        status = http(port, "POST", path, body=body, headers=sent)[0]
+        return status, time.time() - started
+
+    calls = [
+        (f"{base}/confirmations", {"email": lee, "role": "member"}, kim_sent),
+        (f"{base}/join", {}, lee_sent),
+        (f"{base}/join", {}, lee_sent),
+        (f"{base}/join", {}, ned_sent),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        answers = list(pool.map(answer, calls))
+    # Each answered, and only once the holder let go: every join takes the Team's lock.
+    assert [status for status, _ in answers] == [200] * len(calls), answers
+    assert min(waited for _, waited in answers) >= hold - 4, answers
+    assert query(name, f"SELECT email, role FROM agent_keys.members WHERE team = '{team}' ORDER BY email") == [
+        {"email": kim, "role": "owner"}, {"email": lee, "role": "member"}, {"email": ned, "role": "member"}
+    ]
+    assert query(name, f"SELECT count(*)::int AS n FROM agent_keys.member_requests WHERE team = '{team}'") == [{"n": 0}]
+
+
+# Backends waiting for a Team's lock in a close or a join (the holder above takes FOR NO KEY UPDATE, and does not wait).
+TEAM_LOCK_WAITERS = (
+    "SELECT count(*)::int AS n FROM pg_stat_activity"
+    " WHERE wait_event_type = 'Lock' AND query LIKE '%agent_keys.teams WHERE schema = $1 FOR UPDATE%'"
+)
+
+
+def test_a_join_that_waits_for_a_closing_finds_the_team_closed_and_files_a_join_request(hindsight):
+    port, name = hindsight["port"], hindsight["name"]
+    oli, pia = (f"{n}@example.test" for n in ("oli", "pia"))
+    for person in (oli, pia):
+        assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
+    oli_sent, pia_sent, alice_sent = (delegated_headers(hindsight, person) for person in (oli, pia, ALICE))
+    status, text = http(port, "POST", "/ext/delegated/teams", body={"name": "Closing Team"}, headers=oli_sent)
+    assert status == 200, text
+    team = json.loads(text)["team"]
+    base = f"/ext/delegated/teams/{team}"
+    assert http(port, "POST", f"{base}/open", body={"open": True}, headers=alice_sent)[0] == 200
+    hold = 15
+    docker("exec", "-d", name, PYTHON, "-c", f"TEAM = {team!r}\nHOLD = {hold}\n{HOLD_TEAM_LOCK}")
+    deadline = time.time() + 30
+    while docker("exec", name, "test", "-e", f"/tmp/held-{team}", check=False).returncode:
+        assert time.time() < deadline, "the lock was never taken"
+        time.sleep(0.2)
+    started = time.time()
+
+    def waiters(n, done=lambda: False):
+        while query(name, TEAM_LOCK_WAITERS)[0]["n"] < n and not done():
+            assert time.time() < started + hold - 2, f"fewer than {n} requests waited for the lock"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        # The closing queues first, so Postgres hands it the Team's row first when the holder lets go.
+        closing = pool.submit(http, port, "POST", f"{base}/open", body={"open": False}, headers=alice_sent)
+        waiters(1)
+        joining = pool.submit(http, port, "POST", f"{base}/join", body={}, headers=pia_sent)
+        waiters(2, joining.done)
+        closed, joined = closing.result(), joining.result()
+    assert time.time() - started >= hold - 4
+    assert (closed[0], json.loads(closed[1])) == (200, {"team": team, "open": False})
+    assert (joined[0], json.loads(joined[1])) == (200, {"team": team, "email": pia, "role": "member", "status": "pending"})
+    assert query(name, f"SELECT email FROM agent_keys.members WHERE team = '{team}'") == [{"email": oli}]
+    assert query(name, f"SELECT email FROM agent_keys.member_requests WHERE team = '{team}'") == [{"email": pia}]
+
+
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
     # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.

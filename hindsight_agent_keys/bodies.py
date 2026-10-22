@@ -43,6 +43,10 @@ class Identity(BaseModel):
     email: Email
 
 
+class Openness(BaseModel):
+    open: bool  # true opens the Team, false closes it
+
+
 async def _or_refused(change: Awaitable):
     """The change's result; a refusal becomes its HTTP status with the reason as detail."""
     try:
