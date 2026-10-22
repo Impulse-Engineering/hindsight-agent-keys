@@ -2,6 +2,7 @@
 removes members, all with the person's rights: what the key pages and MCP refuse a person, it refuses too."""
 
 import asyncio
+import contextlib
 
 import pytest
 from conftest import (
@@ -14,6 +15,7 @@ from conftest import (
 from test_delegated_keys import on_the_key_page
 from test_delegation import logged
 
+from hindsight_agent_keys import store
 from hindsight_agent_keys.store import Refused
 
 ALICE = "alice@example.com"
@@ -238,6 +240,60 @@ async def test_a_member_change_needs_an_email_and_a_role_of_member_or_owner(team
     before = len(events.rows)
     assert send(client, team, "POST", f"{TEAMS}/{schema}/members", body).status_code == 422
     assert ([m["email"] for m in await ext._store.members(schema)], len(events.rows)) == ([ALICE], before)
+
+
+class LockedElsewhere:
+    """A connection whose try-lock never succeeds: another request holds the Team name."""
+
+    def __init__(self):
+        self.polls = 0
+        self.closed = False
+
+    async def fetchval(self, *args):
+        self.polls += 1
+        return False
+
+    async def close(self):
+        self.closed = True
+
+
+async def test_a_waiter_for_a_team_name_is_refused_after_a_deadline_and_gives_back_its_connection(monkeypatch):
+    conn = LockedElsewhere()
+
+    async def connect(dsn):
+        return conn
+
+    async def db_url():
+        return "postgresql://unused"
+
+    monkeypatch.setattr(store.asyncpg, "connect", connect)
+    monkeypatch.setattr(store, "TEAM_NAME_LOCK_WAIT", 0.2)
+    monkeypatch.setattr(store, "TEAM_NAME_LOCK_POLL", 0.01)
+
+    async def wait_for_the_name():
+        async with store.PostgresKeyStore(db_url).team_name_lock("Platform"):
+            raise AssertionError("the lock is held elsewhere")
+
+    # Bounded here too, so a waiter that never gives up fails this test rather than hangs it.
+    with pytest.raises(Refused) as refusal:
+        await asyncio.wait_for(wait_for_the_name(), timeout=5)
+    assert (refusal.value.status, "try again" in str(refusal.value)) == (503, True)
+    assert (conn.closed, conn.polls > 1) == (True, True)
+
+
+def test_a_creation_whose_name_is_busy_for_too_long_answers_503_and_migrates_nothing(team, monkeypatch):
+    client, ext, events = delegated_app(team)
+    ext._store.roles[ALICE] = "member"
+
+    @contextlib.asynccontextmanager
+    async def busy(name):
+        raise Refused(503, "Another request is creating that Team; try again in a minute.")
+        yield
+
+    monkeypatch.setattr(ext._store, "team_name_lock", busy)
+    resp = send(client, team, "POST", TEAMS, {"name": "Platform"})
+    assert (resp.status_code, "try again" in resp.json()["detail"]) == (503, True)
+    assert (ext.context.schemas, ext._store.teams_by_schema, events.rows) == ([], {}, [])
 
 
 class SlowMigrations(Migrations):

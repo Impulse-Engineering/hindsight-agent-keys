@@ -14,6 +14,9 @@ CREATIONS_PER_HOUR = 5
 ACTIVE_KEYS = 10
 # Each Team is a migrated schema, and agents can create them.
 TEAMS_PER_PERSON = 10
+# A creation waits this many seconds, polling this often, for the Team name another creation holds.
+TEAM_NAME_LOCK_WAIT = 60.0
+TEAM_NAME_LOCK_POLL = 0.1
 
 # Idempotent and outside upstream's Alembic history, like the event log.
 # A key stores only an HMAC of the whole key, never the key.
@@ -461,16 +464,22 @@ class PostgresKeyStore:
     @contextlib.asynccontextmanager
     async def team_name_lock(self, name: str):
         """Hold a lock on the Team name, in any case, across API processes. It takes a connection of its own,
-        not one of the pool's, so waiting for it, or a migration under it, never starves the key lookups."""
+        not one of the pool's, so waiting for it, or a migration under it, never starves the key lookups.
+        A waiter gives up after TEAM_NAME_LOCK_WAIT seconds with Refused(503) and closes its connection,
+        so waiters behind a stuck holder cannot pile up connections."""
         conn = await asyncpg.connect(_asyncpg_dsn(await self._db_url()))
         try:
             # Postgres's own lower(), the one the unique index on the name uses. A waiter polls: a statement left
             # waiting for the lock holds a transaction open, and the migration under the lock creates indexes
             # concurrently, which waits for every open transaction to finish, so a blocked waiter would deadlock it.
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + TEAM_NAME_LOCK_WAIT
             while not await conn.fetchval(
                 "SELECT pg_try_advisory_lock(hashtext(lower($1)))", f"{SCHEMA}.team_name:{name.strip()}"
             ):
-                await asyncio.sleep(0.1)
+                if loop.time() >= deadline:
+                    raise Refused(503, "Another request is still creating a Team with that name; try again in a minute.")
+                await asyncio.sleep(TEAM_NAME_LOCK_POLL)
             yield
         finally:
             # Closing the connection releases the lock, on a failure too.
