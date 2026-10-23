@@ -1,4 +1,5 @@
-# CI runner deps (integration tests, Python lint, doc shell checks), hash-pinned. Regenerate from requirements-ci.in with:
+# CI runner deps (integration tests, Python lint, doc shell checks), hash-pinned. Regenerate from requirements-ci.in with
+# the command below. Dependabot's uv updater reads --python-version from it, so the option stays in this header:
 #   uv pip compile requirements-ci.in -o requirements-ci.txt --generate-hashes --python-version 3.12 --no-header --no-annotate
 iniconfig==2.3.1 \
     --hash=sha256:67f4b9c50da0dedf52af349e7749a80a9057a5031199791b906c3bb3ae878960 \

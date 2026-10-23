@@ -338,10 +338,10 @@ Integration tests start the real container on Hindsight's mock LLM, so they need
 ```sh
 docker build -t hindsight-agent-keys:test .
 docker build --target ui -t hindsight-ui:test .
-uv run --no-project --with pytest==9.0.3 --with markdown-it-py==4.2.0 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
+uv run --no-project --with-requirements requirements-ci.txt pytest -p no:cacheprovider -c /dev/null --rootdir . tests/integration -v
 ```
 
-Script tests run the release watcher in a scratch repository with fake `gh` and `docker`, and the scan alert (`scripts/scan-alert.sh`) with a fake `gh`. `tests/scripts/test_public_repo.py` fails when a tracked file names the company's domains or a private IPv4 address, since this repository is public. `tests/scripts/test_pins.py` checks the pins in the Dockerfile, the workflows and `scripts/`: actions by commit SHA and images by digest (a `FROM`, an `image=` or `image:` value, and the image a `docker run`, `pull` or `create` runs), each with its version, and every `pip install` command with `--require-hashes`. It reads the forms this repo writes and fails on the unusual ones its docstring lists; it is a guardrail, not a shell or YAML interpreter, so review still applies rule 5 to any other form. They also check the shell this README and `docs/` give operators (`tests/scripts/test_doc_shell.py`), in every fenced block tagged `sh`, `bash`, `shell` or `zsh`, or not tagged. Blocks are found with a CommonMark parser (markdown-it-py), and their shell is read from shfmt's syntax tree, as bash in a `bash` block and POSIX sh otherwise, with any heredoc body that reads as shell (a script fed to `ssh` or `sh`), read as bash, which takes all sh syntax too. Shell inside a quoted string (`sh -c '…'`) is not read. A placeholder such as `<port>` reads as a value not yet known, like `$port`. A block that is not shell needs a tag such as `text`, or the tests stop at it:
+Script tests run the release watcher in a scratch repository with fake `gh` and `docker`, and the scan alert (`scripts/scan-alert.sh`) with a fake `gh`. `tests/scripts/test_public_repo.py` fails when a tracked file names the company's domains or a private IPv4 address, since this repository is public. `tests/scripts/test_requirements_ci.py` fails when a pin in `requirements-ci.in` is not at the same version in `requirements-ci.txt`, the file CI installs and Dependabot recompiles from the `.in`. `tests/scripts/test_pins.py` checks the pins in the Dockerfile, the workflows and `scripts/`: actions by commit SHA and images by digest (a `FROM`, an `image=` or `image:` value, and the image a `docker run`, `pull` or `create` runs), each with its version, and every `pip install` command with `--require-hashes`. It reads the forms this repo writes and fails on the unusual ones its docstring lists; it is a guardrail, not a shell or YAML interpreter, so review still applies rule 5 to any other form. They also check the shell this README and `docs/` give operators (`tests/scripts/test_doc_shell.py`), in every fenced block tagged `sh`, `bash`, `shell` or `zsh`, or not tagged. Blocks are found with a CommonMark parser (markdown-it-py), and their shell is read from shfmt's syntax tree, as bash in a `bash` block and POSIX sh otherwise, with any heredoc body that reads as shell (a script fed to `ssh` or `sh`), read as bash, which takes all sh syntax too. Shell inside a quoted string (`sh -c '…'`) is not read. A placeholder such as `<port>` reads as a value not yet known, like `$port`. A block that is not shell needs a tag such as `text`, or the tests stop at it:
 
 - Each gate, a function that prints STOP when its check fails, runs against fake `curl` and `cloudflared` answering 200, 302, 401, 403, 404, 500 and a refused connection, and must succeed only on the status it waits for. It runs under `bash` in a `bash` block and under `sh` otherwise, with the functions its block's shell has. A gate in a heredoc body runs under `bash` when the command it is fed to names bash (`ssh h bash`), else under `sh`, with only that body's functions. Every function a block defines, in a heredoc body too, is found, whatever its form.
 - A `curl` that sends PUT, PATCH or DELETE, or a method held in a variable or a placeholder, uses `-f`, in a shell block or an inline command. Options are read as curl reads them, so `-sSX DELETE` counts; the options that take an argument come from `curl --help all`.
@@ -352,13 +352,13 @@ Script tests run the release watcher in a scratch repository with fake `gh` and 
 They need git, jq, curl, psql and the Docker CLI on the host, pytest and markdown-it-py in the Python that runs them, and shfmt on PATH (shfmt-py installs it):
 
 ```sh
-uv run --no-project --with pytest==9.0.3 --with markdown-it-py==4.2.0 --with shfmt-py==4.2.0 pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
+uv run --no-project --with-requirements requirements-ci.txt pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 ```
 
 Lint runs the same script as CI. It needs ruff on PATH, shellcheck and Docker:
 
 ```sh
-uv run --no-project --with ruff==0.17.0 scripts/lint.sh
+uv run --no-project --with-requirements requirements-ci.txt scripts/lint.sh
 ```
 
 Behind a TLS-inspecting proxy, the vulnerability scan needs that proxy's CA mounted into the Grype container (`SSL_CERT_FILE`).

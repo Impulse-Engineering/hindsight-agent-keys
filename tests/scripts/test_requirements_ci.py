@@ -13,9 +13,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 
 def pins(name):
-    """{name: specifier} for each requirement line; uv indents a pin's --hash continuation lines."""
+    """{name: specifier} for each requirement line, skipping comments and a pin's --hash continuation lines."""
     with open(os.path.join(ROOT, name)) as f:
-        reqs = [Requirement(line.split()[0]) for line in f if line.strip() and line[0] not in "# \t"]
+        reqs = [Requirement(s.split()[0]) for s in map(str.strip, f) if s and not s.startswith(("#", "--"))]
     return {canonicalize_name(r.name): str(r.specifier) for r in reqs}
 
 

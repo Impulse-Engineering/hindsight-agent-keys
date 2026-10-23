@@ -12,5 +12,9 @@ updates:
   # from requirements-ci.txt; the pip updater failed on every run against this uv-compiled file.
   - package-ecosystem: uv
     directory: /
+    # The updater reads every first-level directory's requirements files. docker/'s pins override upstream's
+    # vulnerable packages until the pinned release meets them (Dockerfile), so they are not bumped here.
+    exclude-paths:
+      - docker/**
     schedule:
       interval: weekly
