@@ -34,5 +34,7 @@ def test_every_pin_in_the_in_file_is_compiled_at_the_same_version():
 
 def test_the_txt_names_the_python_version_dependabot_compiles_for():
     """Without it, Dependabot compiles for its own Python, not CI's. The regex is dependabot-core's
-    PYTHON_VERSION_REGEX (uv/lib/dependabot/uv/file_updater/compile_file_updater.rb), matched anywhere in the .txt."""
-    assert re.search(r"--python-version[=\s]+\d+\.\d+", read("requirements-ci.txt"))
+    PYTHON_VERSION_REGEX (uv/lib/dependabot/uv/file_updater/compile_file_updater.rb), matched anywhere in the .txt.
+    3.12 is the python3 of ci.yml's ubuntu-24.04 runner, which installs the .txt."""
+    found = re.search(r"--python-version[=\s]+(\d+\.\d+)", read("requirements-ci.txt"))
+    assert found and found.group(1) == "3.12"
