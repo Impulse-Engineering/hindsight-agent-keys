@@ -8,7 +8,9 @@ updates:
       interval: weekly
 
   # The hash-pinned CI runner (requirements-ci.txt): tests, Python lint and the doc shell parsers.
-  - package-ecosystem: pip
+  # uv, not pip: the uv updater recompiles requirements-ci.in, reading its options (hashes, --python-version)
+  # from requirements-ci.txt; the pip updater failed on every run against this uv-compiled file.
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly

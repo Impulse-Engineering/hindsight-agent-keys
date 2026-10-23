@@ -1,0 +1,25 @@
+"""requirements-ci.txt is compiled from requirements-ci.in (its header has the command); CI installs only the .txt.
+
+Dependabot's uv updater bumps a pin in the .in and recompiles both together. A hand edit to one file alone
+leaves CI on versions the .in does not name, so each pin in the .in must sit in the .txt at the same version.
+"""
+
+import os
+
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def pins(name):
+    """{name: specifier} for each requirement line; uv indents a pin's --hash continuation lines."""
+    with open(os.path.join(ROOT, name)) as f:
+        reqs = [Requirement(line.split()[0]) for line in f if line.strip() and line[0] not in "# \t"]
+    return {canonicalize_name(r.name): str(r.specifier) for r in reqs}
+
+
+def test_every_pin_in_the_in_file_is_compiled_at_the_same_version():
+    wanted, compiled = pins("requirements-ci.in"), pins("requirements-ci.txt")
+    assert wanted
+    assert {n: compiled.get(n) for n in wanted} == wanted
