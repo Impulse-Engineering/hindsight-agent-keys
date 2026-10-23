@@ -1,5 +1,5 @@
 # CI runner deps (integration tests, Python lint, doc shell checks), compiled into requirements-ci.txt (its header has the command).
 pytest==9.0.3
-ruff==0.17.0
+ruff==0.17.1
 markdown-it-py==4.2.0
 shfmt-py==4.2.0
