@@ -199,7 +199,7 @@ printf '%s\n' '<name>==<version>' | uv pip compile - --no-deps --generate-hashes
   --python-version "$py" --no-header --no-annotate -q -o docker/pins.txt
 ```
 
-Then install it in the base stage. A wheel whose bytes match none of the hashes fails the build, whichever index serves it; `--no-deps` installs exactly the pins and resolves nothing else, and `uv pip check` fails the build if they no longer fit upstream's environment:
+Then install it in the base stage (its `RUN --mount` needs BuildKit, Docker's default builder since 23.0). A wheel whose bytes match none of the hashes fails the build, whichever index serves it; `--no-deps` installs exactly the pins and resolves nothing else, and `uv pip check` fails the build if they no longer fit upstream's environment:
 
 ```dockerfile
 # Fixed versions over upstream's, for <advisory> (<package>): docs/operating.md, "Pinning a package over upstream".
