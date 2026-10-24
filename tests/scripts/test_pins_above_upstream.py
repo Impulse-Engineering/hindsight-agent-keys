@@ -87,7 +87,7 @@ def run(repo, pins=None, system_pins=None, venv=(), system=(), docker_fails=Fals
     return result, recorded
 
 
-def low(path, pin, upstream):
+def at_or_below(path, pin, upstream):
     return f"pins-above-upstream: {path}: {pin} is at or below upstream {upstream}; drop the pin"
 
 
@@ -101,9 +101,9 @@ def test_a_pin_at_or_below_upstream_fails_naming_each_one(repo):
     )
     assert result.returncode == 1
     assert result.stderr.splitlines() == [
-        low("docker/pins.txt", "aiohttp==3.14.4", "3.14.5"),
-        low("docker/pins.txt", "certifi==2026.10.19", "2026.10.19"),
-        low("docker/system-pins.txt", "uv==0.13.3", "0.13.4"),
+        at_or_below("docker/pins.txt", "aiohttp==3.14.4", "3.14.5"),
+        at_or_below("docker/pins.txt", "certifi==2026.10.19", "2026.10.19"),
+        at_or_below("docker/system-pins.txt", "uv==0.13.3", "0.13.4"),
     ]
     # Each file against its own interpreter, in the pinned upstream image, never the built one.
     assert [call[:5] for call in calls] == [
@@ -132,6 +132,26 @@ def test_absent_pin_files_pass_without_running_upstream(repo):
     assert "docker/pins.txt: absent" in result.stdout and "docker/system-pins.txt: absent" in result.stdout
 
 
+def test_a_file_at_or_below_fails_when_the_file_after_it_passes(repo):
+    result, _ = run(
+        repo,
+        pins=pin_file(("aiohttp", "3.14.4")),
+        system_pins=pin_file(("uv", "0.13.5")),
+        venv=[("aiohttp", "3.14.5")],
+        system=[("uv", "0.13.4")],
+    )
+    assert result.returncode == 1
+    assert result.stderr.splitlines() == [at_or_below("docker/pins.txt", "aiohttp==3.14.4", "3.14.5")]
+
+
+def test_a_file_at_or_below_fails_beside_an_absent_one(repo):
+    result, calls = run(repo, system_pins=pin_file(("uv", "0.13.4")), system=[("uv", "0.13.4")])
+    assert result.returncode == 1
+    assert result.stderr.splitlines() == [at_or_below("docker/system-pins.txt", "uv==0.13.4", "0.13.4")]
+    assert "docker/pins.txt: absent" in result.stdout
+    assert [call[3] for call in calls] == [SYSTEM]
+
+
 def test_versions_compare_by_pep_440(repo):
     result, _ = run(
         repo,
@@ -139,19 +159,20 @@ def test_versions_compare_by_pep_440(repo):
         venv=[("aiohttp", "3.14.9"), ("yarl", "2.0.0")],
     )
     assert result.returncode == 1
-    assert result.stderr.splitlines() == [low("docker/pins.txt", "yarl==2.0.0rc1", "2.0.0")]
+    assert result.stderr.splitlines() == [at_or_below("docker/pins.txt", "yarl==2.0.0rc1", "2.0.0")]
 
 
 def test_names_match_after_pep_503_normalization(repo):
     result, _ = run(
         repo,
-        pins=pin_file(("Pillow", "13.0.0"), ("claude_agent_sdk", "0.2.121")),
-        venv=[("pillow", "13.0.0"), ("claude-agent-sdk", "0.2.168")],
+        pins=pin_file(("Pillow", "13.0.0"), ("claude_agent_sdk", "0.2.121"), ("pyyaml", "6.0.1")),
+        venv=[("pillow", "13.0.0"), ("claude-agent-sdk", "0.2.168"), ("PyYAML", "6.0.2")],
     )
     assert result.returncode == 1
     assert result.stderr.splitlines() == [
-        low("docker/pins.txt", "Pillow==13.0.0", "13.0.0"),
-        low("docker/pins.txt", "claude_agent_sdk==0.2.121", "0.2.168"),
+        at_or_below("docker/pins.txt", "Pillow==13.0.0", "13.0.0"),
+        at_or_below("docker/pins.txt", "claude_agent_sdk==0.2.121", "0.2.168"),
+        at_or_below("docker/pins.txt", "pyyaml==6.0.1", "6.0.2"),
     ]
 
 

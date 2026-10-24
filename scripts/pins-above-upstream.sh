@@ -1,6 +1,6 @@
 #!/bin/sh
 # Fail when a pin the image installs over upstream is at or below the version the pinned
-# upstream image (the Dockerfile's FROM, never the built image, which carries the pins)
+# upstream image (the Dockerfile's FROM, never the built image, which carries any pins)
 # already has in that pin file's interpreter: the exact pin would downgrade the package or
 # change nothing. Prints one line per such pin, naming both versions. An absent pin file,
 # or a pin for a package upstream does not install, passes. CI's test job runs it on every
@@ -25,7 +25,7 @@ for line in filter(str.strip, sys.stdin):
     upstream.setdefault(canonicalize_name(dist), version)
 if not upstream:
     sys.exit(f"pins-above-upstream: {name}: upstream listed no packages")
-low = 0
+failed = 0
 with open(path) as f:
     for n, line in enumerate(f, 1):
         text = line.strip()
@@ -37,11 +37,12 @@ with open(path) as f:
         have = upstream.get(canonicalize_name(pin[1]))
         if have is not None and Version(pin[2]) <= Version(have):
             print(f"pins-above-upstream: {name}: {pin[1]}=={pin[2]} is at or below upstream {have}; drop the pin", file=sys.stderr)
-            low = 1
-sys.exit(low)'
+            failed = 1
+sys.exit(failed)'
 
 status=0
-# check <pin file> <the --python its Dockerfile install line names>
+# check <pin file> <the interpreter its Dockerfile block installs into: docs/operating.md,
+# "Pinning a package over upstream">
 check() {
   if [ ! -f "$ROOT/$1" ]; then
     echo "pins-above-upstream: $1: absent, nothing to check"
@@ -49,7 +50,7 @@ check() {
   fi
   listing=$(docker run --rm --entrypoint "$2" "$BASE" -c "$LIST")
   if printf '%s\n' "$listing" | python3 -c "$COMPARE" "$ROOT/$1" "$1"; then
-    echo "pins-above-upstream: $1: every pin is above upstream"
+    echo "pins-above-upstream: $1: no pin at or below upstream"
   else
     status=1
   fi

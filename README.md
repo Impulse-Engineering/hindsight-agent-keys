@@ -327,7 +327,7 @@ Every UI shows its Team's banks to whoever reaches its port, so put each hostnam
 
 ## Tests
 
-Unit tests run inside the pinned upstream image, which ships `hindsight_api` and pytest. CI runs them inside the image it built (`UNIT_TEST_IMAGE`), so they also see the image's pinned packages:
+Unit tests run inside the pinned upstream image, which ships `hindsight_api` and pytest. CI runs them inside the image it built (`UNIT_TEST_IMAGE`), so they also see any package the image pins over upstream's:
 
 ```sh
 scripts/unit-tests.sh -v
@@ -355,7 +355,7 @@ They need git, jq, curl, psql and the Docker CLI on the host, pytest and markdow
 uv run --no-project --with-requirements requirements-ci.txt pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 ```
 
-The pin check fails when a pin in `docker/pins.txt` or `docker/system-pins.txt` is at or below the version its interpreter already has in the pinned upstream image (the Dockerfile's `FROM`, never the built image, which carries the pins), comparing by PEP 440 ordering and PEP 503 names. It prints one line per such pin, naming the file, the package and both versions. A pin for a package upstream does not install, and an absent pin file, pass. Pins are described in [docs/operating.md](docs/operating.md), "Pinning a package over upstream". It needs Docker, and packaging in the Python that runs it:
+The pin check fails when a pin in `docker/pins.txt` or `docker/system-pins.txt` is at or below the version its interpreter already has in the pinned upstream image (the Dockerfile's `FROM`, never the built image, which carries any pins), comparing by PEP 440 ordering and PEP 503 names. It prints one line per such pin, naming the file, the package and both versions. A pin for a package upstream does not install, and an absent pin file, pass. Pins are described in [docs/operating.md](docs/operating.md), "Pinning a package over upstream". It needs Docker, and packaging in the Python that runs it:
 
 ```sh
 uv run --no-project --with-requirements requirements-ci.txt scripts/pins-above-upstream.sh

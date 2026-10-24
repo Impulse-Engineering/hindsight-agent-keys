@@ -12,7 +12,7 @@ updates:
   # from requirements-ci.txt, so transitive pins move with each bump. The pip updater would compile a .in with pip-tools.
   - package-ecosystem: uv
     directory: /
-    # The updater reads every first-level directory's requirements files. docker/'s pins override upstream's
+    # The updater reads every first-level directory's requirements files. docker/'s pins, when there are any, override upstream's
     # vulnerable packages until the pinned release meets them (docs/operating.md, "Pinning a package over upstream"),
     # so they are not bumped here.
     exclude-paths:
