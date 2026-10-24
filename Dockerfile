@@ -5,36 +5,7 @@ FROM ghcr.io/vectorize-io/hindsight:1.1.0@sha256:50311d02b4d5d2b7c5242bd336edf87
 LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hindsight-agent-keys" \
       org.opencontainers.image.licenses="MIT"
 
-# Fixed versions over upstream's lockfile, for advisories the scan blocks or reports as High:
-# GHSA-h4mw-j7qp-8mwm (claude-agent-sdk), GHSA-2g87-pp6c-29x5 and GHSA-5wr8-gcqf-gqf3 (aiohttp, which needs this yarl),
-# GHSA-8g5g-8vmr-9782 (pillow) and GHSA-6q48-6c7w-9gw2 (certifi).
-# docker/pins.txt holds the versions and the hash of every wheel; a file whose bytes match none fails the build,
-# whichever index serves it. --no-deps installs exactly those and resolves nothing else, and the check fails the
-# build if they no longer fit upstream's environment.
-# shortcut: exact pins downgrade a newer upstream; drop each one the pinned release already meets.
-# Regenerate docker/pins.txt after editing a version, with the base image's Python version
-# (`docker run --rm --entrypoint /app/api/.venv/bin/python <FROM image> -V`):
-#   printf '<name>==<version>\n...' | uv pip compile - --no-deps --generate-hashes --only-binary :all: \
-#     --python-version <major.minor> --no-header --no-annotate -q -o docker/pins.txt
-RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
-    uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
-      --python /app/api/.venv/bin/python -r /tmp/pins.txt && \
-    uv pip check --python /app/api/.venv/bin/python
-
-# The same for upstream's own uv in the system Python, outside the venv: GHSA-hq85-5cpj-mr62. uv has no
-# dependencies, so there is nothing for a check to fit. Only root can write /usr/local, so the step runs as root.
-# Regenerate docker/system-pins.txt with the system Python's version
-# (`docker run --rm --entrypoint /usr/local/bin/python3 <FROM image> -V`):
-#   printf 'uv==<version>\n' | uv pip compile - --no-deps --generate-hashes --only-binary :all: \
-#     --python-version <major.minor> --no-header --no-annotate -q -o docker/system-pins.txt
-USER root
-RUN --mount=type=bind,source=docker/system-pins.txt,target=/tmp/system-pins.txt \
-    uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
-      --python /usr/local/bin/python3 -r /tmp/system-pins.txt
-USER hindsight
-
 # The UI image: upstream's web UI, one process per Team, never the API (README, "The UI image").
-# It keeps the pinned Python fixes above, so the same scan passes on both images.
 FROM base AS ui
 LABEL org.opencontainers.image.description="Hindsight's web UI, one process per Team"
 # Upstream's launcher stays in the image; if an entrypoint override runs it, it starts no API.

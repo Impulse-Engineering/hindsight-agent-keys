@@ -18,6 +18,6 @@ if [ -n "$issue" ]; then
 else
   # One quoted string per line: tests/scripts/test_pins.py reads this file line by line.
   body=$(printf '%s\n\n%s\n' "The scheduled \`scan\` job on \`main\` did not pass: $run_url" \
-    "Read its log first: a new advisory also fails the \`scan\` check of any PR built on the same pins, and is fixed forward on \`main\` (a pin in \`docker/pins.txt\` or \`docker/system-pins.txt\`, or an upstream bump), while a build or runner failure may pass on a re-run. Close this issue once a scheduled scan passes.")
+    "Read its log first: a new advisory also fails the \`scan\` check of any PR built on the same pins, and is fixed forward on \`main\` (a pin in \`docker/pins.txt\` or \`docker/system-pins.txt\`, as docs/operating.md, \"Pinning a package over upstream\", describes, or an upstream bump), while a build or runner failure may pass on a re-run. Close this issue once a scheduled scan passes.")
   gh issue create --title "$title" --body "$body"
 fi

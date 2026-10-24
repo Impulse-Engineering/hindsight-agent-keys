@@ -180,7 +180,7 @@ The banks that existed before the cut-over are the Public Team, in the `public` 
 
 Each upstream release reaches Prod through a PR, a published digest and a platform admin's approval.
 
-1. **PR.** The daily `upstream-release` workflow opens a PR that pins the new release and links its notes. A maintainer selects **Approve workflows to run**. Read the notes for changes to the tenant, HTTP or MCP extension interfaces, new routes that skip authentication, and new settings that would weaken isolation; each such setting needs a startup guard row. The unit tests fail if the release lets a bank or tenant override another setting the guard checks. Drop each pin in `docker/pins.txt` (the API's venv) and `docker/system-pins.txt` (upstream's uv in the system Python) that the release already meets, since an exact pin would downgrade it, and regenerate the file with the Dockerfile's recipe for it (each file has its own, beside the `RUN` line that installs it). Once a file has no pin left, delete it and its Dockerfile block: its comments, recipe and `RUN` line (for `system-pins.txt`, the `USER` lines around it too).
+1. **PR.** The daily `upstream-release` workflow opens a PR that pins the new release and links its notes. A maintainer selects **Approve workflows to run**. Read the notes for changes to the tenant, HTTP or MCP extension interfaces, new routes that skip authentication, and new settings that would weaken isolation; each such setting needs a startup guard row. The unit tests fail if the release lets a bank or tenant override another setting the guard checks. CI's pin check (`scripts/pins-above-upstream.sh`) fails the PR when a pin in `docker/pins.txt` (the API's venv) or `docker/system-pins.txt` (upstream's uv in the system Python) is at or below the version the release already has, since the exact pin would downgrade it or change nothing, printing one line per pin with both versions. Drop each pin it names and regenerate the file (see "Pinning a package over upstream"). Once a file has no pin left, delete it and its Dockerfile block: its comment and `RUN` line (for `system-pins.txt`, the `USER` lines around it too).
 2. **Merge.** A code owner merges once the `test` and `scan` checks pass. CI on `main` publishes the image, then the `verify-published` job runs the integration tests and the scan on that exact digest. Its summary and a notice on the run name the tag and digest. Approve no other digest. To check its signature, see the README, "CI and publishing".
 3. **Dev.** `platform_update_app container_image=ghcr.io/impulse-engineering/hindsight-agent-keys@sha256:<digest>`, then `platform_approve_image` (platform admin), then `platform_get_deploy_status` until the job is `completed` with `Applied image ref recorded:` naming the digest. A `failed` before the job's final state does not count, and nothing is stopped because of it ([cutover.md](cutover.md), step 2.4). Check on the bypass hostname that a request with no key gets 401 and that a key reaches its banks ([cutover.md](cutover.md), step 8). Deploy the run's `hindsight-ui` digest to a UI app the same way, after the API it calls.
 4. **Prod.** Back up first ([cutover.md](cutover.md), step 1): the new release migrates `public` and every listed schema when it starts. Then deploy as on Dev.
@@ -188,6 +188,28 @@ Each upstream release reaches Prod through a PR, a published digest and a platfo
 **Auth state:** the bypass hostname can stay open. Every digest of this image runs the startup guard, so no container of it serves without our extension; the old container answers until the deploy completes, then the new one does. If the keyless check does not return 401, close the bypass hostname at once ([cutover.md](cutover.md), step 3). A UI app's hostnames stay behind its Access application throughout its deploy: the old UI answers until the deploy completes, then the new one does, and a refused start leaves it down, not open.
 
 **Going back** *(not verified)*. Once a new digest has started, the previous one is not a valid target: its upstream predates the migrations that ran, so do not use `platform_rollback_deploy` for it. Fix forward with a new digest. If the data is damaged, restore the dump taken in step 4 ([cutover.md](cutover.md), "Restore").
+
+## Pinning a package over upstream
+
+When the scan blocks on an advisory in a package upstream's image ships, and the pinned release does not fix it yet, install the fixed version over upstream's in the Dockerfile's base stage, before `FROM base AS ui`, so both images carry it. A package in upstream's API venv goes in `docker/pins.txt`; upstream's own uv, in the system Python, goes in `docker/system-pins.txt`. The pin check reads those two files, each against its interpreter in the pinned upstream image, so a pin must be above the version upstream has there; once a release meets it, the check fails that release's PR ("Upgrading upstream Hindsight", step 1). Write the file with the hash of every wheel, for its interpreter's Python version (for `system-pins.txt`, run `/usr/local/bin/python3` instead):
+
+```sh
+py=$(docker run --rm --entrypoint /app/api/.venv/bin/python "$(scripts/upstream-ref.sh)" -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+printf '%s\n' '<name>==<version>' | uv pip compile - --no-deps --generate-hashes --only-binary :all: \
+  --python-version "$py" --no-header --no-annotate -q -o docker/pins.txt
+```
+
+Then install it in the base stage. A wheel whose bytes match none of the hashes fails the build, whichever index serves it; `--no-deps` installs exactly the pins and resolves nothing else, and `uv pip check` fails the build if they no longer fit upstream's environment:
+
+```dockerfile
+# Fixed versions over upstream's, for <advisory> (<package>): docs/operating.md, "Pinning a package over upstream".
+RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
+    uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
+      --python /app/api/.venv/bin/python -r /tmp/pins.txt && \
+    uv pip check --python /app/api/.venv/bin/python
+```
+
+For `docker/system-pins.txt`, mount that file and install with `--python /usr/local/bin/python3`, between `USER root` and `USER hindsight`, since only root can write `/usr/local`. uv has no dependencies, so a file that pins only uv needs no `uv pip check`.
 
 ## Troubleshooting
 
