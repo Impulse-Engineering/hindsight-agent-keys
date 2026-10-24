@@ -46,10 +46,14 @@ jobs:
       - name: Script tests (release watcher, scan alert, doc shell checks, pins, no real hosts)
         run: PATH="/tmp/it/bin:$PATH" pytest -p no:cacheprovider -c /dev/null --rootdir . tests/scripts -v
 
+      # Against the pinned upstream image, not the built one, which carries any pins.
+      - name: Pin check (no pin at or below the pinned upstream's own version)
+        run: PATH="/tmp/it/bin:$PATH" scripts/pins-above-upstream.sh
+
       - name: Build the images (API, then UI from the same pinned base)
         run: docker build -t "$IMAGE" . && docker build --target ui -t "$UI_IMAGE" .
 
-      # In the built image, so the tests see its pinned packages, not only upstream's.
+      # In the built image, so the tests see any package it pins over upstream's.
       - name: Unit tests (inside the built image)
         run: UNIT_TEST_IMAGE="$IMAGE" scripts/unit-tests.sh -v
 

@@ -242,5 +242,5 @@ def test_every_python_install_checks_hashes():
         if (i := next((i for i, w in enumerate(words) if PIP.fullmatch(os.path.basename(w))), None)) is not None
         if "install" in words[i + 1 :]
     ]
-    assert any(where.startswith("Dockerfile:") for where, _ in installs), "the check no longer sees the image's install"
+    assert any(where.startswith(".github/workflows/ci.yml:") for where, _ in installs), "the check no longer sees CI's install"
     assert [f"{where}: {' '.join(words)}" for where, words in installs if "--require-hashes" not in words] == []
