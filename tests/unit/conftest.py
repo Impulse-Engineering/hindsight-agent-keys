@@ -234,6 +234,7 @@ class MemoryStore:
             "created_at": datetime.now(UTC),
             "expires_at": expires_at,
             "revoked_at": None,
+            "last_used_at": None,
             "via": via,
         }
         if idempotency is not None:
@@ -272,7 +273,7 @@ class MemoryStore:
         return key is not None and key["email"] == email and (not via_workplane or key["via"] is not None)
 
     async def list_keys(self, email, *, via_workplane=False):
-        fields = ("id", "name", "created_at", "expires_at", "revoked_at", "via")
+        fields = ("id", "name", "created_at", "expires_at", "revoked_at", "last_used_at", "via")
         return [{f: k[f] for f in fields} for k in self.keys.values() if self._reached(k, email, via_workplane)]
 
     async def renew_key(self, email, key_id, now, expires_at, *, via_workplane=False):
@@ -281,6 +282,11 @@ class MemoryStore:
             return False
         key["expires_at"] = expires_at
         return True
+
+    async def key_used(self, key_id, now, expires_at):
+        key = self.keys[key_id]
+        if key["revoked_at"] is None:
+            key["last_used_at"], key["expires_at"] = now, max(key["expires_at"], expires_at)
 
     async def revoke_keys(self, email, now, key_id=None, *, via_workplane=False):
         hits = [

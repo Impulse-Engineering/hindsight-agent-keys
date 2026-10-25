@@ -1,4 +1,4 @@
-"""Agent Keys expire, can be renewed and revoked, and work only while their owner keeps signing in."""
+"""Agent Keys expire after 90 days unused, can be renewed and revoked, and work only while their owner keeps signing in."""
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -54,13 +54,74 @@ async def works(keys, key):
     return True
 
 
-async def test_a_key_expires_90_days_after_creation(keys):
+async def test_a_key_never_used_expires_90_days_after_creation(keys):
     _, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
     await sign_in(keys, ALICE, START + 89 * DAY)
     keys.clock.now = START + 90 * DAY - timedelta(seconds=1)
-    assert await works(keys, key)
+    assert [k["state"] for k in await keys.ext.list_keys(ALICE)] == ["active"]
     keys.clock.now = START + 90 * DAY
     assert not await works(keys, key)
+
+
+async def test_a_key_used_within_90_days_keeps_working_past_90_days_from_its_creation(keys):
+    _, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
+    for days in (60, 140, 220):
+        keys.clock.now = START + days * DAY
+        await sign_in(keys, ALICE, keys.clock.now)
+        assert await works(keys, key)
+
+
+async def test_a_key_unused_for_90_days_is_refused_and_cannot_be_renewed(keys):
+    key_id, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
+    keys.clock.now = START + 10 * DAY
+    await sign_in(keys, ALICE, keys.clock.now)
+    assert await works(keys, key)
+    keys.clock.now = START + 100 * DAY - timedelta(seconds=1)
+    await sign_in(keys, ALICE, keys.clock.now)
+    assert [k["state"] for k in await keys.ext.list_keys(ALICE)] == ["active"]
+    keys.clock.now = START + 100 * DAY
+    assert not await works(keys, key)
+    with pytest.raises(Refused) as refusal:
+        await keys.ext.renew_key(ALICE, key_id, None)
+    assert refusal.value.status == 404
+
+
+class CountedUses:
+    """The store's last-used writes, counted, or made to raise."""
+
+    def __init__(self, store, fail=False):
+        self.calls, self._used, self._fail = [], store.key_used, fail
+        store.key_used = self
+
+    async def __call__(self, key_id, now, expires_at):
+        self.calls.append(now)
+        if self._fail:
+            raise ConnectionError("the database went away")
+        await self._used(key_id, now, expires_at)
+
+
+async def test_a_key_records_its_last_use_at_most_once_an_hour_and_never_for_a_refused_request(keys):
+    _, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
+    await sign_in(keys, ALICE, START)
+    used = CountedUses(keys.ext._store)
+    assert await works(keys, key)
+    keys.clock.now = START + timedelta(minutes=59)
+    assert await works(keys, key)
+    assert used.calls == [START]
+    keys.clock.now = START + timedelta(hours=1)
+    assert await works(keys, key)
+    assert used.calls == [START, START + timedelta(hours=1)]
+    keys.clock.now = START + 30 * DAY  # the sign-in window has closed
+    assert not await works(keys, key)
+    assert len(used.calls) == 2
+
+
+async def test_a_last_used_write_that_fails_does_not_fail_the_request(keys, caplog):
+    _, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
+    await sign_in(keys, ALICE, START)
+    CountedUses(keys.ext._store, fail=True)
+    assert await works(keys, key)
+    assert "could not record the use of key" in caplog.text
 
 
 async def test_a_key_stops_30_days_after_its_owners_last_sign_in_and_works_again_once_they_sign_in(keys):
@@ -100,10 +161,10 @@ async def test_the_owner_can_renew_a_key_for_90_days_from_the_renewal(keys):
     keys.clock.now = START + 60 * DAY
     # Renewal needs a sign-in within 30 days, as a key page request makes.
     await sign_in(keys, ALICE, keys.clock.now)
-    await keys.ext.renew_key(ALICE, key_id, None)
+    assert await keys.ext.renew_key(ALICE, key_id, None) == START + 150 * DAY
     await sign_in(keys, ALICE, START + 149 * DAY)
     keys.clock.now = START + 150 * DAY - timedelta(seconds=1)
-    assert await works(keys, key)
+    assert [k["expires_at"] for k in await keys.ext.list_keys(ALICE)] == [START + 150 * DAY]
     keys.clock.now = START + 150 * DAY
     assert not await works(keys, key)
 
@@ -155,6 +216,19 @@ async def test_the_owner_lists_only_their_own_keys_each_with_its_state(keys):
         (laptop, "laptop", "expired", START + 90 * DAY),
         (desktop, "desktop", "revoked", START + 91 * DAY),
         (phone, "phone", "active", START + 91 * DAY),
+    ]
+
+
+async def test_the_owner_lists_each_keys_last_use_and_the_days_left_before_it_stops_unused(keys):
+    _, key = await keys.ext.create_personal_key(ALICE, "laptop", None)
+    await keys.ext.create_personal_key(ALICE, "idle", None)
+    keys.clock.now = START + 10 * DAY
+    await sign_in(keys, ALICE, keys.clock.now)
+    assert await works(keys, key)
+    keys.clock.now = START + 20 * DAY
+    assert [(k["name"], k["last_used_at"], k["days_to_expiry"]) for k in await keys.ext.list_keys(ALICE)] == [
+        ("laptop", START + 10 * DAY, 80),
+        ("idle", None, 70),
     ]
 
 

@@ -35,7 +35,7 @@ Every change is recorded as an event in `agent_keys.events` (README, "The event 
 
 - **Creating.** A person on the Key Allowlist creates a personal key on `/ext/`, and a Team or Public Team key on `/ext/teams`. The key is shown once. An agent sends it as `Authorization: Bearer hsk_<id>_<secret>` on the bypass hostname, to the API and to MCP (`/mcp/` or `/mcp/<bank>/`). An agent that needs personal and Team memory holds two keys.
 - **Limits.** Each person can create 5 keys an hour and hold 10 active keys, personal and Team keys together; past either, creation answers 429. Keys WorkPlane creates for them are counted apart: 25 active and 25 an hour by default (`HINDSIGHT_API_TENANT_WORKPLANE_ACTIVE_KEYS` and `..._KEYS_PER_HOUR`; lowering either revokes nothing). Each person can create 10 Teams.
-- **90 days.** A key works for 90 days from its creation or its last renewal. Its owner renews an unexpired key, or revokes one, on `/ext/`; WorkPlane does the same for the keys it created. An expired or revoked key cannot be renewed; create a new one. Once the owner's 30-day sign-in has lapsed, renewal answers 403 on either channel until they sign in again.
+- **90 days unused.** A key expires 90 days after its last use (a request it authenticated), its last renewal or its creation, whichever is latest, so a key in use keeps working with no maximum lifetime. With Webex notices set up, its holder is warned 14 days before, and an expired key gets one `key_expired` event (README, "The event log"). Its owner renews an unexpired key, or revokes one, on `/ext/`; WorkPlane does the same for the keys it created. An expired or revoked key cannot be renewed; create a new one. Once the owner's 30-day sign-in has lapsed, renewal answers 403 on either channel until they sign in again.
 - **30-day sign-in.** A key works only while its owner has signed in through Access within the last 30 days: a key page request, or a Delegated Request WorkPlane makes for them, dated by the `iat` of their own Access JWT. Tell people to open `/ext/`, or use WorkPlane, at least once a month. Opening it after a lapse means signing in again, which revives the held-back keys at once. This is also what stops a leaver's keys: once the identity provider disables them, their keys stop within 30 days without anyone touching Hindsight. To stop them at once, revoke the identity.
 - **Access session length.** A sign-in is dated by the `iat` of the Access token, and Access keeps one token for a whole session. Keep the Access application's session duration under 30 days, including any policy session duration; Cloudflare's default is 24 hours. With 30 days or more, someone who opens `/ext/` every day can still have their keys stop. The same holds for WorkPlane's Access application, whose JWT dates a Delegated Request's sign-in.
 - **Leaked key.** Its owner revokes it on `/ext/`; it fails on its next request, including inside an open MCP session. If the owner cannot, an admin revokes their identity.
@@ -124,7 +124,7 @@ The app ran stock upstream with one key in `HINDSIGHT_CP_DATAPLANE_API_KEY`. Kee
 
 ## Webex notices
 
-The extension sends Webex direct messages from a bot: to a Team's owners on the Key Allowlist when someone asks to join, to the other owners on the Key Allowlist when an owner or an admin (an agent) asks for someone else to join, to the admins when someone asks for the Key Allowlist, and to the person who asked when their request is decided, unless they made the decision themselves (README, "Webex notices", has the rules and what an interruption leaves). They are best effort and the pages stay the source of truth, so nothing here is needed for Hindsight to work. Joining an Open Team is direct, so it sends no notice; only a Join Request on a Team that is not open does. Once a day, at the first sweep after 13:00 UTC (or earlier that day, at a start after a missed day; never within 20 hours of the run before), the same background task also reminds owners and admins of requests left waiting more than 3 days (admins hear of a request to join a Team after 7), and warns people 14 days before a key of theirs expires and 7 days before their sign-in window closes; there is no separate job to run (README, "Webex notices", has who hears what, when, and what an interrupted run leaves).
+The extension sends Webex direct messages from a bot: to a Team's owners on the Key Allowlist when someone asks to join, to the other owners on the Key Allowlist when an owner or an admin (an agent) asks for someone else to join, to the admins when someone asks for the Key Allowlist, and to the person who asked when their request is decided, unless they made the decision themselves (README, "Webex notices", has the rules and what an interruption leaves). They are best effort and the pages stay the source of truth, so nothing here is needed for Hindsight to work. Joining an Open Team is direct, so it sends no notice; only a Join Request on a Team that is not open does. Once a day, at the first sweep after 13:00 UTC (or earlier that day, at a start after a missed day; never within 20 hours of the run before), the same background task also reminds owners and admins of requests left waiting more than 3 days (admins hear of a request to join a Team after 7), and warns people 14 days before a key of theirs expires unused and 7 days before their sign-in window closes; there is no separate job to run (README, "Webex notices", has who hears what, when, and what an interrupted run leaves).
 
 **Setting up** *(not verified)*:
 
@@ -224,7 +224,7 @@ The README's "Troubleshooting" table maps each symptom to its cause. These are t
   ```sh
   # CT: type the <id> part of the key
   read -r -p 'Key ID: ' id &&
-    echo "select k.kind, k.schema, k.expires_at, k.revoked_at, a.role, s.last_seen,
+    echo "select k.kind, k.schema, k.expires_at, k.last_used_at, k.revoked_at, a.role, s.last_seen,
       k.kind = 'team' and k.schema <> 'public' and not exists (select 1 from agent_keys.members m
         where m.team = k.schema and m.email = k.email) as left_team
       from agent_keys.keys k left join agent_keys.allowlist a on a.email = k.email
@@ -236,7 +236,7 @@ The README's "Troubleshooting" table maps each symptom to its cause. These are t
   | --- | --- |
   | No row | The key was not created here: another environment, or a mistyped ID. |
   | `revoked_at` set | Revoked by its owner, by revoke identity, or by a schema purge. |
-  | `expires_at` past | Expired. The owner creates a new key. |
+  | `expires_at` past | Expired: unused and not renewed for 90 days (`last_used_at` is its last recorded use). The owner creates a new key. |
   | `last_seen` empty or older than 30 days | The owner must open `/ext/` (or use WorkPlane). If they did and `last_seen` did not move, the Access application's session duration is 30 days or more ("Access session length", above): shorten it, then have them sign out of Access and open `/ext/` again, so Access issues a new token. |
   | `role` empty or `requested` | The owner is off the Key Allowlist, unless they are a first admin. |
   | `left_team` true | The owner is no longer in the Team. |

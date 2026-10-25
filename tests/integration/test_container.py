@@ -775,11 +775,18 @@ def test_revoking_a_key_stops_it_within_an_open_mcp_session(hindsight):
     assert rows == [{"kind": "key_revoked", "key_id": created["id"], "email": CAROL}]
 
 
-def test_a_key_needs_its_owner_to_sign_in_every_30_days_and_expires_unless_renewed(hindsight):
+def test_a_key_needs_its_owner_to_sign_in_every_30_days_and_expires_unless_used_or_renewed(hindsight):
     port, name = hindsight["port"], hindsight["name"]
     created = personal_key(hindsight, BOB, name="lifecycle")
     key_id, key = created["id"], created["key"]
+    life = f"SELECT last_used_at, expires_at > now() + interval '89 days' AS full FROM agent_keys.keys WHERE id = '{key_id}'"
+    query(name, f"UPDATE agent_keys.keys SET expires_at = now() + interval '1 day' WHERE id = '{key_id}' RETURNING id")
     assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
+    # The request was a use: recorded, and the key's 90 days start again from it. A second within the hour writes nothing.
+    [used] = query(name, life)
+    assert used["full"] and used["last_used_at"] is not None
+    assert http(port, "GET", "/v1/default/banks", key=key)[0] == 200
+    assert query(name, life) == [used]
     query(name, f"UPDATE agent_keys.sign_ins SET last_seen = now() - interval '30 days' WHERE email = '{BOB}' RETURNING email")
     assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
     # Any key page request with a fresh Access token is a sign-in, and revives the key.
@@ -797,7 +804,12 @@ def test_a_key_needs_its_owner_to_sign_in_every_30_days_and_expires_unless_renew
         {"kind": "key_renewed", "key_id": key_id, "email": BOB}
     ]
 
-    query(name, f"UPDATE agent_keys.keys SET expires_at = now() WHERE id = '{key_id}' RETURNING id")
+    # Unused for 90 days since its last use.
+    query(
+        name,
+        "UPDATE agent_keys.keys SET last_used_at = now() - interval '90 days', expires_at = now()"
+        f" WHERE id = '{key_id}' RETURNING id",
+    )
     assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
     status, text = key_page(hindsight, "GET", "/ext/keys", BOB)
     assert {k["id"]: k["state"] for k in json.loads(text)}[key_id] == "expired"
@@ -2378,13 +2390,13 @@ def test_the_days_reminders_are_queued_once_across_processes_and_a_stop_partway_
         return [[a, "admin", f"{asker} has waited {asked} days for a place on the Key Allowlist."] for a in admins]
 
     def undated(step):
-        return sorted([to, kind, re.sub(r", on \d{4}-\d\d-\d\d", "", line)] for to, kind, line in step[0]), step[1]
+        return sorted([to, kind, re.sub(r"(, on| since) \d{4}-\d\d-\d\d", "", line)] for to, kind, line in step[0]), step[1]
 
-    renew = "Renew it on your key page."
+    unused = "has not been used and stops working in {} days, unless it is used or renewed on your key page."
     # Requests older than 3 days to the owners, older than 7 to the admins too; never own2's (own2 owns the Team).
     assert undated(out["first"]) == (sorted([
         *owners_hear(joiner, 4), *owners_hear(late, 8), *admins_hear(late, 8), *allowlist(4),
-        [holder, "holder", f'Your Agent Key "soon-{RUN}" expires in 13 days. {renew}'],
+        [holder, "holder", f'Your Agent Key "soon-{RUN}" ' + unused.format(13)],
         [holder, "holder", "Your Agent Keys stop working in 7 days, unless you sign in again: open your key page."],
     ]), 1)
     # Later that day, at 13:30, in the same process and in a restarted one: nothing more, the day was run at 10:00.
@@ -2401,12 +2413,12 @@ def test_the_days_reminders_are_queued_once_across_processes_and_a_stop_partway_
     assert undated(out["after_the_stop"]) == (sorted([
         *owners_hear(joiner, 6), *owners_hear(late, 10), *admins_hear(late, 10), *allowlist(6), *owners_hear(fresh, 4),
     ]), 3)
-    # A week missed, and a start at 10:00: one run, which warns of the key that came within 14 days of expiring since
+    # A week missed, and a start at 10:00: one run, which warns of the key that came within 14 days of expiring unused since
     # the last, and none at 13:30.
     assert undated(out["a_week_later"]) == (sorted([
         *owners_hear(joiner, 13), *admins_hear(joiner, 13), *owners_hear(late, 17), *admins_hear(late, 17),
         *owners_hear(fresh, 10), *admins_hear(fresh, 10), *allowlist(13),
-        [holder, "holder", f'Your Agent Key "later-{RUN}" expires in 11 days. {renew}'],
+        [holder, "holder", f'Your Agent Key "later-{RUN}" ' + unused.format(11)],
     ]), 4)
     assert out["that_afternoon"] == [[], 4]
 
@@ -2464,14 +2476,14 @@ async def add_keys(people, via=None):
 
 
 def test_a_key_warning_goes_out_only_while_its_key_works_in_postgres(hindsight):
-    a, b, c = (f"warned-{who}-{RUN}@example.test" for who in ("a", "b", "c"))
-    for person in (a, b, c):
+    a, b, c, d = (f"warned-{who}-{RUN}@example.test" for who in ("a", "b", "c", "d"))
+    for person in (a, b, c, d):
         assert key_page(hindsight, "POST", "/ext/admin/people", ALICE, body={"email": person, "role": "member"})[0] == 204
     out = notice_store(
         hindsight["name"],
         f"""
-a, b, c = {a!r}, {b!r}, {c!r}
-people = [a, b, c]
+a, b, c, d = {a!r}, {b!r}, {c!r}, {d!r}
+people = [a, b, c, d]
 {KEY_ROWS}
 
 
@@ -2496,8 +2508,16 @@ class Racing(PostgresKeyStore):
 await add_keys(people)
 racing, webex = Racing(url), Webex()
 try:
-    # b's key is revoked first, and warnings are queued after: as by a day's run that read the key just before.
+    # b's key is revoked first, and warnings are queued after: as by a day's run that read the key just before. d's
+    # stopped at T0, 90 days after its last use.
     await racing.revoke_keys(b, T0, key_of(b))
+    lapsed = await asyncpg.connect(uri)
+    try:
+        await lapsed.execute(
+            "UPDATE agent_keys.keys SET last_used_at = $2, expires_at = $3 WHERE id = $1", key_of(d), T0 - timedelta(days=90), T0
+        )
+    finally:
+        await lapsed.close()
     for person in people:
         await racing.queue_notice([person], "holder", None, "key", "/ext/", key_id=key_of(person))
         await racing.queue_notice([person], "holder", None, "window", "/ext/")
@@ -2516,7 +2536,8 @@ out["log"] = [list(r.values()) for r in rows]
 """,
     )
     # c's key works: both warnings go. a's was revoked after the claim: the final check, under a's lock, stops both, as a
-    # holds no other key that works. b's was revoked before its warnings were queued: they are dropped at the claim.
+    # holds no other key that works. b's was revoked before its warnings were queued, and d's stopped unused: they are
+    # dropped at the claim.
     assert out["sent"] == [[c, "Hindsight:\n- key\n- window\nSee https://keys.example.test/ext/"]]
     assert out["log"] == [[a, "skipped", "no longer eligible"], [c, "sent", None]]
 
@@ -2665,3 +2686,87 @@ def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team)
         assert BANK in text
     finally:
         docker("rm", "-f", name, check=False)
+
+
+def test_the_start_that_adds_last_use_gives_every_key_that_works_90_days_and_leaves_the_rest_in_postgres(hindsight):
+    holder = f"rollout-{RUN}@example.test"
+    out = notice_store(
+        hindsight["name"],
+        f"""
+holder, run = {holder!r}, {RUN!r}
+
+
+class Rollback(Exception):
+    pass
+
+
+conn = await asyncpg.connect(uri)
+try:
+    # A database from before the column, its start replayed in a transaction that is rolled back.
+    async with conn.transaction():
+        await conn.execute("ALTER TABLE agent_keys.keys DROP COLUMN last_used_at")
+        await conn.execute("INSERT INTO agent_keys.people (email) VALUES ($1)", holder)
+        for key, days, revoked in (("works", 5, False), ("expired", -1, False), ("revoked", 5, True)):
+            await conn.execute(
+                "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at, revoked_at)"
+                " VALUES ($1, $2, 'k', $3, 'p_rollout', 'personal', now() + $4::interval, CASE WHEN $5 THEN now() END)",
+                "rollout" + key + run, bytes(32), holder, timedelta(days=days), revoked,
+            )
+        mine = "SELECT id, expires_at, now() AS now FROM agent_keys.keys WHERE email = $1 ORDER BY id"
+        before = await conn.fetch(mine, holder)
+        await conn.execute(store_module.DDL)
+        await conn.execute(store_module.DDL)  # a later start changes nothing
+        after = await conn.fetch(mine, holder)
+        out["changed"] = {{b["id"][len("rollout") : -len(run)]: str(a["expires_at"] - b["now"]) for b, a in zip(before, after) if a["expires_at"] != b["expires_at"]}}
+        out["last_used"] = await conn.fetchval("SELECT count(last_used_at) FROM agent_keys.keys WHERE email = $1", holder)
+        raise Rollback
+except Rollback:
+    pass
+finally:
+    await conn.close()
+""",
+    )
+    # Only the key that works moved, to 90 days from the start; nothing is recorded as used yet.
+    assert out == {"changed": {"works": "90 days, 0:00:00"}, "last_used": 0}
+
+
+def test_a_key_that_stops_unused_is_logged_once_by_the_next_days_run_in_postgres(hindsight):
+    holder = f"lapsed-{RUN}@example.test"
+    out = notice_store(
+        hindsight["name"],
+        f"""
+holder, run = {holder!r}, {RUN!r}
+# Days far ahead of any other test's, deleted afterwards so later runs count from theirs.
+N1 = datetime(2100, 1, 1, 13, 0, tzinfo=UTC)
+N2 = N1 + timedelta(days=1)
+conn = await asyncpg.connect(uri)
+try:
+    await conn.execute("INSERT INTO agent_keys.people (email) VALUES ($1)", holder)
+    for key, expires, revoked, kind in (
+        ("before", N1 - timedelta(hours=1), None, "personal"),
+        ("between", N1 + timedelta(hours=1), None, "team"),
+        ("revoked", N1 + timedelta(hours=1), N1, "personal"),
+        ("works", N2 + timedelta(days=1), None, "personal"),
+    ):
+        await conn.execute(
+            "INSERT INTO agent_keys.keys (id, digest, name, email, schema, kind, expires_at, revoked_at)"
+            " VALUES ($1, $2, 'k', $3, 'p_lapsed', $4, $5, $6)",
+            "lapse" + key + run, bytes(32), holder, kind, expires, revoked,
+        )
+    for day in (N1, N2, N2 + timedelta(hours=2)):  # the second day's run, then a sweep that finds the day run
+        await store.run_reminders(day.date(), day, lambda last, ran_before: True, lambda due: [])
+    rows = await conn.fetch(
+        "SELECT key_id, email, team, at, actor, channel FROM agent_keys.events WHERE kind = 'key_expired' AND email = $1 ORDER BY id",
+        holder,
+    )
+    out["events"] = [[r["key_id"][len("lapse") : -len(run)], r["email"] == holder, r["team"], str(r["at"]), r["actor"], r["channel"]] for r in rows]
+finally:
+    await conn.execute("DELETE FROM agent_keys.reminder_runs WHERE day >= $1", N1.date())
+    await conn.close()
+""",
+    )
+    # One row each for the keys that stopped unrevoked, dated when they stopped; the revoked key and the key that works none.
+    assert out["events"] == [
+        ["before", True, None, "2100-01-01 12:00:00+00:00", None, None],
+        ["between", True, "p_lapsed", "2100-01-01 14:00:00+00:00", None, None],
+    ]

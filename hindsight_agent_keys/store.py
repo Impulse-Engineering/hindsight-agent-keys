@@ -2,12 +2,15 @@
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 
 import asyncpg
 
 from hindsight_agent_keys.events import SCHEMA, _asyncpg_dsn
+
+logger = logging.getLogger(__name__)
 
 # Per person. Counted in the database, so they hold across API processes.
 CREATIONS_PER_HOUR = 5
@@ -211,6 +214,21 @@ BEGIN
         DELETE FROM {SCHEMA}.notice_queue WHERE kind = 'holder';
     END IF;
 END $$;
+-- #1046: when the key last authenticated a request (extension.USE_RECORDED_EVERY), NULL until its first use since the
+-- column was added; each use moves expires_at to extension.KEY_LIFETIME after it. Added once, under the table's lock so a
+-- concurrent start waits and then finds it: the start that adds it gives every key that works then a full 90 days from
+-- now, so a key in use does not stop at the fixed date it had before its first recorded use. Both are in the start's one
+-- transaction, so a stop leaves the column and the new dates together or neither.
+DO $$
+BEGIN
+    LOCK TABLE {SCHEMA}.keys IN ACCESS EXCLUSIVE MODE;
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = '{SCHEMA}.keys'::regclass
+                   AND attname = 'last_used_at' AND NOT attisdropped) THEN
+        ALTER TABLE {SCHEMA}.keys ADD COLUMN last_used_at timestamptz;
+        UPDATE {SCHEMA}.keys SET expires_at = greatest(expires_at, now() + interval '90 days')
+            WHERE revoked_at IS NULL AND expires_at > now();
+    END IF;
+END $$;
 """
 
 
@@ -386,11 +404,11 @@ class PostgresKeyStore:
         return old
 
     async def find_key(self, key_id: str) -> asyncpg.Record | None:
-        """The key's digest, email, schema, kind, expiry and revocation, its owner's role on
+        """The key's digest, email, schema, kind, expiry, revocation and last recorded use, its owner's role on
         the Key Allowlist and its owner's last sign-in, in one indexed lookup."""
         pool = await self._get_pool()
         return await pool.fetchrow(
-            f"SELECT k.digest, k.email, k.schema, k.kind, k.expires_at, k.revoked_at, a.role, s.last_seen"
+            f"SELECT k.digest, k.email, k.schema, k.kind, k.expires_at, k.revoked_at, k.last_used_at, a.role, s.last_seen"
             f" FROM {SCHEMA}.keys k LEFT JOIN {SCHEMA}.allowlist a ON a.email = k.email"
             f" LEFT JOIN {SCHEMA}.sign_ins s ON s.email = k.email WHERE k.id = $1",
             key_id,
@@ -619,7 +637,7 @@ class PostgresKeyStore:
     async def list_keys(self, email: str, *, via_workplane: bool = False) -> list[dict]:
         pool = await self._get_pool()
         rows = await pool.fetch(
-            f"SELECT id, name, created_at, expires_at, revoked_at, via FROM {SCHEMA}.keys"
+            f"SELECT id, name, created_at, expires_at, revoked_at, last_used_at, via FROM {SCHEMA}.keys"
             " WHERE email = $1 AND (NOT $2::boolean OR via IS NOT NULL) ORDER BY created_at, id",
             email,
             via_workplane,
@@ -642,6 +660,18 @@ class PostgresKeyStore:
             via_workplane,
         )
         return renewed is not None
+
+    async def key_used(self, key_id: str, now: datetime, expires_at: datetime) -> None:
+        """Record that the key authenticated a request at `now`, which moves its expiry to `expires_at` unless a renewal
+        set it later."""
+        pool = await self._get_pool()
+        await pool.execute(
+            f"UPDATE {SCHEMA}.keys SET last_used_at = $2, expires_at = greatest(expires_at, $3)"
+            " WHERE id = $1 AND revoked_at IS NULL",
+            key_id,
+            now,
+            expires_at,
+        )
 
     async def revoke_keys(
         self, email: str, now: datetime, key_id: str | None = None, *, via_workplane: bool = False
@@ -900,9 +930,10 @@ class PostgresKeyStore:
     ) -> bool:
         """Queue the reminders of `day` unless a process has, if `is_due(the last run's time or None, whether the day before
         was run)` (Notices.remind). One transaction records the day, reads what reminders are made of, and queues the notices
-        `build(due)` makes, so a stop anywhere in it leaves the day not run and nothing queued. A second process running the
-        same day waits for the first's transaction at the day's row, then finds the day run. Returns whether the day has been
-        run, by this call or before; False, queuing nothing, while it is not due. `due` holds `last`, when the previous run
+        `build(due)` makes, so a stop anywhere in it leaves the day not run and nothing queued. In the same transaction it
+        logs `key_expired` once for each unrevoked key whose expiry fell since the previous run (or ever, at the first),
+        dated by its expiry. A second process running the same day waits for the first's transaction at the day's row, then
+        finds the day run. Returns whether the day has been run, by this call or before; False, queuing nothing, while it is not due. `due` holds `last`, when the previous run
         was (None before the first), and every row of `allowlist` and `sign_ins`, of `requests` that wait (`_WAITING`, with
         the Team's name and its owners), and of `keys` that are unrevoked and unexpired at `now` (with their Team's name and
         their holder's role in it, `team_role`)."""
@@ -921,6 +952,21 @@ class PostgresKeyStore:
                 now,
             ):
                 return True
+            # A savepoint: an event log that cannot take the rows (its table not created yet) leaves the reminders to run.
+            # shortcut: logged only by this run, which needs Webex notices set up; give it a job of its own if a
+            # deployment runs without them.
+            try:
+                async with conn.transaction():
+                    await conn.execute(
+                        f"INSERT INTO {SCHEMA}.events (at, kind, key_id, email, team)"
+                        " SELECT expires_at, 'key_expired', id, email, CASE WHEN kind = 'team' THEN schema END"
+                        f" FROM {SCHEMA}.keys WHERE revoked_at IS NULL AND expires_at <= $1"
+                        " AND ($2::timestamptz IS NULL OR expires_at > $2) ORDER BY expires_at, id",
+                        now,
+                        last,
+                    )
+            except asyncpg.PostgresError as exc:
+                logger.warning("agent-keys: could not record expired keys: %s", exc)
             due = {
                 "last": last,
                 "allowlist": await conn.fetch(f"SELECT email, role, requested_at FROM {SCHEMA}.allowlist ORDER BY email"),
