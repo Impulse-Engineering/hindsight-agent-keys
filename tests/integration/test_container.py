@@ -2665,30 +2665,6 @@ finally:
     assert out["after_restart"] == [["other key", f"upgradedother{RUN}"]]
 
 
-def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
-    assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
-    # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.
-    personal_key(hindsight, ERIN)
-    for prefix in ("p", "t"):
-        found = query(hindsight["name"], f"SELECT nspname FROM pg_namespace WHERE nspname LIKE '{prefix}\\_%'")
-        assert found, f"no {prefix}_ schema to start stock Hindsight against"
-    docker("rm", "-f", hindsight["name"])
-    name = f"hak-it-stock-{RUN}"
-    env = {
-        "HINDSIGHT_API_LLM_PROVIDER": "mock",
-        "HINDSIGHT_API_TENANT_EXTENSION": "hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension",
-        "HINDSIGHT_API_TENANT_API_KEY": LEGACY,
-        "HINDSIGHT_ENABLE_CP": "false",
-    }
-    try:
-        port = start(UPSTREAM, name, volume, env)
-        status, text = http(port, "GET", "/v1/default/banks", key=LEGACY)
-        assert status == 200, text
-        assert BANK in text
-    finally:
-        docker("rm", "-f", name, check=False)
-
-
 def test_the_start_that_adds_last_use_gives_every_unexpired_key_90_days_and_leaves_the_rest_in_postgres(hindsight):
     holder = f"rollout-{RUN}@example.test"
     out = notice_store(
@@ -2807,3 +2783,29 @@ finally:
         ["2026-10-22 13:01:00+00:00", "2027-01-20 13:01:00+00:00"],
         ["2026-10-22 13:01:00+00:00", "2027-01-20 13:01:00+00:00"],
     ]
+
+
+
+# Keep last: it removes the module's container, so a test after it fails with "No such container".
+def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
+    assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
+    # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.
+    personal_key(hindsight, ERIN)
+    for prefix in ("p", "t"):
+        found = query(hindsight["name"], f"SELECT nspname FROM pg_namespace WHERE nspname LIKE '{prefix}\\_%'")
+        assert found, f"no {prefix}_ schema to start stock Hindsight against"
+    docker("rm", "-f", hindsight["name"])
+    name = f"hak-it-stock-{RUN}"
+    env = {
+        "HINDSIGHT_API_LLM_PROVIDER": "mock",
+        "HINDSIGHT_API_TENANT_EXTENSION": "hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension",
+        "HINDSIGHT_API_TENANT_API_KEY": LEGACY,
+        "HINDSIGHT_ENABLE_CP": "false",
+    }
+    try:
+        port = start(UPSTREAM, name, volume, env)
+        status, text = http(port, "GET", "/v1/default/banks", key=LEGACY)
+        assert status == 200, text
+        assert BANK in text
+    finally:
+        docker("rm", "-f", name, check=False)
