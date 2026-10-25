@@ -2786,7 +2786,7 @@ finally:
 
 
 
-# Keep last: it removes the module's container, so a test after it fails with "No such container".
+# Removes the module's container: tests/integration/conftest.py collects it last.
 def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team):
     assert http(hindsight["port"], "PUT", f"/v1/default/banks/{BANK}", key=LEGACY, body={"mission": "ci"})[0] in (200, 201)
     # The database also holds a personal and a Team schema, which stock Hindsight neither lists nor migrates.
