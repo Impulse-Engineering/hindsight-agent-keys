@@ -285,7 +285,8 @@ class MemoryStore:
 
     async def key_used(self, key_id, now, expires_at):
         key = self.keys[key_id]
-        if key["revoked_at"] is None:
+        last = key["last_used_at"]
+        if key["revoked_at"] is None and (last is None or last <= now - timedelta(hours=1)):
             key["last_used_at"], key["expires_at"] = now, max(key["expires_at"], expires_at)
 
     async def revoke_keys(self, email, now, key_id=None, *, via_workplane=False):

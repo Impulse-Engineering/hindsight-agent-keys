@@ -812,7 +812,8 @@ def test_a_key_needs_its_owner_to_sign_in_every_30_days_and_expires_unless_used_
     )
     assert http(port, "GET", "/v1/default/banks", key=key)[0] == 401
     status, text = key_page(hindsight, "GET", "/ext/keys", BOB)
-    assert {k["id"]: k["state"] for k in json.loads(text)}[key_id] == "expired"
+    listed = {k["id"]: k for k in json.loads(text)}[key_id]
+    assert (listed["state"], listed["days_to_expiry"], listed["last_used_at"] is not None) == ("expired", 0, True)
     assert key_page(hindsight, "POST", f"/ext/keys/{key_id}/renew", BOB, body={})[0] == 404
 
 
@@ -2688,7 +2689,7 @@ def test_stock_hindsight_starts_on_the_same_database(hindsight, volume, ci_team)
         docker("rm", "-f", name, check=False)
 
 
-def test_the_start_that_adds_last_use_gives_every_key_that_works_90_days_and_leaves_the_rest_in_postgres(hindsight):
+def test_the_start_that_adds_last_use_gives_every_unexpired_key_90_days_and_leaves_the_rest_in_postgres(hindsight):
     holder = f"rollout-{RUN}@example.test"
     out = notice_store(
         hindsight["name"],
@@ -2726,7 +2727,7 @@ finally:
     await conn.close()
 """,
     )
-    # Only the key that works moved, to 90 days from the start; nothing is recorded as used yet.
+    # Only the unrevoked, unexpired key moved, to 90 days from the start; nothing is recorded as used yet.
     assert out == {"changed": {"works": "90 days, 0:00:00"}, "last_used": 0}
 
 
@@ -2746,6 +2747,7 @@ try:
         ("before", N1 - timedelta(hours=1), None, "personal"),
         ("between", N1 + timedelta(hours=1), None, "team"),
         ("revoked", N1 + timedelta(hours=1), N1, "personal"),
+        ("revokedlater", N1 + timedelta(hours=1), N1 + timedelta(hours=2), "personal"),  # revoked after it expired
         ("works", N2 + timedelta(days=1), None, "personal"),
     ):
         await conn.execute(
@@ -2765,8 +2767,39 @@ finally:
     await conn.close()
 """,
     )
-    # One row each for the keys that stopped unrevoked, dated when they stopped; the revoked key and the key that works none.
+    # One row each for the keys that stopped unrevoked (one revoked only afterwards), dated when they stopped; the key revoked
+    # before it stopped and the key that works none.
     assert out["events"] == [
         ["before", True, None, "2100-01-01 12:00:00+00:00", None, None],
         ["between", True, "p_lapsed", "2100-01-01 14:00:00+00:00", None, None],
+        ["revokedlater", True, None, "2100-01-01 14:00:00+00:00", None, None],
+    ]
+
+
+def test_a_use_within_the_hour_of_the_last_recorded_one_writes_nothing_even_out_of_order_in_postgres(hindsight):
+    person = f"used-{RUN}@example.test"
+    out = notice_store(
+        hindsight["name"],
+        f"""
+person = {person!r}
+{KEY_ROWS}
+await add_keys([person])
+key = key_of(person)
+conn = await asyncpg.connect(uri)
+try:
+    seen = []
+    # Requests that passed principal's check at once: a later one recorded first, an earlier one after it, then one an
+    # hour after the first recorded.
+    for at in (T0 + timedelta(minutes=1), T0, T0 + timedelta(minutes=61)):
+        await store.key_used(key, at, at + timedelta(days=90))
+        seen.append(await conn.fetchrow("SELECT last_used_at, expires_at FROM agent_keys.keys WHERE id = $1", key))
+    out["seen"] = [[str(r["last_used_at"]), str(r["expires_at"])] for r in seen]
+finally:
+    await conn.close()
+""",
+    )
+    assert out["seen"] == [
+        ["2026-10-22 12:01:00+00:00", "2027-01-20 12:01:00+00:00"],
+        ["2026-10-22 12:01:00+00:00", "2027-01-20 12:01:00+00:00"],
+        ["2026-10-22 13:01:00+00:00", "2027-01-20 13:01:00+00:00"],
     ]
