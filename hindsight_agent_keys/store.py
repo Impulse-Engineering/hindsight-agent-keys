@@ -646,10 +646,11 @@ class PostgresKeyStore:
     async def renew_key(
         self, email: str, key_id: str, now: datetime, expires_at: datetime, *, via_workplane: bool = False
     ) -> bool:
-        """Move the expiry of the person's key unless it is revoked or already expired."""
+        """Move the expiry of the person's key unless it is revoked or already expired; never earlier, so a use recorded
+        while the renewal ran keeps its later date."""
         pool = await self._get_pool()
         renewed = await pool.fetchval(
-            f"UPDATE {SCHEMA}.keys SET expires_at = $4"
+            f"UPDATE {SCHEMA}.keys SET expires_at = greatest(expires_at, $4)"
             " WHERE id = $1 AND email = $2 AND revoked_at IS NULL AND expires_at > $3 AND (NOT $5::boolean OR via IS NOT NULL)"
             " RETURNING id",
             key_id,

@@ -280,7 +280,7 @@ class MemoryStore:
         key = self.keys.get(key_id)
         if not self._reached(key, email, via_workplane) or key["revoked_at"] is not None or key["expires_at"] <= now:
             return False
-        key["expires_at"] = expires_at
+        key["expires_at"] = max(key["expires_at"], expires_at)
         return True
 
     async def key_used(self, key_id, now, expires_at):

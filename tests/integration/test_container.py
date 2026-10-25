@@ -2793,6 +2793,9 @@ try:
     for at in (T0 + timedelta(minutes=1), T0, T0 + timedelta(minutes=61)):
         await store.key_used(key, at, at + timedelta(days=90))
         seen.append(await conn.fetchrow("SELECT last_used_at, expires_at FROM agent_keys.keys WHERE id = $1", key))
+    # A renewal that read the time before the last use was recorded never moves the expiry back.
+    assert await store.renew_key(person, key, T0, T0 + timedelta(days=90))
+    seen.append(await conn.fetchrow("SELECT last_used_at, expires_at FROM agent_keys.keys WHERE id = $1", key))
     out["seen"] = [[str(r["last_used_at"]), str(r["expires_at"])] for r in seen]
 finally:
     await conn.close()
@@ -2801,5 +2804,6 @@ finally:
     assert out["seen"] == [
         ["2026-10-22 12:01:00+00:00", "2027-01-20 12:01:00+00:00"],
         ["2026-10-22 12:01:00+00:00", "2027-01-20 12:01:00+00:00"],
+        ["2026-10-22 13:01:00+00:00", "2027-01-20 13:01:00+00:00"],
         ["2026-10-22 13:01:00+00:00", "2027-01-20 13:01:00+00:00"],
     ]

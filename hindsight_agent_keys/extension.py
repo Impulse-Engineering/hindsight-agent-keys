@@ -38,7 +38,8 @@ from hindsight_agent_keys.store import PostgresKeyStore, Refused
 
 PUBLIC_SCHEMA = "public"
 
-# A key works until this long after its last use, its last renewal or its creation, whichever is latest (its expires_at),
+# A key works until this long after its last recorded use, its last renewal or its creation (or #1046's rollout, for a key
+# then unexpired), whichever is latest (its expires_at),
 KEY_LIFETIME = timedelta(days=90)
 # where a use is a request the key authenticated, recorded at most this often per key,
 USE_RECORDED_EVERY = timedelta(hours=1)
@@ -873,7 +874,7 @@ class AgentKeysTenantExtension(TenantExtension):
                     team = " for the Public Team"
                 else:
                     team = f' for the Team "{plain(k["team_name"])}"'
-                # Its window started at its last recorded use, renewal or creation, so it has not been used since then.
+                # Its window started at its last recorded use, renewal, creation or #1046's rollout: no use since then.
                 idle = (k["expires_at"] - KEY_LIFETIME).astimezone(UTC).date().isoformat()
                 line = (
                     f'Your Agent Key "{plain(k["name"])}"{team} has not been used since {idle} and stops working'
