@@ -38,8 +38,11 @@ from hindsight_agent_keys.store import PostgresKeyStore, Refused
 
 PUBLIC_SCHEMA = "public"
 
-# A key works for this long after it is created or renewed,
+# A key works until this long after its last recorded use, its last renewal or its creation (or #1046's rollout, for a key
+# then unexpired), whichever is latest (its expires_at),
 KEY_LIFETIME = timedelta(days=90)
+# where a use is a request the key authenticated, recorded at most this often per key,
+USE_RECORDED_EVERY = timedelta(hours=1)
 # and only while its owner has signed in through Access within this window.
 SIGN_IN_WINDOW = timedelta(days=30)
 
@@ -398,8 +401,9 @@ class AgentKeysTenantExtension(TenantExtension):
     # With `via_workplane`, the next three reach only the person's keys created via WorkPlane.
 
     async def list_keys(self, email: str, *, via_workplane: bool = False) -> list[dict]:
-        """The person's own keys, oldest first, each with its state and whole days to expiry (rounded up;
-        0 once expired, None once revoked, so a revoked key never looks due for renewal)."""
+        """The person's own keys, oldest first, each with its last recorded use, its state and whole days to expiry, the
+        day it stops unless used or renewed (rounded up; 0 once expired, None once revoked, so a revoked key never looks
+        due for renewal)."""
         now = self._clock()
         return [
             {
@@ -647,6 +651,11 @@ class AgentKeysTenantExtension(TenantExtension):
         # Uncached, so removing a member stops their Team keys on their next request.
         if team and await self._store.team_role(row["schema"], row["email"]) is None:
             return None
+        if row["last_used_at"] is None or now - row["last_used_at"] >= USE_RECORDED_EVERY:
+            try:
+                await self._store.key_used(match.group(1), now, now + KEY_LIFETIME)
+            except Exception as exc:  # noqa: BLE001 - the key was accepted; the next request records the use
+                logger.warning("agent-keys: could not record the use of key %s: %s", match.group(1), exc)
         return Principal(row["kind"], row["schema"], match.group(1), row["email"])
 
     async def authenticate(self, context: RequestContext) -> TenantContext:
@@ -865,7 +874,12 @@ class AgentKeysTenantExtension(TenantExtension):
                     team = " for the Public Team"
                 else:
                     team = f' for the Team "{plain(k["team_name"])}"'
-                line = f'Your Agent Key "{plain(k["name"])}"{team} expires {_when(k["expires_at"], now)}. Renew it on your key page.'
+                # Its window started at its last recorded use, renewal, creation or #1046's rollout: no use since then.
+                idle = (k["expires_at"] - KEY_LIFETIME).astimezone(UTC).date().isoformat()
+                line = (
+                    f'Your Agent Key "{plain(k["name"])}"{team} has not been used since {idle} and stops working'
+                    f" {_when(k['expires_at'], now)}, unless it is used or renewed on your key page."
+                )
                 reminders.append(Notice("holder", [k["email"]], line, "/ext/", key=k["id"]))
         for email in sorted({k["email"] for k in working}):
             closes = signed_in[email] + SIGN_IN_WINDOW

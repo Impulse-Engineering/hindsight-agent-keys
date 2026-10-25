@@ -529,7 +529,7 @@ $main
 PAGE = Template("""<div class="head"><h1>Your keys</h1>
 <p>Personal Agent Keys let your AI coding agents reach Hindsight memory as you.</p></div>
 <div class="banner"><svg class="i"><use href="#clock"/></svg>
-<b>Your keys work for 90 days, and only while you sign in here at least every 30 days.</b></div>
+<b>A key stops after 90 days without use, and works only while you sign in here at least every 30 days.</b></div>
 $allowlist
 $webex
 <p class="status" id="result" role="status"></p>
@@ -542,7 +542,7 @@ $webex
 <div class="card"><header><h2>Keys</h2><span class="sub" id="key-count"></span></header>
 <div class="tw"><table>
 <thead><tr><th scope="col">Name</th><th scope="col">ID</th><th scope="col">Created</th><th scope="col">Created via</th>
-<th scope="col">Expires</th><th scope="col">State</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
+<th scope="col">Last used</th><th scope="col">Stops if unused</th><th scope="col">State</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
 <tbody id="keys"></tbody>
 </table></div></div>
 <script>
@@ -554,7 +554,7 @@ function expiry(key) {
   const when = key.state === "expired" ? "expired " + ago(key.expires_at)
     : left < 1 ? "expires today" : left + (left === 1 ? " day left" : " days left");
   const width = Math.max(0, Math.min(100, left / 90 * 100));
-  return '<div class="life" title="' + day(key.expires_at) + '"><span>' + when + '</span>'
+  return '<div class="life" title="' + day(key.expires_at) + '"><span>' + when + '</span><span class="sub">' + day(key.expires_at) + '</span>'
     + '<div class="bar' + (left < 30 ? " low" : "") + '" role="img" aria-label="' + Math.max(left, 0) + ' of 90 days left">'
     + '<i style="width:' + width + '%"></i></div></div>';
 }
@@ -577,6 +577,9 @@ async function showKeys() {
     created.textContent = ago(key.created_at);
     created.title = day(key.created_at);
     row.insertCell().textContent = key.via ? "WorkPlane" : "this page";
+    const used = row.insertCell();
+    used.textContent = key.last_used_at ? ago(key.last_used_at) : "-";
+    used.title = key.last_used_at ? day(key.last_used_at) : "No use recorded";
     row.insertCell().innerHTML = key.state === "revoked" ? '<span class="sub">-</span>' : expiry(key);
     const pill = row.insertCell().appendChild(document.createElement("span"));
     pill.className = "pill " + key.state;

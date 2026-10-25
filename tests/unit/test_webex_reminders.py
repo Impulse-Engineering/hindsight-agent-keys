@@ -1,4 +1,4 @@
-"""Daily Webex reminders of requests left waiting, and warnings to key holders before a key expires or their sign-in
+"""Daily Webex reminders of requests left waiting, and warnings to key holders before a key stops unused or their sign-in
 window closes (README, "Webex notices"). They go through the same queue, opt-out, window and send log as every notice;
 the day is run once across API processes and restarts. The store is the fake of test_webex_notices.py; the same
 contract runs in Postgres in tests/integration/test_container.py."""
@@ -161,7 +161,7 @@ async def test_joining_an_open_team_settles_an_agents_request_for_a_members_plac
 # Key holders
 
 
-async def test_a_key_holder_is_warned_once_when_a_key_that_works_comes_within_14_days_of_expiring(world):
+async def test_a_key_holder_is_warned_once_when_a_key_that_works_comes_within_14_days_of_stopping_unused(world):
     await world.ext.set_member(ALICE, world.schema, IVAN, "member", None)
     await world.ext.create_personal_key(DAVE, "laptop", None)
     await world.ext.create_team_key(CAROL, world.schema, "http://ci.example.test", None)
@@ -189,16 +189,34 @@ async def test_a_key_holder_is_warned_once_when_a_key_that_works_comes_within_14
     world.clock.later(days=1)
     sign_ins()
     await remind(world)
-    renew = "on 2027-01-20. Renew it on your key page."
+    idle = "has not been used since 2026-10-22 and stops working in 14 days, on 2027-01-20, unless it is used or renewed on your key page."
     assert sorted(world.webex.sent) == [
-        (CAROL, f'Hindsight:\n- Your Agent Key "hxxp://ci[.]example[.]test" for the Team "Platform" expires in 14 days, {renew}\nSee {PAGE}'),
-        (DAVE, f'Hindsight:\n- Your Agent Key "laptop" expires in 14 days, {renew}\nSee {PAGE}'),
-        (GINA, f'Hindsight:\n- Your Agent Key "shared" for the Public Team expires in 14 days, {renew}\nSee {PAGE}'),
+        (CAROL, f'Hindsight:\n- Your Agent Key "hxxp://ci[.]example[.]test" for the Team "Platform" {idle}\nSee {PAGE}'),
+        (DAVE, f'Hindsight:\n- Your Agent Key "laptop" {idle}\nSee {PAGE}'),
+        (GINA, f'Hindsight:\n- Your Agent Key "shared" for the Public Team {idle}\nSee {PAGE}'),
     ]
     world.clock.later(days=1)
     sign_ins()
     await remind(world)
     assert len(world.webex.sent) == 3
+
+
+async def test_a_used_key_is_warned_14_days_before_90_days_from_its_last_use_not_from_its_creation(world):
+    _, key = await world.ext.create_personal_key(DAVE, "laptop", None)
+    await remind(world)  # the first run
+    world.clock.later(days=30)
+    world.store.sign_ins[DAVE] = world.clock.now
+    assert await world.ext.principal(key) is not None
+    for days in (46, 30):  # 14 days before 90 from creation, then 14 before 90 from the use
+        world.clock.later(days=days)
+        world.store.sign_ins[DAVE] = world.clock.now
+        await remind(world)
+    line = "has not been used since 2026-11-21 and stops working in 14 days, on 2027-02-19, unless it is used or renewed on your key page."
+    assert world.webex.sent == [(DAVE, f'Hindsight:\n- Your Agent Key "laptop" {line}\nSee {PAGE}')]
+    world.clock.later(days=1)
+    world.store.sign_ins[DAVE] = world.clock.now
+    await remind(world)
+    assert len(world.webex.sent) == 1
 
 
 async def test_a_key_holder_is_warned_once_when_their_sign_in_window_comes_within_7_days_of_closing(world):

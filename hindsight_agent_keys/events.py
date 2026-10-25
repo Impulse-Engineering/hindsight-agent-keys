@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 # Idempotent and schema-qualified: our tables never enter upstream's Alembic
 # history, so stock Hindsight still starts against a database this image used.
+# store.PostgresKeyStore runs it too, as store.run_reminders writes `key_expired` rows in its own transaction.
 DDL = f"""
 CREATE SCHEMA IF NOT EXISTS {SCHEMA};
 CREATE TABLE IF NOT EXISTS {SCHEMA}.events (
