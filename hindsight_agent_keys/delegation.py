@@ -1,11 +1,12 @@
 """Delegated Requests, under /ext/delegated: a Delegate (WorkPlane) acting for a person signed in to it.
 
-Server to server, on the delegation application's own hostname. Each request carries two
-credentials, each verified on its own: the Delegate's Access service-token JWT, which Access
-forwards in Cf-Access-Jwt-Assertion, and the person's own Access JWT for WorkPlane's application
-in X-Delegated-Access-Jwt. Identity headers are never read: the person is the second JWT's
-email, and a self operation takes no email from the body. Routes call the tenant extension
-only, never the store, so every rule and limit the key pages meet applies here too.
+Server to server, on the delegation hostname (the primary hostname or one of its own). Each
+request carries two credentials, each verified on its own: the Delegate's Access service-token
+JWT, which Access forwards in Cf-Access-Jwt-Assertion, and the person's own Access JWT for
+WorkPlane's application in X-Delegated-Access-Jwt. Identity headers are never read: the person
+is the second JWT's email, and a self operation takes no email from the body. Routes call the
+tenant extension only, never the store, so every rule and limit the key pages meet applies here
+too.
 """
 
 from typing import Annotated

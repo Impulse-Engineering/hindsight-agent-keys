@@ -8,6 +8,7 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 | --- | --- | --- |
 | Key pages (behind Access) | `https://<primary>/ext/` | `https://<primary>/ext/` |
 | Agents: API and MCP (bypass hostname) | `https://<bypass>` | `https://<bypass>` |
+| WorkPlane: Delegated Requests (`HINDSIGHT_API_TENANT_DELEGATION_HOST`) | `https://<primary>/ext/delegated/` | `https://<primary>/ext/delegated/` |
 
 ## Who does what
 
@@ -67,7 +68,7 @@ An admin signed in to WorkPlane can also do steps 1 and 2 through it, for keys o
 
 For a compromised or misbehaving WorkPlane: stop everything it does in Hindsight at once. Do the steps in this order. Revoking the keys (step 2) stops their retain and recall, but not WorkPlane creating new keys for the people who use it: only deleting its service token (step 1) stops that.
 
-1. **Stop Delegated Requests in Access** (a Cloudflare Zero Trust admin). Under **Access controls** > **Service credentials** > **Service Tokens**, delete WorkPlane's service token, the one whose client ID is `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID`; a deleted token cannot be recovered. Then edit the delegation application and select **Revoke existing tokens**, which ends the sessions Access already issued to it. **Auth state:** from then on Access refuses every Delegated Request, so WorkPlane can neither manage access nor create keys, but the keys it created still retain and recall until step 2.
+1. **Stop Delegated Requests in Access** (a Cloudflare Zero Trust admin). Under **Access controls** > **Service credentials** > **Service Tokens**, delete WorkPlane's service token, the one whose client ID is `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID`; a deleted token cannot be recovered. Then edit the Access application in front of the delegation hostname and select **Revoke existing tokens**, which ends the sessions Access already issued to it. When the delegation hostname is the primary hostname, that application is the key pages' too, so this also ends every person's key-page session: they sign in again on their next visit. **Auth state:** from then on Access refuses every Delegated Request, so WorkPlane can neither manage access nor create keys, but the keys it created still retain and recall until step 2.
 2. **Revoke every key created via WorkPlane** (an admin). On `/ext/admin`, under **Kill switch**, press **Revoke every key created via WorkPlane**. Every such key, personal or Team, whoever holds it, is revoked in one transaction and fails on its next request, including inside an open MCP session. Keys people created on `/ext/` keep working. The event log records `workplane_keys_revoked` with you as `actor`. No Delegated Request can do this, even an admin's, so it never depends on WorkPlane.
 3. **Press it again a minute later.** A key creation that had already passed Hindsight's checks when step 1 took effect can still be stored after the first press. The second press revokes it. Pressing again is safe: it revokes only keys not yet revoked, and answers how many, normally 0.
 
@@ -80,7 +81,7 @@ To check from the CT, this prints the number of keys created via WorkPlane that 
 pg psql -X -d hindsight -Atc 'select count(*) from agent_keys.keys where via is not null and revoked_at is null'
 ```
 
-To bring WorkPlane back once the cause is fixed *(not verified)*: create a new service token for it, add it to the delegation application's policy, and set `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID` to its client ID with `platform_set_secret`, which restarts the app. **Auth state:** down during the restart; afterwards Hindsight accepts only the new token. Then give WorkPlane the token. The revoked keys stay revoked; WorkPlane creates new ones the next time each person uses it.
+To bring WorkPlane back once the cause is fixed *(not verified)*: create a new service token for it, add it to the Service Auth policy on the Access application in front of the delegation hostname, and set `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID` to its client ID with `platform_set_secret`, which restarts the app. **Auth state:** down during the restart; afterwards Hindsight accepts only the new token. Then give WorkPlane the token. The revoked keys stay revoked; WorkPlane creates new ones the next time each person uses it.
 
 ## Teams
 
@@ -130,18 +131,18 @@ The extension sends Webex direct messages from a bot: to a Team's owners on the 
 
 1. **Create the bot** (a Webex developer account in the organization). On developer.webex.com create a bot (**My Webex Apps**, **Create a New App**, **Create a Bot**): its name, username and icon are what people see in their Webex app. The page then shows the bot's access token once. Copy it into the password manager entry for the app; do not paste it into a terminal or a chat. Note the expiry the bot's page shows for the token. If it shows one within a year, add a renewal reminder for the date.
 2. **Set the secret.** `HINDSIGHT_API_TENANT_WEBEX_BOT_TOKEN` is a secret like the pepper: Conductor keeps it in the app's `.env` on the CT, and the image itself holds no `.env` (README, "Startup guard"). Register it with `platform_request_secret`, then set it as [cutover.md](cutover.md), step 4.3, sets the pepper, so the value comes from a file and never appears in a terminal or a chat; trash the file afterwards and empty the Trash. Setting it restarts the app. **Auth state:** down during the restart, then the same image and extension, so nothing opens. The three `ACCESS` settings must be set too (README, "Configuration"); without them nothing is sent.
-3. **Check once on Dev** with a test person who has never messaged the bot. Each of these must hold, or no notice is queued and the check proves nothing:
+3. **Check once on Dev or Lab** with a test person who has never messaged the bot. Each of these must hold, or no notice is queued and the check proves nothing:
    - the test person is on the Key Allowlist and has not turned Webex notices off on `/ext/`;
    - they are an owner of a new Team that is not open (an Open Team is silent: joining it is direct);
    - a second person, also on the Key Allowlist, who is not in that Team and has no request waiting for it, asks to join it by name, which files a new Join Request.
 
    The owner should see the message in their Webex app. For the admin variant instead, make the test person an admin (notices on), and have someone with no place on the Key Allowlist at all (not a member, not an admin, and no request of theirs waiting: decline an old one first) sign in and ask for it, which files a new request. It passes on HTTP 200 (`sent` in the send log below) and the message shown in their Webex app. Whether a bot may message a person by email before that person has messaged it is exactly what this checks. Fill in the table below.
 
-**Dev check and token record.** Fill in a row when the check runs, and again each time the token is regenerated.
+**Check and token record.** Fill in a row when the check runs, and again each time the token is regenerated.
 
 | Date | Who ran it | Result: HTTP status, and whether the message showed in Webex | Token expiry the bot's page showed |
 | --- | --- | --- | --- |
-| *(not yet run)* | | | |
+| 2026-10-28, Lab | J. Bryan, with two colleagues as requester and admin | Admin variant: someone with no place on the Key Allowlist asked for one, and the admin, who had never messaged the bot, was shown the message in Webex at 23:25 UTC. Decision variant: an admin approved a request, and the requester, who had never messaged the bot, was shown the message in Webex. Both were delivered, so Webex accepted the sends (HTTP 200); the send log was not read. | 2027-10-28: within a year, so a renewal reminder is due |
 
 **Renewing the token.** Before the date in the reminder, regenerate the token on the bot's page and set the secret again as in step 2. If the token is wrong or has expired, messages fail with `HTTP 401` in the send log and nobody is told anything; the pages are unaffected. With no token set at all, nothing is queued and the send log gets no rows.
 
