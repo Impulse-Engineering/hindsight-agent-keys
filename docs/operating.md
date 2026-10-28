@@ -8,7 +8,7 @@ Commands marked *(not verified)* have not been run on Dev. Commands marked **CT*
 | --- | --- | --- |
 | Key pages (behind Access) | `https://<primary>/ext/` | `https://<primary>/ext/` |
 | Agents: API and MCP (bypass hostname) | `https://<bypass>` | `https://<bypass>` |
-| WorkPlane: Delegated Requests (`HINDSIGHT_API_TENANT_DELEGATION_HOST`) | `https://<primary>/ext/delegated/` | `https://<primary>/ext/delegated/` |
+| WorkPlane: Delegated Requests (`HINDSIGHT_API_TENANT_DELEGATION_HOST`) | `https://<primary>/ext/delegated/` | `https://<delegation host>/ext/delegated/` *(not verified)* |
 
 ## Who does what
 
@@ -81,7 +81,7 @@ To check from the CT, this prints the number of keys created via WorkPlane that 
 pg psql -X -d hindsight -Atc 'select count(*) from agent_keys.keys where via is not null and revoked_at is null'
 ```
 
-To bring WorkPlane back once the cause is fixed *(not verified)*: create a new service token for it, add it to the Service Auth policy on the Access application in front of the delegation hostname, and set `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID` to its client ID with `platform_set_secret`, which restarts the app. **Auth state:** down during the restart; afterwards Hindsight accepts only the new token. Then give WorkPlane the token. The revoked keys stay revoked; WorkPlane creates new ones the next time each person uses it.
+To bring WorkPlane back once the cause is fixed *(not verified)*: create a new service token for it, add it to the Service Auth policy on the Access application in front of the delegation hostname, and set `HINDSIGHT_API_TENANT_DELEGATE_CLIENT_ID` to its client ID with `platform_set_secret`, which restarts the app. **Auth state:** down during the restart; afterwards Hindsight accepts only the new token. Then give WorkPlane the token. If step 1 revoked the sessions of the primary hostname's Access application, people sign in again on their next visit to the key pages. Check that a person's `/ext/` loads and that a Delegated Request with the new token answers. The revoked keys stay revoked; WorkPlane creates new ones the next time each person uses it.
 
 ## Teams
 
@@ -142,7 +142,7 @@ The extension sends Webex direct messages from a bot: to a Team's owners on the 
 
 | Date | Who ran it | Result: HTTP status, and whether the message showed in Webex | Token expiry the bot's page showed |
 | --- | --- | --- | --- |
-| 2026-10-28, Lab | J. Bryan, with two colleagues as requester and admin | Admin variant: someone with no place on the Key Allowlist asked for one, and the admin, who had never messaged the bot, was shown the message in Webex at 23:25 UTC. Decision variant: an admin approved a request, and the requester, who had never messaged the bot, was shown the message in Webex. Both were delivered, so Webex accepted the sends (HTTP 200); the send log was not read. | 2027-10-28: within a year, so a renewal reminder is due |
+| 2026-10-28, Lab | J. Bryan, with two colleagues as requester and admin | Passed, for people who had never messaged the bot. Admin variant: someone with no place on the Key Allowlist asked for one; the admin's message was `sent` at 23:25 UTC and shown in their Webex app. Decision variant: the admin approved two requests; both requesters' messages were `sent` (23:26 and 23:36 UTC), and one requester confirmed it in their Webex app. A second request to the same admin went at 23:40, held by the 15-minute window. Four `sent` rows in the send log, none `failed`, queue empty. | 2027-10-28: renewal reminder in Impulse-Engineering/aseva-foundation-hosting#1061 |
 
 **Renewing the token.** Before the date in the reminder, regenerate the token on the bot's page and set the secret again as in step 2. If the token is wrong or has expired, messages fail with `HTTP 401` in the send log and nobody is told anything; the pages are unaffected. With no token set at all, nothing is queued and the send log gets no rows.
 
