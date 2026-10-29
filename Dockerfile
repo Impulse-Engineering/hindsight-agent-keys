@@ -5,6 +5,12 @@ FROM ghcr.io/vectorize-io/hindsight:1.1.0@sha256:50311d02b4d5d2b7c5242bd336edf87
 LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hindsight-agent-keys" \
       org.opencontainers.image.licenses="MIT"
 
+# Fixed versions over upstream's, for GHSA-6v38-4h7w-rj9h (authlib): docs/operating.md, "Pinning a package over upstream".
+RUN --mount=type=bind,source=docker/pins.txt,target=/tmp/pins.txt \
+    uv pip install --no-cache --no-deps --require-hashes --only-binary :all: \
+      --python /app/api/.venv/bin/python -r /tmp/pins.txt && \
+    uv pip check --python /app/api/.venv/bin/python
+
 # The UI image: upstream's web UI, one process per Team, never the API (README, "The UI image").
 FROM base AS ui
 LABEL org.opencontainers.image.description="Hindsight's web UI, one process per Team"
