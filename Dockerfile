@@ -1,6 +1,6 @@
 # Two images from one pin: the API image (the default, last stage) and the UI image (--target ui).
 # scripts/upstream-ref.sh reads this pin, and the upstream-release workflow bumps it for both.
-FROM ghcr.io/vectorize-io/hindsight:1.1.0@sha256:50311d02b4d5d2b7c5242bd336edf8735df8374eaad496a92f49c83b37d2aa06 AS base
+FROM ghcr.io/vectorize-io/hindsight:1.2.1@sha256:d2bc230a714e933affd63753e181a0579328fdcbbc021800a76e0bc7b6e76b31 AS base
 
 LABEL org.opencontainers.image.source="https://github.com/Impulse-Engineering/hindsight-agent-keys" \
       org.opencontainers.image.licenses="MIT"
